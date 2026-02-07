@@ -18,13 +18,247 @@ import seaborn as sns
 from sklearn.metrics import (
     mean_squared_error, 
     log_loss, 
-    roc_auc_score, 
+    roc_auc_score,
+    r2_score,
     brier_score_loss,
     accuracy_score,
 )
 
-from ensemble_selection import EnsembleSelector
+# =============================================================================
+# Caruana-style greedy forward ensemble selection method
+# =============================================================================
 
+class EnsembleSelector:
+    """Base class for ensemble selection methods."""
+
+    def __init__(self, metric: str = 'rmse', verbose: bool = True) -> None:
+        """
+        Initialize the EnsembleSelector.
+
+        Args:
+            metric (str): Metric to use for evaluation ('rmse', 'mse', 'r2', 'log_loss', 'brier').
+            verbose (bool): Whether to print verbose output.
+        """
+        self.metric = metric
+        self.verbose = verbose
+        self.ensemble_weights = {}
+
+    def compute_metric(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        """
+        Compute the performance metric between true and predicted values.
+
+        Args:
+            y_true (np.ndarray): Ground truth target values.
+            y_pred (np.ndarray): Predicted target values.
+
+        Returns:
+            float: Computed metric value (lower is better for all supported metrics).
+
+        Raises:
+            ValueError: If an unknown metric is specified.
+        """
+        if self.metric == 'rmse':
+            return np.sqrt(mean_squared_error(y_true, y_pred))
+        elif self.metric == 'mse':
+            return mean_squared_error(y_true, y_pred)
+        elif self.metric == 'r2':
+            return -r2_score(y_true, y_pred)  # Negative for minimization
+        elif self.metric == 'log_loss':
+            y_pred_clipped = np.clip(y_pred, 1e-7, 1 - 1e-7)
+            return log_loss(y_true, y_pred_clipped)
+        elif self.metric == 'brier':
+            y_pred_clipped = np.clip(y_pred, 1e-7, 1 - 1e-7)
+            return np.mean((y_true - y_pred_clipped) ** 2)
+        else:
+            raise ValueError(f"Unknown metric: {self.metric}. "
+                           f"Supported: 'rmse', 'mse', 'r2', 'log_loss', 'brier'.")
+
+    def greedy_selection(
+        self,
+        predictions_dict: Dict[str, np.ndarray],
+        y_true: np.ndarray,
+        n_iterations: int = 100,
+        with_replacement: bool = True,
+        sorted_init: int = 5,
+        n_bags: int = 10,
+        bag_fraction: float = 0.5,
+    ) -> Dict[str, float]:
+        """
+        Perform Caruana-style greedy forward ensemble selection with enhancements.
+
+        Args:
+            predictions_dict (Dict[str, np.ndarray]): 
+                Dictionary mapping model names to their prediction arrays (shape: [n_samples]).
+            y_true (np.ndarray): 
+                Ground truth target values (shape: [n_samples]).
+            n_iterations (int, optional): 
+                Maximum number of greedy selection iterations per bag. Default is 100.
+            with_replacement (bool, optional): 
+                If True, allows models to be selected multiple times (with replacement). Default is True.
+            sorted_init (int, optional): 
+                Number of top-performing models to use for sorted initialization (0 disables). Default is 5.
+            n_bags (int, optional): 
+                Number of bagging iterations (ensembles). If >1, bagged ensemble selection is used. Default is 10.
+            bag_fraction (float, optional): 
+                Fraction of models to sample in each bag (if n_bags > 1). Default is 0.5.
+
+        Returns:
+            Dict[str, float]: 
+                Dictionary mapping model names to their normalized ensemble weights.
+        """
+        model_names = list(predictions_dict.keys())
+        n_models = len(model_names)
+
+        if n_bags > 1:
+            # Bagged ensemble selection
+            bag_ensembles = []
+            for bag_idx in range(n_bags):
+                # Random sample of models
+                np.random.seed(bag_idx)
+                bag_models = np.random.choice(
+                    model_names,
+                    size=max(1, int(n_models * bag_fraction)),
+                    replace=False
+                )
+                bag_preds = {k: v for k, v in predictions_dict.items() if k in bag_models}
+
+                # Run selection on this bag
+                bag_ensemble = self._single_selection(
+                    bag_preds, y_true, n_iterations, with_replacement, sorted_init
+                )
+                bag_ensembles.append(bag_ensemble)
+
+            # Merge bag ensembles
+            merged_weights = defaultdict(float)
+            for ensemble in bag_ensembles:
+                for model, weight in ensemble.items():
+                    merged_weights[model] += weight
+
+            # Normalize
+            total = sum(merged_weights.values())
+            return {k: v / total for k, v in merged_weights.items()} if total > 0 else {}
+        else:
+            return self._single_selection(
+                predictions_dict, y_true, n_iterations, with_replacement, sorted_init
+            )
+
+    def _single_selection(
+        self,
+        predictions_dict: Dict[str, np.ndarray],
+        y_true: np.ndarray,
+        n_iterations: int,
+        with_replacement: bool,
+        sorted_init: int,
+    ) -> Dict[str, float]:
+        """
+        Perform a single greedy forward ensemble selection run.
+
+        Args:
+            predictions_dict (Dict[str, np.ndarray]): 
+                Dictionary mapping model names to their prediction arrays (shape: [n_samples]).
+            y_true (np.ndarray): 
+                Ground truth target values (shape: [n_samples]).
+            n_iterations (int): 
+                Maximum number of greedy selection iterations.
+            with_replacement (bool): 
+                If True, allows models to be selected multiple times (with replacement).
+            sorted_init (int): 
+                Number of top-performing models to use for sorted initialization (0 disables).
+
+        Returns:
+            Dict[str, float]: 
+                Dictionary mapping model names to their normalized ensemble weights.
+        """
+        # A few important notes:
+        # - the predictions are assumed to be numpy arrays of shape (n_samples,)
+        # - the ensemble is represented as a dict mapping model names to counts (number of times selected)
+        
+        model_names = list(predictions_dict.keys())
+
+        # Sorted initialization: start with top N models
+        if sorted_init > 0:
+            # Calculate initial scores per model
+            initial_scores = {}
+            for name in model_names:
+                score = self.compute_metric(y_true, predictions_dict[name])
+                initial_scores[name] = score
+
+            # Select best models
+            sorted_models = sorted(initial_scores.items(), key=lambda x: x[1])
+            init_models = [name for name, _ in sorted_models[:sorted_init]]
+
+            # Initialize ensemble with the top-sorted_init models
+            ensemble = {m: 1 for m in init_models}
+            current_pred = np.mean([predictions_dict[m] for m in init_models], axis=0)
+            current_score = self.compute_metric(y_true, current_pred)
+        else:
+            ensemble = {}
+            current_pred = np.zeros_like(y_true, dtype=float)
+            current_score = float('inf')
+
+        # Greedy selection
+        best_overall_score = current_score
+        best_overall_ensemble = ensemble.copy()
+
+        for _ in range(n_iterations):
+            best_model = None
+            best_score = current_score
+
+            # Try adding each model
+            for model_name in model_names:
+                ensemble_size = sum(ensemble.values())
+
+                # New prediction if we add this model
+                if ensemble_size == 0:
+                    new_pred = predictions_dict[model_name]
+                else:
+                    new_pred = (current_pred * ensemble_size + predictions_dict[model_name]) / (ensemble_size + 1)
+
+                score = self.compute_metric(y_true, new_pred)
+
+                if score < best_score:
+                    best_score = score
+                    best_model = model_name
+
+            # Add best model
+            if best_model is not None:
+                ensemble[best_model] = ensemble.get(best_model, 0) + 1
+                ensemble_size = sum(ensemble.values())
+                current_pred = (
+                    current_pred * (ensemble_size - 1) + predictions_dict[best_model]
+                ) / ensemble_size
+                current_score = best_score
+
+                # Track best ensemble
+                if current_score < best_overall_score:
+                    best_overall_score = current_score
+                    best_overall_ensemble = ensemble.copy()
+            else:
+                # No improvement possible
+                if not with_replacement:
+                    break
+                # With replacement, we keep going but performance plateaus
+
+        # Normalize weights between 0 and 1
+        total = sum(best_overall_ensemble.values())
+        return {k: v / total for k, v in best_overall_ensemble.items()} if total > 0 else {}
+
+    def predict(self, predictions_dict: Dict[str, np.ndarray], weights: Dict[str, float]) -> np.ndarray:
+        """
+        Make prediction using ensemble weights.
+
+        Args:
+            predictions_dict (Dict[str, np.ndarray]): Dictionary mapping model names to their prediction arrays.
+            weights (Dict[str, float]): Dictionary mapping model names to their ensemble weights.
+
+        Returns:
+            np.ndarray: Weighted ensemble prediction.
+        """
+        # pred = np.zeros_like(next(iter(predictions_dict.values())), dtype=float)
+        pred = np.zeros_like(list(predictions_dict.values())[0], dtype=float)
+        for model_name, weight in weights.items():
+            pred += predictions_dict[model_name] * weight
+        return pred
 
 # =============================================================================
 # ENSEMBLE WEIGHTS I/O
@@ -822,7 +1056,7 @@ def main():
                         help='Directory containing prediction CSV files.')
     parser.add_argument('--task', type=str, default='Dmax',
                         help='Task identifier: Dmax, DC50, or bin')
-    parser.add_argument('--output_dir', type=str, default='plots/',
+    parser.add_argument('--output_dir', type=str, default='ensemble_results/',
                         help='Directory to save output plots and results.')
     parser.add_argument('--hillclimb_perc', type=float, default=0.2,
                         help='Percentage of test set to use for selection (default: 0.5).')

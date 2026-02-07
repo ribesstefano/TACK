@@ -40,7 +40,7 @@ Please ensure you have the raw data files downloaded and placed in the `data/ori
 
 ## Pipeline Steps
 
-### 1. Scrape TPD-DB Data
+### 1. 🌐 Scrape TPD-DB Data
 
 Download PROTAC and molecular glue data from TPD-DB and save the text file into `data/original/`. Then run the scraping script to download the corresponding HTML pages:
 
@@ -58,7 +58,7 @@ python tack_dataset/tpddb_scraping.py \
 
 **Output:** Raw HTML files in `data/original/html/`
 
-### 2. Parse TPD-DB Data
+### 2. 📄 Parse TPD-DB Data
 
 Extract structured data from HTML files:
 
@@ -68,7 +68,7 @@ python tack_dataset/tpddb_parsing.py -v
 
 **Output:** Parsed CSV files in `data/parsed/`
 
-### 3. Clean TPD-DB Data
+### 3. 🧹 Clean TPD-DB Data
 
 Apply quality cleaning and standardization:
 
@@ -85,7 +85,7 @@ python tack_dataset/curate_tpddb.py
 
 **Output:** `data/curation/tpddb_protac_glues_dc50_dmax.csv`
 
-### 4. Curate PROTACpedia
+### 4. 📚 Curate PROTAC-Pedia
 
 Process PROTACpedia data:
 
@@ -101,7 +101,7 @@ python tack_dataset/curate_protacpedia.py
 
 **Output:** `data/curation/protacpedia_protac_dc50_dmax.csv`
 
-### 5. Curate PROTAC-DB
+### 5. 🗃️ Curate PROTAC-DB
 
 Process the PROTAC-DB dataset:
 
@@ -136,7 +136,7 @@ python tack_dataset/curate_protacdb_tpddb_protacpedia.py
 
 **Output:** `data/curation/protacdb_tpddb_protacpedia_protac_dc50_dmax_activities.csv`
 
-### 7. Create Data Splits
+### 7. ✂️ Create Data Splits
 
 Generate training+validation/hold-out splits:
 
