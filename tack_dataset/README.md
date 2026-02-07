@@ -216,3 +216,7 @@ data
 ```
 
 Final curated datasets for the TACK dataset will be available in `data/tack/` with standardized formats and cluster assignments for model training and evaluation.
+
+## Disclaimer
+
+The Python files: `tack_dataset/curate_protacpedia.py`, `tack_dataset/curate_protacdb.py`, `tack_dataset/curate_protacdb_tpddb_protacpedia.py`, `tack_dataset/data_splitting.py`, are derived from Jupyter notebooks under the `tack_dataset/notebooks/` directory. The notebooks contain detailed explanations and visualizations of the curation process, while the Python scripts are optimized for reproducibility and automation. Please refer to the notebooks for a deeper understanding of the data processing steps and rationale behind key decisions.
