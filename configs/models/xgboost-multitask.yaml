@@ -1,0 +1,22 @@
+model_config:
+    objective: "reg:squarederror"
+    eval_metric: "rmse"
+    tree_method: "hist"
+    # 1. THE BRAKES: Drastically lower learning rate
+    learning_rate: 0.01    
+    n_estimators: 2000     # Needs more rounds because LR is low
+    # 2. THE SMOOTHER: Subsampling (Bagging)
+    subsample: 0.60        # <--- CRITICAL: Train on random 60% chunks
+    colsample_bytree: 0.80 # Random 80% of features
+    # 3. THE ANCHOR: Force leaves to have significant weight
+    min_child_weight: 20   # <--- Increased from 10 to 20   
+    # 4. Constraints
+    max_depth: 5           # A nice middle ground
+    gamma: 1.5             # Original: 1.1
+    reg_alpha: 1.5
+    reg_lambda: 1.5
+    n_jobs: 10
+    seed: 42
+training_config:
+    num_boost_round: 2000
+    early_stopping_rounds: 30

@@ -1,0 +1,3 @@
+# TACK: A statistical evaluation of degradation activity on a novel TArgeting Chimeras Knowledge dataset
+
+This repository contains the code and data for the TACK dataset, a curated collection of PROTAC-induced degradation activities from multiple sources including TPD-DB, PROTAC-DB, and PROTACpedia. The dataset is designed for training and evaluating machine learning models to predict PROTAC activity.

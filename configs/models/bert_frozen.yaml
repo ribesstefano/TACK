@@ -1,0 +1,13 @@
+model_config:
+    learning_rate: 0.001
+    lr_scheduler_type: reduce_on_plateau
+    warmup_ratio: 0.2
+    num_cycles: 5
+    model_name: google-bert/bert-base-cased
+    task_type: point
+    head_dropout: 0.0
+    head_depth: 3
+    freeze_bert: true
+training_config:
+    max_epochs: 100
+    patience: 20

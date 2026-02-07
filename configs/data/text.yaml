@@ -1,0 +1,8 @@
+use_tokenizer: True
+tokenizer_name: 'google-bert/bert-base-cased'
+cell_line_col: 'Cell_Line'
+batch_size: 32
+# Labels
+normalize_labels: false
+standardize_labels: true
+impute_labels: true

@@ -1,0 +1,161 @@
+"""
+Utility functions for handling saving and loading dictionaries in JSON,
+pickle, or NPZ format.
+"""
+import os
+import logging
+import functools
+import pickle
+from pathlib import Path
+from typing import Optional, List, Dict
+
+import gdown
+import h5py
+import numpy as np
+import pandas as pd
+
+from tackai.config import config
+
+def get_cache_dir() -> str:
+    """Get the cache directory path and ensure it exists.
+    
+    Returns:
+        str: Path to the cache directory
+    """
+    cache_dir = os.environ.get(
+        "STAEDA_CACHE",
+        os.path.join(os.path.expanduser('~'), '.cache', 'staeda')
+    )
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except PermissionError as e:
+        # Fallback to a temporary directory
+        import tempfile
+        cache_dir = os.path.join(tempfile.gettempdir(), 'staeda')
+        os.makedirs(cache_dir, exist_ok=True)
+        logging.warning(f"Permission denied creating cache directory. Using temporary directory: {cache_dir}")
+    except Exception as e:
+        logging.error(f"Failed to create cache directory {cache_dir}: {e}")
+        raise
+    return cache_dir
+
+def download_file(url: str, dest: Path, hash: Optional[str] = None):
+    """ Download a file from a URL to a destination path.
+    Args:
+        url (str): The URL to download the file from.
+        dest (Path): The destination path where the file will be saved.
+    """
+    if not dest.parent.exists():
+        os.makedirs(dest.parent, exist_ok=True)
+        logging.debug(f"Created directory {dest.parent} for downloading file.")
+
+    if not dest.exists():
+        gdown.download(url, output=str(dest), quiet=False)
+        logging.debug(f"Downloaded {url} to {dest}")
+
+    if hash is not None:
+        import hashlib
+        sha256_hash = hashlib.sha256()
+        with open(dest, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        if sha256_hash.hexdigest() != hash:
+            raise ValueError(f"File {dest} does not match the expected hash {hash}.")
+
+@functools.lru_cache()
+def load_protein2embedding(
+    embeddings_path: Optional[str] = None,
+) -> Dict[str, np.ndarray]:
+    """ Load the protein embeddings from a file.
+
+    Args:
+        embeddings_path (str): The path to the embeddings file.
+
+    Returns:
+        Dict[str, np.ndarray]: A dictionary of protein embeddings.
+    """
+    if embeddings_path is None:
+        embeddings_path = Path(get_cache_dir()) / 'uniprot2embedding.h5'
+        if not embeddings_path.exists():
+            os.makedirs(embeddings_path.parent, exist_ok=True)
+            download_file(
+                url=config.uniprot2embedding_url,
+                dest=embeddings_path,
+            )
+            logging.debug(f"Downloaded protein embeddings to: {embeddings_path}")
+    protein2embedding = {}
+    with h5py.File(embeddings_path, "r") as file:
+        for sequence_id in file.keys():
+            embedding = file[sequence_id][:]
+            protein2embedding[sequence_id] = np.array(embedding)
+    return protein2embedding
+
+
+@functools.lru_cache()
+def load_cell2embedding(
+        embeddings_path: Optional[str] = None,
+) -> Dict[str, np.ndarray]:
+    """ Load the cell line embeddings from a file.
+    
+    Args:
+        embeddings_path (str): The path to the embeddings file.
+        
+    Returns:
+        Dict[str, np.ndarray]: A dictionary of cell line embeddings.
+    """
+    if embeddings_path is None:
+        embeddings_path = Path(get_cache_dir()) / 'cell2embedding.pkl'
+        if not embeddings_path.exists():
+            os.makedirs(embeddings_path.parent, exist_ok=True)
+            download_file(
+                url=config.cell2embedding_url,
+                dest=embeddings_path,
+            )
+            logging.debug(f"Downloaded protein embeddings to: {embeddings_path}")
+    with open(embeddings_path, 'rb') as f:
+        cell2embedding = pickle.load(f)
+    return cell2embedding
+
+
+@functools.lru_cache()
+def load_curated_dataset() -> pd.DataFrame:
+    """ Load the curated PROTAC dataset as described in the paper: https://arxiv.org/abs/2406.02637
+
+    Returns:
+        pd.DataFrame: The curated PROTAC dataset.
+    """
+    df_path = Path(get_cache_dir()) / 'PROTAC-Degradation-DB.csv'
+    if not df_path.exists():
+        os.makedirs(df_path.parent, exist_ok=True)
+        download_file(
+            url=config.curated_dataset_url,
+            dest=df_path,
+        )
+    return pd.read_csv(df_path)
+
+
+def avail_e3_ligases() -> List[str]:
+    """ Get the available E3 ligases.
+    
+    Returns:
+        List[str]: The available E3 ligases.
+    """
+    return list(config.e3_ligase2uniprot.keys())
+
+
+def avail_cell_lines() -> List[str]:
+    """ Get the available cell lines.
+    
+    Returns:
+        List[str]: The available cell lines.
+    """
+    return list(load_cell2embedding().keys())
+
+
+def avail_uniprots() -> List[str]:
+    """ Get the available Uniprot IDs.
+    
+    Returns:
+        List[str]: The available Uniprot IDs.
+    """
+    return list(load_protein2embedding().keys())
