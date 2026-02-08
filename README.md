@@ -1,3 +1,99 @@
 # TACK: A statistical evaluation of degradation activity on a novel TArgeting Chimeras Knowledge dataset
 
-This repository contains the code and data for the TACK dataset, a curated collection of PROTAC-induced degradation activities from multiple sources including TPD-DB, PROTAC-DB, and PROTACpedia. The dataset is designed for training and evaluating machine learning models to predict PROTAC activity.
+TACK combines data from multiple sources (TPD-DB, PROTAC-DB, and PROTAC-Pedia) to create the largest publicly available dataset for training and evaluating machine learning models that predict PROTAC-induced protein degradation activities.
+
+## 📚 Overview
+
+This repository provides:
+- **Curated Dataset**: High-quality PROTAC degradation data with DC50/Dmax measurements
+- **Data Curation Pipeline**: Scripts to reproduce the dataset from raw sources
+- **Training Framework**: Model training with nested 5×5 cross-validation
+- **Ensemble Selection**: Caruana's greedy forward selection with uncertainty quantification
+- **Benchmark Suite**: Standardized evaluation protocols and baselines
+
+Please refer to the [`tack_dataset/README.md`](tack_dataset/README.md) for detailed instructions on dataset curation and to [`scripts/README.md`](scripts/README.md) for model training and ensemble selection.
+
+### Key Features
+
+- ✅ **Multi-source integration** with deduplication and quality control
+- ✅ **Scaffold-based data splitting** to prevent information leakage
+- ✅ **Rigorous statistical evaluation** via repeated cross-validation
+- ✅ **Uncertainty quantification** through ensemble disagreement
+- ✅ **Multiple model architectures**: MLP, XGBoost
+- ✅ **Hyperparameter optimization** using Optuna
+
+## 🚀 Quick Start
+
+### Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/ribesstefano/TACK.git
+cd TACK
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Set PYTHONPATH
+export PYTHONPATH=$(pwd):$PYTHONPATH
+```
+
+### Download the Dataset
+
+The TACK dataset is available on Hugging Face:
+
+```python
+from datasets import load_dataset
+
+# Load full dataset
+ds = load_dataset("ailab-bio/TACK", split="train")
+
+# Load specific configurations
+dmax_ds = load_dataset("ailab-bio/TACK", "Dmax", split="train")
+dc50_ds = load_dataset("ailab-bio/TACK", "DC50", split="train")
+multitask_ds = load_dataset("ailab-bio/TACK", "multitask", split="train")
+```
+
+### Train a Model
+
+```bash
+# Train XGBoost model with scaffold-based splitting
+python scripts/train_models.py \
+    --model_type xgboost \
+    --task dmax \
+    --group scaffold \
+    --batch_size 64
+```
+
+### Construct Ensemble
+
+```bash
+# Run ensemble selection and comparison
+python scripts/ensemble_comparison.py \
+    --task dmax \
+    --prediction_dir ./predictions \
+    --output_dir ./ensemble_results
+```
+
+## 📂 Repository Structure
+
+```
+TACK/
+├── data/                  # Processed dataset files when running curation scripts
+├── configs/               # YAML configuration files for data and models
+├── logs/                  # Log files from data curation and model training
+├── notebooks/             # Jupyter notebooks for exploration
+├── predictions/           # Models' predictions on 5x5 CV splits and hold-out set
+├── ensemble_results/      # Results from ensemble selection and comparison
+├── scripts/               # Python scripts for training and ensemble selection
+├── requirements.txt       # Python package dependencies
+└── README.md              # This README file
+```
+
+## 📄 License
+
+The TACK dataset and code are released under the MIT License. See `LICENSE` for details.
+
+## 🤝 Acknowledgements
+
+We thank the contributors of the TPD-DB, PROTAC-DB, and PROTAC-Pedia for making this resource possible.
