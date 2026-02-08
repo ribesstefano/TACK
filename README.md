@@ -60,7 +60,7 @@ multitask_ds = load_dataset("ailab-bio/TACK", "multitask", split="train")
 
 - $DC_{50}$ regression: `data/tack/protacdb_tpddb_protacpedia_protac_dc50_activities_processed.csv`
 - $D_{max}$ regression: `data/tack/protacdb_tpddb_protacpedia_protac_dmax_activities_processed.csv`
-- Binary activity prediciton: `data/tack/protacdb_tpddb_protacpedia_protac_multitask_activities_processed.csv`
+- Binary activity prediction: `data/tack/protacdb_tpddb_protacpedia_protac_multitask_activities_processed.csv`
 
 ### Train a Model
 
