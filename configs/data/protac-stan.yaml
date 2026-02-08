@@ -18,8 +18,8 @@ cell_line_col: "Cell_Line_ID"
 # Proteins
 use_poi_precomputed_embedding: true
 use_ligase_precomputed_embedding: true
-poi_embeddings_file: "/mimer/NOBACKUP/groups/naiss2023-6-290/nils/PROTAC-STAN/data/custom/embeddings.npz"
-ligase_embeddings_file: "/mimer/NOBACKUP/groups/naiss2023-6-290/nils/PROTAC-STAN/data/custom/embeddings.npz"
+poi_embeddings_file: "path/to/ESM-S/embeddings.npz"
+ligase_embeddings_file: "path/to/ESM-S/embeddings.npz"
 poi_embeddings_per_residue: false
 ligase_embeddings_per_residue: false
 use_poi_pca: false
