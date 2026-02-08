@@ -2,7 +2,7 @@
 
 TACK combines data from multiple sources (TPD-DB, PROTAC-DB, and PROTAC-Pedia) to create the largest publicly available dataset for training and evaluating machine learning models that predict PROTAC-induced protein degradation activities.
 
-![Overview of the TACK dataset and training pipeline](misc/tack.drawio.png)
+![Overview of the TACK dataset and training pipeline](misc/tack_overview.png)
 
 ## 📚 Overview
 
@@ -60,7 +60,7 @@ multitask_ds = load_dataset("ailab-bio/TACK", "multitask", split="train")
 
 - $DC_{50}$ regression: `data/tack/protacdb_tpddb_protacpedia_protac_dc50_activities_processed.csv`
 - $D_{max}$ regression: `data/tack/protacdb_tpddb_protacpedia_protac_dmax_activities_processed.csv`
-- Binary activity prediciton: `data/tack/protacdb_tpddb_protacpedia_protac_dc50_dmax_activities_processed.csv`
+- Binary activity prediciton: `data/tack/protacdb_tpddb_protacpedia_protac_multitask_activities_processed.csv`
 
 ### Train a Model
 
