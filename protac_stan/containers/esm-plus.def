@@ -1,0 +1,19 @@
+Bootstrap: docker
+From: continuumio/miniconda3:23.10.0-1
+
+%post
+    apt-get update && apt-get install -y build-essential git && apt-get clean
+
+    conda install -y python=3.8.18
+    pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu116
+    pip install torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-1.12.1+cu116.html
+    pip install torchdrug
+
+    conda install -y easydict pyyaml -c conda-forge
+    pip install jupyterlab datasets huggingface_hub wandb fair-esm torch-geometric python-dotenv
+
+    conda clean --all -y
+    pip cache purge
+
+%environment
+    export PATH=/opt/conda/bin:$PATH
