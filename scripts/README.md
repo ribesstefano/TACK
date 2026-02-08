@@ -50,9 +50,9 @@ python scripts/train_models.py \
 - `dmax`: Dmax regression (% degradation)
 - `dc50`: DC50 regression (pDC50 scale)
 - `bin`: Binary activity classification
-- `dmax_bin`: Binary classification from Dmax
-- `dc50_bin`: Binary classification from DC50
-- `multitask`: Joint Dmax + DC50 prediction
+- `dmax_bin`: Binary classification from Dmax (thresholded at 80%)
+- `dc50_bin`: Binary classification from DC50 (thresholded at 100 nM)
+- `multitask`: Joint Dmax + DC50 prediction (either one of the regression targets)
 
 **Data Splitting Strategies:**
 - `random`: Random scaffold-free splitting
@@ -71,19 +71,12 @@ python scripts/train_models.py \
     --checkpoint_dir ./checkpoints \
     --predictions_dir ./predictions
 
-# Train BERT model for binary activity classification
-python scripts/train_models.py \
-    --model_type bert \
-    --task bin \
-    --group butina \
-    --batch_size 16
-
-# Multitask training with MLP
+# Train MLP model for binary activity classification
 python scripts/train_models.py \
     --model_type mlp \
-    --task multitask \
+    --task bin \
     --group random \
-    --batch_size 32
+    --batch_size 16
 ```
 
 ### ⚙️ Configuration Files
@@ -92,10 +85,10 @@ Custom configurations can be provided via YAML files:
 
 ```bash
 python scripts/train_models.py \
-    --model_type bert \
-    --task dmax \
-    --data_config configs/data/bert_full_features.yaml \
-    --model_config configs/model/bert_large.yaml
+    --model_type mlp \
+    --task bin \
+    --data_config configs/data/bin-fp.yaml \
+    --model_config configs/model/mlp-bin.yaml
 ```
 
 **Example configs in `configs/`:**
@@ -135,7 +128,7 @@ The script generates:
 **Example output structure:** by default the results will be saved under a newly created `ensemble_results` directory. Example after running the script for the `dmax`, `dc50`, and `bin` tasks:
 
 ```
-plots/
+ensemble_results/
 ├── ensemble_comparison_bin.png
 ├── ensemble_comparison_dc50.png
 ├── ensemble_comparison_dmax.png

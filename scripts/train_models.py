@@ -122,10 +122,18 @@ def main():
                         help='Path to YAML file with data configuration.')
     parser.add_argument('--model_config', type=str, default=None,
                         help='Path to YAML file with model configuration.')
+    pasrser.add_argument('--tune_hyperparameters', action='store_true',
+                        help='Whether to perform hyperparameter tuning (unused, in development).')
+    parser.add_argument('--n_tuning_trials', type=int, default=20,
+                        help='Number of hyperparameter tuning trials (unused, in development).')
+    parser.add_argument('--custom_dataset_csv', type=str, default=None,
+                        help='Path to a custom dataset CSV file that overrides the default TACK dataset (must contain the same columns).')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility.')
     args = parser.parse_args()
     
     # Set float32 matmul precision to high for better performance
-    pl.seed_everything(42)
+    pl.seed_everything(args.seed)
     torch.set_float32_matmul_precision('high')
     
     # Enable DEBUG logging
@@ -136,19 +144,25 @@ def main():
     Path(args.checkpoint_dir).mkdir(parents=True, exist_ok=True)
     Path(args.predictions_dir).mkdir(parents=True, exist_ok=True)
 
-    # Download and prepare dataset
-    ds_config = 'default'
-    if 'dmax' in args.task:
-        ds_config = 'Dmax'
-    elif 'dc50' in args.task:
-        ds_config = 'DC50'
-    elif args.task == 'bin' or (args.task == 'multitask' and args.model_type != 'bert'):
-        ds_config = 'multitask'
-    ds = load_dataset(
-        "ailab-bio/TACK",
-        ds_config,
-        split="train",
-    )
+    # Load custom dataset if provided, otherwise load default TACK dataset
+    if args.custom_dataset_csv is not None:
+        logger.debug(f"Loading custom dataset from CSV file: {args.custom_dataset_csv}")
+        df = pd.read_csv(args.custom_dataset_csv)
+        ds = Dataset.from_pandas(df, preserve_index=False)
+    else:
+        # Download and prepare dataset
+        ds_config = 'default'
+        if 'dmax' in args.task:
+            ds_config = 'Dmax'
+        elif 'dc50' in args.task:
+            ds_config = 'DC50'
+        elif args.task == 'bin' or (args.task == 'multitask' and args.model_type != 'bert'):
+            ds_config = 'multitask'
+        ds = load_dataset(
+            "ailab-bio/TACK",
+            ds_config,
+            split="train",
+        )
 
     # Process dataset labels based on task
     labels = ['Value']
