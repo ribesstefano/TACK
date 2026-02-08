@@ -1,6 +1,6 @@
 <h1 align="center">TACK</h1>
 
-<h3 align="center"><i>A statistical evaluation of degradation activity on a novel TArgeting Chimeras Knowledge dataset</i></h3>
+<h4 align="center"><i>A statistical evaluation of degradation activity on a novel TArgeting Chimeras Knowledge dataset</i></h4>
 
 <p align="center">
   <img src="misc/tack.drawio.png" alt="Overview of the TACK dataset and training pipeline" width="100%">
