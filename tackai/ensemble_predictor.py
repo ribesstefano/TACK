@@ -1,10 +1,11 @@
 """
-Ensemble Predictor for STAEDA Models
+Ensemble Predictor for TACK Models
 Handles loading and prediction from multiple model types (XGBoost, Lightning)
 with weighted averaging and uncertainty quantification.
 """
 import os
 import re
+import pickle
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Literal
@@ -13,6 +14,9 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 import torch
+
+from tackai.data.datamodule import load_datamodule
+from tackai.models.tackai_model import TACKModel
 
 warnings.filterwarnings('ignore')
 
@@ -148,27 +152,18 @@ class SampleInput:
         }
 
 
-# Default values for missing inputs based on common training data
+# Default values for optional inputs based on common training data.
+# NOTE: SMILES, POI (name/sequence), and E3 ligase (name/sequence) are
+# considered *required* — no defaults are supplied for them.
 DEFAULT_VALUES = {
-    'POI_Name': 'BRD4',
-    'POI_Sequence': 'MSSPQDLKNNIAQEYLTSQVLPGHTPPPPLLKKA',  # Short placeholder, will be extended
-    'Ligase_Name': 'VHL',
-    'Ligase_Sequence': 'MPRRAENWDE...',  # Placeholder
-    'Cell_Line_ID': 'HEK293',
-    'Assay': 'Dmax',
+    'Cell_Line_ID': 'Unknown',
+    'Assay': 'Unknown',
     'Assay_Time': 24.0,  # Default 24 hours
     'Degrader_Type': 'PROTAC',
 }
 
-# Commonly used BRD4 sequence for placeholder
-BRD4_SEQUENCE = (
-    "MSSPQDLKNNIAQEYLTSQVLPGHTPPPPLLKKAPKVKPLPPPLPPAPASGQKKQQQQQPQQQ"
-    "QPPPPPKKPHMERGNGKEKSTSGKLPNLVNGEGGKPWKIGKKENISSILPMCKIKDLLHSDC"
-    "ACLAWSEKDREEKQRLLAIRQQQLLQLEGLQQHQQQLQQQQQQQQQQQQQQQQQQLQQQQQQ"
-    "QQQQQLQPPPPPQPHLPPPPQPQLPQQQQQQQQQQQQQQQQQQQQQQQQQQQLQQQQPPPPP"
-    "PPPPPPPPPPPPPPQQQQQQQQQQQQQQQQLQQQQQLQQQQQLQQQQQQQQQQQQQQQQLQQ"
-    "QLQQQQLQQQQQQQQQQLQQQQQQQQQQQQQQQQQQQQQQQQQQQQLQPQQQPQQLPPPPPP"
-)
+# Task labels recognised in model filenames
+KNOWN_TASKS = {'dmax', 'dc50', 'bin', 'dmax_bin', 'dc50_bin', 'multitask'}
 
 
 class EnsemblePredictor:
@@ -205,7 +200,6 @@ class EnsemblePredictor:
         task: str = 'dmax',
         label_name: Optional[str] = None,
         device: str = 'cpu',
-        denormalize: bool = True,
     ) -> None:
         """
         Initialize the ensemble predictor.
@@ -217,13 +211,16 @@ class EnsemblePredictor:
             task: Task type ('dmax', 'dc50', 'bin')
             label_name: Name of the label column for denormalization
             device: Device to use for inference ('cpu' or 'cuda')
-            denormalize: Whether to denormalize predictions
         """
         self.models = models
         self.datamodules = datamodules
         self.task = task.lower()
         self.device = device
-        self.denormalize = denormalize
+        
+        # Per-model task inferred from filenames / datamodule label names
+        self.model_tasks: Dict[str, str] = {}
+        for name in models:
+            self.model_tasks[name] = self._infer_model_task(name, datamodules.get(name))
         
         # Infer label name if not provided
         if label_name is None:
@@ -250,6 +247,9 @@ class EnsemblePredictor:
         
         # Get a reference datamodule for shared operations
         self._ref_datamodule = self._get_reference_datamodule()
+        
+        # Pre-compute categorical choices across all datamodules
+        self._categorical_choices: Dict[str, List[str]] = self._collect_categorical_choices()
     
     def _infer_label_name(self) -> Optional[str]:
         """Infer label name from task or datamodule."""
@@ -272,6 +272,82 @@ class EnsemblePredictor:
             if dm is not None:
                 return dm
         return None
+    
+    # ------------------------------------------------------------------
+    # Task inference
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _infer_model_task(model_name: str, datamodule: Optional[Any] = None) -> str:
+        """Infer the prediction task for a single model.
+
+        The task is determined by:
+        1. The label names stored in the datamodule (most reliable).
+        2. Parsing the model filename (``model=<arch>_<task>_protac-...``).
+        3. Falling back to ``'dmax'`` if nothing else works.
+        """
+        # 1. From datamodule label names
+        if datamodule is not None and hasattr(datamodule, 'labels') and datamodule.labels:
+            label = datamodule.labels[0].lower()
+            if 'binary' in label or 'activity' in label:
+                return 'bin'
+            elif 'pdc50' in label or 'dc50' in label:
+                return 'dc50'
+            elif 'dmax' in label:
+                return 'dmax'
+
+        # 2. From model filename convention:
+        #    model=<arch>_<task>_protac-data=...
+        #    e.g. model=mlp_dmax_protac-data=...
+        m = re.search(r'model=\w+?_(\w+?)_protac', model_name, re.IGNORECASE)
+        if m:
+            task_str = m.group(1).lower()
+            if task_str in KNOWN_TASKS:
+                return task_str
+
+        return 'dmax'
+    
+    # ------------------------------------------------------------------
+    # Categorical choices
+    # ------------------------------------------------------------------
+
+    def _collect_categorical_choices(self) -> Dict[str, List[str]]:
+        """Collect unique category values from all datamodule ordinal encoders.
+
+        Returns a dict mapping column names (e.g. ``'Ligase_Name'``,
+        ``'Cell_Line_ID'``, ``'Assay'``) to sorted lists of known
+        categories seen during training (across **all** folds / configs).
+        """
+        merged: Dict[str, set] = {}
+        for dm in self.datamodules.values():
+            if dm is None:
+                continue
+            pipeline = getattr(dm, 'category_pipeline', None)
+            if pipeline is None:
+                continue
+            for _name, transformer, cols in pipeline.transformers_:
+                ordinal = transformer.named_steps.get('ordinal') if hasattr(transformer, 'named_steps') else None
+                if ordinal is None or not hasattr(ordinal, 'categories_'):
+                    continue
+                for col, cats in zip(cols, ordinal.categories_):
+                    if col not in merged:
+                        merged[col] = set()
+                    merged[col].update(c for c in cats if c is not None)
+        # Convert to sorted lists
+        return {col: sorted(vals) for col, vals in merged.items()}
+
+    def get_categorical_choices(self) -> Dict[str, List[str]]:
+        """Return known categorical values for each ordinal-encoded column.
+
+        Each list is sorted and **does not** include ``'Unknown'`` – the
+        caller should add it when building a UI.
+        """
+        return dict(self._categorical_choices)
+
+    @property
+    def available_tasks(self) -> List[str]:
+        """Return the distinct set of tasks present in the loaded models."""
+        return sorted(set(self.model_tasks.values()))
     
     def get_required_inputs(self, model_name: Optional[str] = None) -> Dict[str, List[str]]:
         """
@@ -327,78 +403,161 @@ class EnsemblePredictor:
         sample_dict: Dict[str, Any],
         datamodule: Optional[Any] = None,
         verbose: bool = True,
-    ) -> Dict[str, Any]:
-        """
-        Validate inputs and fill in defaults for missing values.
-        
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Validate inputs and fill in defaults for *optional* features.
+
+        **Required** inputs (SMILES, POI name/sequence, E3 ligase
+        name/sequence) will **not** be defaulted – a warning is emitted
+        instead and the caller can decide whether to skip the model.
+
+        The method also normalises user-supplied keys so that e.g. both
+        ``'Smiles'`` and ``'SMILES'`` are accepted.
+
         Args:
-            sample_dict: Dictionary of input values
-            datamodule: Datamodule to check requirements against
-            verbose: Whether to print warnings about missing inputs
-            
+            sample_dict: Dictionary of input values.
+            datamodule: Datamodule to check requirements against.
+            verbose: Whether to print warnings about missing inputs.
+
         Returns:
-            Dictionary with defaults filled in for missing values
+            A tuple ``(filled_dict, missing_required)`` where
+            ``missing_required`` lists column names that are required by
+            the datamodule but were not provided by the user.
         """
         dm = datamodule or self._ref_datamodule
         if dm is None:
-            return sample_dict
-        
-        filled = dict(sample_dict)
-        missing_warnings = []
-        
-        # Map standard column names to sample_dict keys and defaults
-        col_mappings = [
-            (dm.smiles_col, 'SMILES', None),  # SMILES is required, no default
-            (dm.poi_col, 'POI_Name', DEFAULT_VALUES.get('POI_Name')),
-            (dm.poi_sequence_col, 'POI_Sequence', BRD4_SEQUENCE),
-            (dm.ligase_col, 'Ligase_Name', DEFAULT_VALUES.get('Ligase_Name')),
-            (dm.ligase_sequence_col, 'Ligase_Sequence', DEFAULT_VALUES.get('Ligase_Sequence')),
-            (dm.cell_line_col, 'Cell_Line_ID', DEFAULT_VALUES.get('Cell_Line_ID')),
-            (dm.assay_type_col, 'Assay', DEFAULT_VALUES.get('Assay')),
-            (dm.treatment_time_col, 'Assay_Time', DEFAULT_VALUES.get('Assay_Time')),
+            return dict(sample_dict), []
+
+        # --- Normalise keys --------------------------------------------------
+        # Build a map from lower-cased key → datamodule column name so that
+        # user dicts with slightly different casing still match.
+        dm_col_names = [
+            dm.smiles_col, dm.poi_col, dm.poi_sequence_col,
+            dm.ligase_col, dm.ligase_sequence_col, dm.cell_line_col,
+            dm.treatment_time_col, dm.assay_type_col,
         ]
-        
-        for dm_col, default_key, default_val in col_mappings:
-            # Check if this column is needed
-            is_needed = False
-            if dm_col == dm.smiles_col:
-                is_needed = True
-            elif dm_col == dm.poi_col and (getattr(dm, 'use_poi_name_embedding', False) or 
-                                           getattr(dm, 'poi_embeddings_id_type', '') != 'sequence'):
-                is_needed = True
-            elif dm_col == dm.poi_sequence_col and (getattr(dm, 'use_poi_sequence_embedding', False) or
-                                                     getattr(dm, 'use_poi_precomputed_embedding', False)):
-                is_needed = True
-            elif dm_col == dm.ligase_col and getattr(dm, 'use_ligase_name_embedding', False):
-                is_needed = True
-            elif dm_col == dm.ligase_sequence_col and getattr(dm, 'use_ligase_precomputed_embedding', False):
-                is_needed = True
-            elif dm_col == dm.cell_line_col and (getattr(dm, 'use_cell_description_embedding', False) or
-                                                  getattr(dm, 'use_cell_name_embedding', False)):
-                is_needed = True
-            elif dm_col == dm.treatment_time_col and getattr(dm, 'use_treatment_time', False):
-                is_needed = True
-            elif dm_col == dm.assay_type_col and getattr(dm, 'use_assay_type_encoding', False):
-                is_needed = True
-            
-            # Check if value is missing/None
+        lower_to_dm = {c.lower(): c for c in dm_col_names if c}
+
+        filled: Dict[str, Any] = {}
+        for k, v in sample_dict.items():
+            canonical = lower_to_dm.get(k.lower(), k)
+            filled[canonical] = v
+
+        missing_required: List[str] = []
+        default_warnings: List[str] = []
+
+        # Columns that are *never* auto-filled – the user must provide them
+        required_cols = {dm.smiles_col, dm.poi_col, dm.poi_sequence_col,
+                         dm.ligase_col, dm.ligase_sequence_col}
+
+        # (dm_col, is_needed_check)
+        col_checks = [
+            (dm.smiles_col, lambda: True),
+            (dm.poi_col, lambda: (
+                getattr(dm, 'use_poi_name_embedding', False)
+                or getattr(dm, 'poi_embeddings_id_type', '') != 'sequence'
+            )),
+            (dm.poi_sequence_col, lambda: (
+                getattr(dm, 'use_poi_sequence_embedding', False)
+                or getattr(dm, 'use_poi_precomputed_embedding', False)
+            )),
+            (dm.ligase_col, lambda: getattr(dm, 'use_ligase_name_embedding', False)),
+            (dm.ligase_sequence_col, lambda: getattr(dm, 'use_ligase_precomputed_embedding', False)),
+            (dm.cell_line_col, lambda: (
+                getattr(dm, 'use_cell_description_embedding', False)
+                or getattr(dm, 'use_cell_name_embedding', False)
+            )),
+            (dm.treatment_time_col, lambda: getattr(dm, 'use_treatment_time', False)),
+            (dm.assay_type_col, lambda: getattr(dm, 'use_assay_type_encoding', False)),
+        ]
+
+        for dm_col, is_needed_fn in col_checks:
+            if not is_needed_fn():
+                continue
+
             current_val = filled.get(dm_col)
-            if is_needed and (current_val is None or (isinstance(current_val, str) and current_val.strip() == '')):
+            is_missing = current_val is None or (isinstance(current_val, str) and current_val.strip() == '')
+
+            if not is_missing:
+                continue
+
+            if dm_col in required_cols:
+                missing_required.append(dm_col)
+            else:
+                # Fill optional fields with defaults
+                default_val = DEFAULT_VALUES.get(dm_col)
                 if default_val is not None:
                     filled[dm_col] = default_val
-                    missing_warnings.append(f"  - {dm_col}: using default '{default_val if len(str(default_val)) < 30 else str(default_val)[:30] + '...'}'") 
-                elif dm_col == dm.smiles_col:
-                    raise ValueError(f"SMILES is required but not provided")
-        
-        if verbose and missing_warnings:
-            print(f"Note: Some inputs were missing and filled with defaults:")
-            for w in missing_warnings[:3]:  # Show max 3 warnings
-                print(w)
-            if len(missing_warnings) > 3:
-                print(f"  ... and {len(missing_warnings) - 3} more")
-        
-        return filled
+                    short = str(default_val) if len(str(default_val)) < 30 else str(default_val)[:30] + '...'
+                    default_warnings.append(f"  - {dm_col}: using default '{short}'")
+
+        if verbose:
+            if missing_required:
+                warnings.warn(
+                    f"Required input(s) missing: {', '.join(missing_required)}. "
+                    "Models that need these features will be skipped.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if default_warnings:
+                print("Note: Some inputs were missing and filled with defaults:")
+                for w in default_warnings[:5]:
+                    print(w)
+                if len(default_warnings) > 5:
+                    print(f"  ... and {len(default_warnings) - 5} more")
+
+        return filled, missing_required
     
+    @staticmethod
+    def _build_xgb_feature_names(
+        features_dict: Dict[str, np.ndarray],
+        datamodule: Optional[Any] = None,
+    ) -> List[str]:
+        """
+        Build feature names for XGBoost matching the training-time convention.
+        
+        The naming convention mirrors ``DegradationComplexDataModule.get_Xy``:
+        - Sequence features (POI/Ligase): use ngram names from the sklearn
+          encoder when available, otherwise ``{key}_{j}``.
+        - Scalar descriptor features ("Descriptor" in name, length 1): keep
+          the bare key with **no** ``_0`` suffix.
+        - All other features: ``{key}_{j}``.
+        
+        Args:
+            features_dict: Dictionary mapping feature keys to numpy arrays.
+            datamodule: Optional datamodule to extract sequence encoder names.
+            
+        Returns:
+            List of feature names in the order they appear when concatenated.
+        """
+        poi_seq_col = getattr(datamodule, 'poi_sequence_col', 'POI_Sequence') if datamodule else 'POI_Sequence'
+        lig_seq_col = getattr(datamodule, 'ligase_sequence_col', 'Ligase_Sequence') if datamodule else 'Ligase_Sequence'
+
+        # Try to get ngram names from the sequence encoder
+        ngram_names = None
+        if datamodule is not None:
+            seq_emb = getattr(datamodule, 'poi_sequence_embedding', None)
+            if seq_emb is not None and hasattr(seq_emb, 'sklearn_encoder'):
+                ngram_names = seq_emb.sklearn_encoder.get_feature_names_out()
+
+        feature_names: List[str] = []
+        for key in sorted(features_dict.keys()):
+            value = features_dict[key]
+            flat = value.flatten() if hasattr(value, 'flatten') else np.asarray(value).flatten()
+
+            if poi_seq_col in key or lig_seq_col in key:
+                # Sequence feature – use ngram names when available
+                if ngram_names is not None and len(ngram_names) == len(flat):
+                    feature_names.extend([f"{key}_{ng}" for ng in ngram_names])
+                else:
+                    feature_names.extend([f"{key}_{j}" for j in range(len(flat))])
+            elif 'Descriptor' in key and len(flat) == 1:
+                # Scalar descriptor – no suffix
+                feature_names.append(key)
+            else:
+                feature_names.extend([f"{key}_{j}" for j in range(len(flat))])
+
+        return feature_names
+
     def get_xgb_feature_names(self, datamodule: Any, sample_dict: Dict[str, Any]) -> List[str]:
         """
         Get feature names for XGBoost model from a sample featurization.
@@ -410,20 +569,8 @@ class EnsemblePredictor:
         Returns:
             List of feature names in order they appear in concatenated features
         """
-        # Get features as dict to see the names
         features = datamodule.featurize_sample(sample_dict, return_tensor='np')
-        
-        feature_names = []
-        for key in sorted(features.keys()):
-            value = features[key]
-            if hasattr(value, '__len__') and not isinstance(value, str):
-                # Multi-dimensional feature
-                for i in range(len(value.flatten())):
-                    feature_names.append(f"{key}_{i}")
-            else:
-                feature_names.append(key)
-        
-        return feature_names
+        return self._build_xgb_feature_names(features, datamodule)
     
     @staticmethod
     def _get_model_type(model: Any) -> str:
@@ -447,7 +594,6 @@ class EnsemblePredictor:
         label_name: Optional[str] = None,
         device: str = 'cpu',
         pattern: Optional[str] = None,
-        denormalize: bool = True,
     ) -> 'EnsemblePredictor':
         """
         Load models from a directory.
@@ -460,7 +606,6 @@ class EnsemblePredictor:
             label_name: Label column name for denormalization
             device: Device for inference
             pattern: Optional regex pattern to filter model files
-            denormalize: Whether to denormalize predictions
             
         Returns:
             Initialized EnsemblePredictor
@@ -502,7 +647,7 @@ class EnsemblePredictor:
         if not models:
             raise ValueError(f"No models could be loaded from {model_dir}")
         
-        return cls(models, datamodules, weights, task, label_name, device, denormalize)
+        return cls(models, datamodules, weights, task, label_name, device)
     
     @classmethod
     def from_weights_file(
@@ -511,7 +656,6 @@ class EnsemblePredictor:
         model_dir: Union[str, Path],
         datamodule_dir: Optional[Union[str, Path]] = None,
         device: str = 'cpu',
-        denormalize: bool = True,
     ) -> 'EnsemblePredictor':
         """
         Load an ensemble predictor from a weights JSON file.
@@ -523,7 +667,6 @@ class EnsemblePredictor:
             model_dir: Directory containing model checkpoints
             datamodule_dir: Directory containing datamodule state dicts
             device: Device for inference
-            denormalize: Whether to denormalize predictions
             
         Returns:
             Initialized EnsemblePredictor with only the specified models
@@ -596,7 +739,6 @@ class EnsemblePredictor:
             weights=loaded_weights,
             task=task,
             device=device,
-            denormalize=denormalize,
         )
     
     @staticmethod
@@ -689,8 +831,7 @@ class EnsemblePredictor:
                 
             try:
                 if hparams_path.suffix == '.yaml' and state_path and state_path.exists():
-                    # Load from YAML + state dict using staeda's load_datamodule
-                    from tackai.data.datamodule import load_datamodule
+                    # Load from YAML + state dict using tackai's load_datamodule
                     datamodule = load_datamodule(hparams_path, state_path)
                     break
                 elif hparams_path.suffix == '.pt':
@@ -705,9 +846,8 @@ class EnsemblePredictor:
                 print(f"    Warning: Failed to load datamodule from {hparams_path}: {e}")
         
         try:
-            # Load Lightning model using STAEDAModel.load_from_checkpoint
-            from tackai.models.staeda_model import STAEDAModel
-            model = STAEDAModel.load_from_checkpoint(
+            # Load Lightning model using TACKModel.load_from_checkpoint
+            model = TACKModel.load_from_checkpoint(
                 str(model_path), 
                 map_location=device,
             )
@@ -742,7 +882,6 @@ class EnsemblePredictor:
             model = xgb.Booster()
             model.load_model(str(model_path))
         elif suffix == '.pkl':
-            import pickle
             with open(model_path, 'rb') as f:
                 model = pickle.load(f)
         else:
@@ -865,23 +1004,30 @@ class EnsemblePredictor:
             elif datamodule is not None:
                 try:
                     # Validate and fill defaults for this specific datamodule
-                    filled_sample = self.validate_and_fill_defaults(
+                    filled_sample, missing_required = self.validate_and_fill_defaults(
                         sample_dict, datamodule, verbose=False
                     )
+                    
+                    if missing_required:
+                        warnings.warn(
+                            f"Skipping model '{name}': missing required input(s) "
+                            f"{', '.join(missing_required)}.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
+                        featurized[name] = None
+                        continue
                     
                     # Determine format based on model type
                     if model_type == 'xgboost':
                         # For XGBoost, get features as dict first to preserve names
                         features_dict = datamodule.featurize_sample(filled_sample, return_tensor='np')
-                        # Store as tuple: (flattened_array, feature_names)
+                        # Build feature names matching training convention
+                        feature_names = self._build_xgb_feature_names(features_dict, datamodule)
+                        # Flatten feature values in the same sorted-key order
                         feature_list = []
-                        feature_names = []
                         for key in sorted(features_dict.keys()):
-                            value = features_dict[key]
-                            flat_value = value.flatten()
-                            feature_list.append(flat_value)
-                            for i in range(len(flat_value)):
-                                feature_names.append(f"{key}_{i}")
+                            feature_list.append(features_dict[key].flatten())
                         features = (np.concatenate(feature_list).astype(np.float32), feature_names)
                     elif model_type == 'lightning':
                         features = datamodule.featurize_sample(filled_sample, return_tensor='pt')
@@ -918,7 +1064,14 @@ class EnsemblePredictor:
             raise ValueError(f"Unknown model type for {model_name}")
     
     def _predict_xgboost(self, model: Any, features: Any) -> np.ndarray:
-        """Get prediction from XGBoost model."""
+        """Get prediction from XGBoost model.
+        
+        When *features* is a ``(array, feature_names)`` tuple the method
+        builds a ``pandas.DataFrame`` so that columns are aligned to the
+        model's expected feature order.  This avoids errors caused by the
+        inference code iterating feature keys in a different order than the
+        training code.
+        """
         import xgboost as xgb
         
         # Handle tuple of (features, feature_names)
@@ -930,24 +1083,31 @@ class EnsemblePredictor:
             if features.ndim == 1:
                 features = features.reshape(1, -1)
             
-            # Try to get feature names from the model if not provided
-            if feature_names is None:
-                try:
-                    model_feature_names = model.feature_names
-                    if model_feature_names:
-                        feature_names = model_feature_names
-                except:
-                    pass
+            # Try to get the model's expected feature names
+            model_feature_names = None
+            try:
+                model_feature_names = model.feature_names
+            except Exception:
+                pass
             
-            # Create DMatrix with feature names if available
-            if feature_names is not None:
-                # Check if number of features matches
-                if len(feature_names) == features.shape[1]:
+            if feature_names is not None and model_feature_names is not None:
+                if set(feature_names) == set(model_feature_names) and len(feature_names) == features.shape[1]:
+                    # Same features, possibly different order – build a
+                    # DataFrame and reorder columns to match the model.
+                    df = pd.DataFrame(features, columns=feature_names)
+                    df = df[model_feature_names]
+                    dmatrix = xgb.DMatrix(df)
+                elif len(feature_names) == features.shape[1]:
                     dmatrix = xgb.DMatrix(features, feature_names=feature_names)
                 else:
-                    # Feature count mismatch - try without names
-                    print(f"Warning: Feature count mismatch ({features.shape[1]} vs {len(feature_names)} names). Using without feature names.")
+                    print(
+                        f"Warning: Feature count mismatch "
+                        f"({features.shape[1]} vs {len(feature_names)} names). "
+                        f"Using without feature names."
+                    )
                     dmatrix = xgb.DMatrix(features)
+            elif feature_names is not None and len(feature_names) == features.shape[1]:
+                dmatrix = xgb.DMatrix(features, feature_names=feature_names)
             else:
                 dmatrix = xgb.DMatrix(features)
         elif isinstance(features, pd.DataFrame):
@@ -1028,8 +1188,6 @@ class EnsemblePredictor:
         Returns:
             Denormalized prediction array
         """
-        if not self.denormalize:
-            return prediction
         
         dm = datamodule or self._ref_datamodule
         
@@ -1062,112 +1220,128 @@ class EnsemblePredictor:
         self,
         sample: Union[SampleInput, Dict[str, Any]],
         return_individual: bool = True,
-    ) -> EnsemblePrediction:
-        """
-        Make ensemble prediction.
-        
+        tasks: Optional[List[str]] = None,
+    ) -> Dict[str, EnsemblePrediction]:
+        """Make ensemble prediction, returning one result per task.
+
+        When the ensemble contains models for multiple tasks (e.g. ``dmax``,
+        ``dc50``, ``bin``), each task's models are aggregated independently
+        and a separate ``EnsemblePrediction`` is returned for each.
+
         Args:
-            sample: SampleInput object or dictionary with input data
-            return_individual: Whether to return individual model predictions
-            
+            sample: ``SampleInput`` object or dictionary with input data.
+            return_individual: Whether to return individual model predictions.
+            tasks: Optional subset of tasks to predict.  ``None`` means all
+                available tasks.
+
         Returns:
-            EnsemblePrediction object with weighted mean, uncertainty, and details
+            Dictionary mapping task name to ``EnsemblePrediction``.
+            If the ensemble contains only a single task this dict will have
+            one entry.
         """
         # Featurize input for all models
         features = self.featurize_input(sample)
-        
-        # Collect predictions from all models
-        individual_predictions_normalized = {}
-        
+
+        # Group models by task
+        task_models: Dict[str, Dict[str, np.ndarray]] = {}  # task -> {model: pred}
+        allowed_tasks = set(tasks) if tasks else None
+
         for model_name in self.models.keys():
             if model_name not in self.weights:
                 continue
-            
+
+            model_task = self.model_tasks.get(model_name, self.task)
+            if allowed_tasks is not None and model_task not in allowed_tasks:
+                continue
+
             model_features = features.get(model_name)
             if model_features is None:
-                # Try to use any available features
-                available = [f for f in features.values() if f is not None]
-                if available:
-                    model_features = available[0]
-            
+                continue
+
             try:
                 pred = self.predict_single_model(model_name, model_features)
-                individual_predictions_normalized[model_name] = pred
+                task_models.setdefault(model_task, {})[model_name] = pred
             except Exception as e:
                 error_msg = str(e)
-                # Shorten feature_names mismatch errors (they can be very long)
                 if 'feature_names mismatch' in error_msg:
                     error_msg = "feature_names mismatch (training/inference feature encoding incompatible)"
                 print(f"Warning: Prediction failed for model={model_name}: {error_msg}")
                 continue
-        
-        if not individual_predictions_normalized:
+
+        if not task_models:
             raise RuntimeError("All model predictions failed")
-        
-        # Compute weighted average (normalized)
-        weighted_sum = np.zeros_like(list(individual_predictions_normalized.values())[0], dtype=float)
-        weight_sum = 0.0
-        
-        for model_name, pred in individual_predictions_normalized.items():
-            weight = self.weights.get(model_name, 0.0)
-            weighted_sum += pred * weight
-            weight_sum += weight
-        
-        weighted_mean_normalized = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
-        
-        # Compute uncertainty in normalized space
-        all_preds_normalized = np.array(list(individual_predictions_normalized.values()))
-        uncertainty_std_normalized = np.std(all_preds_normalized, axis=0)
-        
-        # Denormalize predictions
-        individual_predictions = {}
-        for model_name, pred in individual_predictions_normalized.items():
-            dm = self.datamodules.get(model_name) or self._ref_datamodule
-            individual_predictions[model_name] = self.denormalize_prediction(pred, dm)
-        
-        weighted_mean = self.denormalize_prediction(weighted_mean_normalized)
-        
-        # Compute uncertainty in original scale
-        # Use delta method approximation: denormalize mean ± std
-        upper = self.denormalize_prediction(weighted_mean_normalized + uncertainty_std_normalized)
-        lower = self.denormalize_prediction(weighted_mean_normalized - uncertainty_std_normalized)
-        uncertainty_std = (upper - lower) / 2.0
-        
-        # Compute additional metrics for binary classification
-        predictive_entropy = None
-        if self.task == 'bin':
-            avg_pred = np.clip(weighted_mean, 1e-7, 1 - 1e-7)
-            predictive_entropy = -(
-                avg_pred * np.log(avg_pred) +
-                (1 - avg_pred) * np.log(1 - avg_pred)
+
+        # Build one EnsemblePrediction per task
+        results: Dict[str, EnsemblePrediction] = {}
+        for task_name, preds_norm in task_models.items():
+            # Weighted average (normalized)
+            weighted_sum = np.zeros_like(list(preds_norm.values())[0], dtype=float)
+            weight_sum = 0.0
+            for mn, pred in preds_norm.items():
+                w = self.weights.get(mn, 0.0)
+                weighted_sum += pred * w
+                weight_sum += w
+            weighted_mean_normalized = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
+
+            all_preds_norm = np.array(list(preds_norm.values()))
+            uncertainty_std_normalized = np.std(all_preds_norm, axis=0)
+
+            # Denormalize
+            individual_predictions = {}
+            for mn, pred in preds_norm.items():
+                dm = self.datamodules.get(mn) or self._ref_datamodule
+                individual_predictions[mn] = self.denormalize_prediction(pred, dm)
+
+            weighted_mean = self.denormalize_prediction(weighted_mean_normalized)
+            upper = self.denormalize_prediction(weighted_mean_normalized + uncertainty_std_normalized)
+            lower = self.denormalize_prediction(weighted_mean_normalized - uncertainty_std_normalized)
+            uncertainty_std = (upper - lower) / 2.0
+
+            # Task label name
+            task_to_label = {
+                'dmax': 'Dmax (%) (DC50/Dmax)',
+                'dc50': 'pDC50 (DC50/Dmax)',
+                'bin': 'Binary_Activity',
+            }
+            label_name = task_to_label.get(task_name, self.label_name)
+
+            # Binary classification entropy
+            predictive_entropy = None
+            if task_name == 'bin':
+                avg_pred = np.clip(weighted_mean, 1e-7, 1 - 1e-7)
+                predictive_entropy = -(
+                    avg_pred * np.log(avg_pred)
+                    + (1 - avg_pred) * np.log(1 - avg_pred)
+                )
+
+            results[task_name] = EnsemblePrediction(
+                weighted_mean=weighted_mean,
+                uncertainty_std=uncertainty_std,
+                weighted_mean_normalized=weighted_mean_normalized,
+                uncertainty_std_normalized=uncertainty_std_normalized,
+                individual_predictions=individual_predictions if return_individual else {},
+                individual_predictions_normalized=preds_norm if return_individual else {},
+                weights={k: v for k, v in self.weights.items() if k in preds_norm},
+                model_names=list(preds_norm.keys()),
+                task=task_name,
+                label_name=label_name,
+                predictive_entropy=predictive_entropy,
             )
-        
-        return EnsemblePrediction(
-            weighted_mean=weighted_mean,
-            uncertainty_std=uncertainty_std,
-            weighted_mean_normalized=weighted_mean_normalized,
-            uncertainty_std_normalized=uncertainty_std_normalized,
-            individual_predictions=individual_predictions if return_individual else {},
-            individual_predictions_normalized=individual_predictions_normalized if return_individual else {},
-            weights={k: v for k, v in self.weights.items() if k in individual_predictions_normalized},
-            model_names=list(individual_predictions_normalized.keys()),
-            task=self.task,
-            label_name=self.label_name,
-            predictive_entropy=predictive_entropy,
-        )
+
+        return results
     
     def predict_batch(
         self,
         samples: List[Union[SampleInput, Dict[str, Any]]],
-    ) -> List[EnsemblePrediction]:
-        """
-        Make batch predictions.
-        
+    ) -> List[Dict[str, EnsemblePrediction]]:
+        """Make batch predictions.
+
         Args:
-            samples: List of SampleInput objects or dictionaries
-            
+            samples: List of SampleInput objects or dictionaries.
+
         Returns:
-            List of EnsemblePrediction objects
+            List of dicts mapping task name to ``EnsemblePrediction``
+            (one dict per sample).
         """
         results = []
         
@@ -1191,23 +1365,12 @@ class EnsemblePredictor:
         cell_line_col: Optional[str] = None,
         treatment_time_col: Optional[str] = None,
     ) -> pd.DataFrame:
+        """Make predictions for a DataFrame.
+
+        Adds one set of prediction columns per task present in the ensemble.
         """
-        Make predictions for a DataFrame.
-        
-        Args:
-            df: Input DataFrame
-            smiles_col: Column name for SMILES
-            poi_col: Column name for POI name
-            poi_sequence_col: Column name for POI sequence
-            ligase_col: Column name for ligase name
-            cell_line_col: Column name for cell line
-            treatment_time_col: Column name for treatment time
-            
-        Returns:
-            DataFrame with predictions added
-        """
-        results = []
-        
+        all_row_results = []
+
         for idx, row in df.iterrows():
             sample = SampleInput(
                 smiles=row.get(smiles_col) if smiles_col in row else None,
@@ -1217,41 +1380,40 @@ class EnsemblePredictor:
                 cell_line=row.get(cell_line_col) if cell_line_col and cell_line_col in row else None,
                 treatment_time=row.get(treatment_time_col) if treatment_time_col and treatment_time_col in row else None,
             )
-            
+
+            row_dict: Dict[str, Any] = {}
             try:
-                result = self.predict(sample, return_individual=True)  # Need individual for CI
-                ci_lower = result.ci_lower_95[0] if result.ci_lower_95 is not None else np.nan
-                ci_upper = result.ci_upper_95[0] if result.ci_upper_95 is not None else np.nan
-                results.append({
-                    'prediction': result.weighted_mean[0] if result.weighted_mean is not None else np.nan,
-                    'uncertainty': result.uncertainty_std[0] if result.uncertainty_std is not None else np.nan,
-                    'ci_lower': ci_lower,
-                    'ci_upper': ci_upper,
-                })
+                task_results = self.predict(sample, return_individual=True)
+                for task_name, result in task_results.items():
+                    suffix = f"_{task_name}" if len(task_results) > 1 else ""
+                    ci_lower = result.ci_lower_95[0] if result.ci_lower_95 is not None else np.nan
+                    ci_upper = result.ci_upper_95[0] if result.ci_upper_95 is not None else np.nan
+                    row_dict[f'prediction{suffix}'] = result.weighted_mean[0] if result.weighted_mean is not None else np.nan
+                    row_dict[f'uncertainty{suffix}'] = result.uncertainty_std[0] if result.uncertainty_std is not None else np.nan
+                    row_dict[f'ci_lower{suffix}'] = ci_lower
+                    row_dict[f'ci_upper{suffix}'] = ci_upper
             except Exception as e:
-                results.append({
-                    'prediction': np.nan,
-                    'uncertainty': np.nan,
-                    'ci_lower': np.nan,
-                    'ci_upper': np.nan,
-                    'error': str(e),
-                })
-        
-        result_df = pd.DataFrame(results)
+                row_dict['error'] = str(e)
+
+            all_row_results.append(row_dict)
+
+        result_df = pd.DataFrame(all_row_results)
         return pd.concat([df.reset_index(drop=True), result_df], axis=1)
-    
+
     def get_model_info(self) -> Dict[str, Any]:
         """Get information about loaded models."""
         return {
             'n_models': len(self.models),
             'model_names': list(self.models.keys()),
             'model_types': self.model_types,
+            'model_tasks': self.model_tasks,
             'weights': self.weights,
             'task': self.task,
+            'available_tasks': self.available_tasks,
             'label_name': self.label_name,
             'device': self.device,
-            'denormalize': self.denormalize,
             'has_datamodule': self._ref_datamodule is not None,
+            'categorical_choices': self.get_categorical_choices(),
         }
     
     def update_weights(self, new_weights: Dict[str, float]) -> None:

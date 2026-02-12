@@ -20,7 +20,7 @@ from sklearn.model_selection import GroupKFold, KFold
 from sklearn.metrics import mean_squared_error
 
 from staeda import DegradationComplexDataModule
-from staeda import STAEDAModel
+from staeda import TACKModel
 from tackai.config import (
     save_config_to_yaml,
     load_config_from_yaml,
@@ -308,7 +308,7 @@ def train_lightning_model(
         Trained PyTorch Lightning module.
     """
     # Create model
-    model = STAEDAModel(
+    model = TACKModel(
         model_type=model_type,
         label_names=label_names,
         **model_config['model_config'],
@@ -808,7 +808,7 @@ def run_cv_experiment(
             
             if checkpoint_path.exists():
                 print(f"Loading existing model from: {checkpoint_path}")
-                model = STAEDAModel.load_from_checkpoint(checkpoint_path)
+                model = TACKModel.load_from_checkpoint(checkpoint_path)
             else:
                 current_config = model_config.copy()
                 
@@ -874,7 +874,7 @@ def run_cv_experiment(
             
             # if checkpoint_path.exists():
             #     print(f"Loading existing model from: {checkpoint_path}")
-            #     model = STAEDAModel.load_from_checkpoint(checkpoint_path)
+            #     model = TACKModel.load_from_checkpoint(checkpoint_path)
             # else:                
             #     if model_type == 'mlp':
             #         feature_dim = data_module.get_total_feature_dim()

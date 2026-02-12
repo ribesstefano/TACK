@@ -45,7 +45,7 @@ export PYTHONPATH=$(pwd):$PYTHONPATH
 
 ### Download the Dataset
 
-The TACK dataset is available on Hugging Face:
+The TACK dataset will soon be available on Hugging Face:
 
 ```python
 from datasets import load_dataset

@@ -42,7 +42,7 @@ def classification_metrics(prefix: str):
         prefix=prefix,
     )
 
-class STAEDAModel(pl.LightningModule):
+class TACKModel(pl.LightningModule):
 
     def __init__(
             self,

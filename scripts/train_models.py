@@ -84,7 +84,8 @@ def convert_dc50_to_pdc50(example, type_col='Value_Type', value_col='Value'):
     """ Convert DC50 in nano Molar to pDC50 (-log10(M)). """
     if type_col in example and example[type_col] == 'Dmax':
         return example
-    return DegradationComplexDataModule.convert_dc50_to_pdc50(example[value_col])
+    example['Value'] = DegradationComplexDataModule.convert_dc50_to_pdc50(example[value_col])
+    return example
 
 def split_held_out(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """ Split the dataframe into held-out and non-held-out sets based on the
