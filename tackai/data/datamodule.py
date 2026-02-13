@@ -32,12 +32,12 @@ from sklearn.impute import SimpleImputer, IterativeImputer
 from sklearn.decomposition import PCA
 from transformers import AutoTokenizer
 
-from staeda import (
+from tackai import (
     ProteinEmbedding,
     CellEmbedding,
     MolEmbedding,
 )
-from staeda import load_config_from_yaml
+from tackai import load_config_from_yaml
 
 class DegradationComplexDataModule(pl.LightningDataModule):
     

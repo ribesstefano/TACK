@@ -12,7 +12,7 @@ import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from datasets import DatasetDict, Dataset
 
-from staeda import DegradationComplexDataModule
+from tackai import DegradationComplexDataModule
 
 def get_xgboost_predictions(
     model: xgb.Booster,

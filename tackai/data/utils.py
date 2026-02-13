@@ -24,14 +24,14 @@ def get_cache_dir() -> str:
     """
     cache_dir = os.environ.get(
         "STAEDA_CACHE",
-        os.path.join(os.path.expanduser('~'), '.cache', 'staeda')
+        os.path.join(os.path.expanduser('~'), '.cache', 'tackai')
     )
     try:
         os.makedirs(cache_dir, exist_ok=True)
     except PermissionError as e:
         # Fallback to a temporary directory
         import tempfile
-        cache_dir = os.path.join(tempfile.gettempdir(), 'staeda')
+        cache_dir = os.path.join(tempfile.gettempdir(), 'tackai')
         os.makedirs(cache_dir, exist_ok=True)
         logging.warning(f"Permission denied creating cache directory. Using temporary directory: {cache_dir}")
     except Exception as e:

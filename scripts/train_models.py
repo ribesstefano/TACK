@@ -19,7 +19,7 @@ from datasets import load_dataset, Dataset
 
 from tackai.config import load_config_from_yaml  # noqa: E402
 from tackai.training import run_cv_experiment
-from staeda import DegradationComplexDataModule
+from tackai import DegradationComplexDataModule
 
 def get_bin_label(
         row: Union[pd.Series, Dict[str, Any]],

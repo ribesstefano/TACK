@@ -19,8 +19,8 @@ from datasets import Dataset, DatasetDict
 from sklearn.model_selection import GroupKFold, KFold
 from sklearn.metrics import mean_squared_error
 
-from staeda import DegradationComplexDataModule
-from staeda import TACKModel
+from tackai import DegradationComplexDataModule
+from tackai import TACKModel
 from tackai.config import (
     save_config_to_yaml,
     load_config_from_yaml,
