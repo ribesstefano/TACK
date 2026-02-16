@@ -11,9 +11,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Literal
 from dataclasses import dataclass, field
 
+import torch
 import numpy as np
 import pandas as pd
-import torch
+import xgboost as xgb
 
 from tackai.data.datamodule import load_datamodule
 from tackai.models.tackai_model import TACKModel
@@ -23,55 +24,75 @@ warnings.filterwarnings('ignore')
 
 @dataclass
 class EnsemblePrediction:
-    """Container for ensemble prediction results."""
-    # Core predictions (in original scale after denormalization)
+    """Container for ensemble prediction results.
+
+    All predictions are stored in the **original (denormalized) scale**.
+    Two kinds of 95% confidence intervals are provided:
+
+    * **Percentile CI** – non-parametric, based on the 2.5th and 97.5th
+      percentiles of the individual model predictions.  Interpretation:
+      "most models predict within this range."
+    * **SEM CI** – parametric, based on the standard error of the mean
+      (assumes approximate normality).  Interpretation: "the true average
+      prediction is likely in this range."  Shrinks towards zero as the
+      number of models increases.
+    """
+    # Core predictions (denormalized / original scale)
     weighted_mean: np.ndarray
     uncertainty_std: np.ndarray
-    
-    # Raw predictions (normalized, before inverse transform)
-    weighted_mean_normalized: np.ndarray
-    uncertainty_std_normalized: np.ndarray
-    
-    # Individual model info
+
+    # Individual model info (all denormalized)
     individual_predictions: Dict[str, np.ndarray]
-    individual_predictions_normalized: Dict[str, np.ndarray]
     weights: Dict[str, float]
     model_names: List[str]
-    
+
     # Task and label info
     task: str = 'dmax'
     label_name: Optional[str] = None
-    
-    # Additional uncertainty metrics (computed in original scale)
+
+    # Additional uncertainty metrics (computed from denormalized predictions)
     prediction_variance: np.ndarray = field(default=None)
     prediction_range: np.ndarray = field(default=None)
     prediction_iqr: np.ndarray = field(default=None)
-    
+
     # For binary classification
     predictive_entropy: Optional[np.ndarray] = None
-    
-    # Confidence intervals
-    ci_lower_95: Optional[np.ndarray] = None
-    ci_upper_95: Optional[np.ndarray] = None
-    
+
+    # Percentile-based 95% CI (non-parametric)
+    ci_percentile_lower_95: Optional[np.ndarray] = None
+    ci_percentile_upper_95: Optional[np.ndarray] = None
+
+    # Standard Error Method (SEM)-based 95% CI (parametric, normal assumption)
+    ci_sem_lower_95: Optional[np.ndarray] = None
+    ci_sem_upper_95: Optional[np.ndarray] = None
+
     def __post_init__(self):
-        """Compute additional uncertainty metrics."""
+        """Compute additional uncertainty metrics from denormalized predictions."""
         if not self.individual_predictions:
             return
-            
+
         preds = np.array(list(self.individual_predictions.values()))
-        
+        n_models = len(preds)
+
         self.prediction_variance = np.var(preds, axis=0)
         self.prediction_range = np.max(preds, axis=0) - np.min(preds, axis=0)
-        
+
         q75 = np.percentile(preds, 75, axis=0)
         q25 = np.percentile(preds, 25, axis=0)
         self.prediction_iqr = q75 - q25
-        
-        # 95% confidence intervals
-        self.ci_lower_95 = self.weighted_mean - 1.96 * self.uncertainty_std
-        self.ci_upper_95 = self.weighted_mean + 1.96 * self.uncertainty_std
-    
+
+        # --- Percentile-based 95% CI (non-parametric) ---
+        self.ci_percentile_lower_95 = np.percentile(preds, 2.5, axis=0)
+        self.ci_percentile_upper_95 = np.percentile(preds, 97.5, axis=0)
+
+        # --- SEM-based 95% CI (parametric) ---
+        if n_models > 1:
+            sem = np.std(preds, ddof=1, axis=0) / np.sqrt(n_models)
+        else:
+            sem = np.zeros_like(self.weighted_mean)
+        self.ci_sem_lower_95 = self.weighted_mean - 1.96 * sem
+        self.ci_sem_upper_95 = self.weighted_mean + 1.96 * sem
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization."""
         def to_list(arr):
@@ -80,13 +101,14 @@ class EnsemblePrediction:
             if isinstance(arr, np.ndarray):
                 return arr.tolist()
             return arr
-        
+
         return {
             'weighted_mean': to_list(self.weighted_mean),
             'uncertainty_std': to_list(self.uncertainty_std),
-            'weighted_mean_normalized': to_list(self.weighted_mean_normalized),
-            'ci_lower_95': to_list(self.ci_lower_95),
-            'ci_upper_95': to_list(self.ci_upper_95),
+            'ci_percentile_lower_95': to_list(self.ci_percentile_lower_95),
+            'ci_percentile_upper_95': to_list(self.ci_percentile_upper_95),
+            'ci_sem_lower_95': to_list(self.ci_sem_lower_95),
+            'ci_sem_upper_95': to_list(self.ci_sem_upper_95),
             'prediction_variance': to_list(self.prediction_variance),
             'prediction_range': to_list(self.prediction_range),
             'prediction_iqr': to_list(self.prediction_iqr),
@@ -97,7 +119,7 @@ class EnsemblePrediction:
             'task': self.task,
             'label_name': self.label_name,
         }
-    
+
     def summary(self) -> str:
         """Return a formatted summary string."""
         lines = [
@@ -105,7 +127,8 @@ class EnsemblePrediction:
             f"Label: {self.label_name or 'N/A'}",
             f"Number of models: {len(self.model_names)}",
             f"Prediction: {self.weighted_mean[0]:.4f} ± {self.uncertainty_std[0]:.4f}",
-            f"95% CI: [{self.ci_lower_95[0]:.4f}, {self.ci_upper_95[0]:.4f}]",
+            f"95% CI (percentile): [{self.ci_percentile_lower_95[0]:.4f}, {self.ci_percentile_upper_95[0]:.4f}]",
+            f"95% CI (SEM):        [{self.ci_sem_lower_95[0]:.4f}, {self.ci_sem_upper_95[0]:.4f}]",
         ]
         return "\n".join(lines)
 
@@ -197,8 +220,8 @@ class EnsemblePredictor:
         models: Dict[str, Any],
         datamodules: Dict[str, Any],
         weights: Optional[Dict[str, float]] = None,
-        task: str = 'dmax',
-        label_name: Optional[str] = None,
+        # task: str = 'dmax',
+        # label_name: Optional[str] = None,
         device: str = 'cpu',
     ) -> None:
         """
@@ -214,7 +237,6 @@ class EnsemblePredictor:
         """
         self.models = models
         self.datamodules = datamodules
-        self.task = task.lower()
         self.device = device
         
         # Per-model task inferred from filenames / datamodule label names
@@ -222,18 +244,26 @@ class EnsemblePredictor:
         for name in models:
             self.model_tasks[name] = self._infer_model_task(name, datamodules.get(name))
         
-        # Infer label name if not provided
-        if label_name is None:
-            label_name = self._infer_label_name()
-        self.label_name = label_name
+        # self.task = task.lower()
+        # # Infer label name if not provided
+        # if label_name is None:
+        #     label_name = self._infer_label_name()
+        # self.label_name = label_name
         
-        # Set up weights
+        # Set up weights, if not provided, use uniform weights per task,
+        # creating a dict mapping model name → weight
+        self.weights = {}
         if weights is None:
-            n_models = len(models)
-            self.weights = {name: 1.0 / n_models for name in models.keys()}
-        else:
-            total = sum(weights.values())
-            self.weights = {k: v / total for k, v in weights.items()}
+            task2name = {}
+            for name, task in self.model_tasks.items():
+                if task not in task2name:
+                    task2name[task] = []
+                task2name[task].append(name)
+            # Convert to model_name → weight
+            for task, names in task2name.items():
+                n = len(names)
+                for name in names:
+                    self.weights[name] = 1.0 / n
         
         # Validate weights
         for name in self.weights.keys():
@@ -245,8 +275,14 @@ class EnsemblePredictor:
         for name, model in self.models.items():
             self.model_types[name] = self._get_model_type(model)
         
-        # Get a reference datamodule for shared operations
-        self._ref_datamodule = self._get_reference_datamodule()
+        # Validate that every model has a corresponding datamodule
+        missing_dm = [name for name in self.models if self.datamodules.get(name) is None]
+        if missing_dm:
+            raise ValueError(
+                f"The following models have no associated datamodule: {missing_dm}. "
+                "Each model must have a corresponding datamodule for featurization "
+                "and denormalization."
+            )
         
         # Pre-compute categorical choices across all datamodules
         self._categorical_choices: Dict[str, List[str]] = self._collect_categorical_choices()
@@ -254,9 +290,9 @@ class EnsemblePredictor:
     def _infer_label_name(self) -> Optional[str]:
         """Infer label name from task or datamodule."""
         task_to_label = {
-            'dmax': 'Dmax (%) (DC50/Dmax)',
-            'dc50': 'pDC50 (DC50/Dmax)',
-            'bin': 'Binary_Activity',
+            'dmax': 'Dmax (%)',
+            'dc50': 'DC50 (nM)',
+            'bin': 'Binary Activity',
         }
         
         # Try to get from datamodule first
@@ -264,13 +300,6 @@ class EnsemblePredictor:
             if dm is not None and hasattr(dm, 'labels') and dm.labels:
                 return dm.labels[0]
         
-        return task_to_label.get(self.task)
-    
-    def _get_reference_datamodule(self) -> Optional[Any]:
-        """Get a reference datamodule for shared operations like denormalization."""
-        for dm in self.datamodules.values():
-            if dm is not None:
-                return dm
         return None
     
     # ------------------------------------------------------------------
@@ -423,9 +452,12 @@ class EnsemblePredictor:
             ``missing_required`` lists column names that are required by
             the datamodule but were not provided by the user.
         """
-        dm = datamodule or self._ref_datamodule
+        dm = datamodule
         if dm is None:
-            return dict(sample_dict), []
+            raise ValueError(
+                "A datamodule must be provided for input validation. "
+                "Cannot fall back to a reference datamodule."
+            )
 
         # --- Normalise keys --------------------------------------------------
         # Build a map from lower-cased key → datamodule column name so that
@@ -506,71 +538,18 @@ class EnsemblePredictor:
                     print(f"  ... and {len(default_warnings) - 5} more")
 
         return filled, missing_required
-    
-    @staticmethod
-    def _build_xgb_feature_names(
-        features_dict: Dict[str, np.ndarray],
-        datamodule: Optional[Any] = None,
-    ) -> List[str]:
-        """
-        Build feature names for XGBoost matching the training-time convention.
-        
-        The naming convention mirrors ``DegradationComplexDataModule.get_Xy``:
-        - Sequence features (POI/Ligase): use ngram names from the sklearn
-          encoder when available, otherwise ``{key}_{j}``.
-        - Scalar descriptor features ("Descriptor" in name, length 1): keep
-          the bare key with **no** ``_0`` suffix.
-        - All other features: ``{key}_{j}``.
-        
-        Args:
-            features_dict: Dictionary mapping feature keys to numpy arrays.
-            datamodule: Optional datamodule to extract sequence encoder names.
-            
-        Returns:
-            List of feature names in the order they appear when concatenated.
-        """
-        poi_seq_col = getattr(datamodule, 'poi_sequence_col', 'POI_Sequence') if datamodule else 'POI_Sequence'
-        lig_seq_col = getattr(datamodule, 'ligase_sequence_col', 'Ligase_Sequence') if datamodule else 'Ligase_Sequence'
 
-        # Try to get ngram names from the sequence encoder
-        ngram_names = None
-        if datamodule is not None:
-            seq_emb = getattr(datamodule, 'poi_sequence_embedding', None)
-            if seq_emb is not None and hasattr(seq_emb, 'sklearn_encoder'):
-                ngram_names = seq_emb.sklearn_encoder.get_feature_names_out()
-
-        feature_names: List[str] = []
-        for key in sorted(features_dict.keys()):
-            value = features_dict[key]
-            flat = value.flatten() if hasattr(value, 'flatten') else np.asarray(value).flatten()
-
-            if poi_seq_col in key or lig_seq_col in key:
-                # Sequence feature – use ngram names when available
-                if ngram_names is not None and len(ngram_names) == len(flat):
-                    feature_names.extend([f"{key}_{ng}" for ng in ngram_names])
-                else:
-                    feature_names.extend([f"{key}_{j}" for j in range(len(flat))])
-            elif 'Descriptor' in key and len(flat) == 1:
-                # Scalar descriptor – no suffix
-                feature_names.append(key)
-            else:
-                feature_names.extend([f"{key}_{j}" for j in range(len(flat))])
-
-        return feature_names
-
-    def get_xgb_feature_names(self, datamodule: Any, sample_dict: Dict[str, Any]) -> List[str]:
+    def get_xgb_feature_names(self, datamodule: Any) -> List[str]:
         """
         Get feature names for XGBoost model from a sample featurization.
         
         Args:
             datamodule: The datamodule to use for featurization
-            sample_dict: Sample input dictionary
             
         Returns:
             List of feature names in order they appear in concatenated features
         """
-        features = datamodule.featurize_sample(sample_dict, return_tensor='np')
-        return self._build_xgb_feature_names(features, datamodule)
+        return datamodule.get_xgboost_feature_names()
     
     @staticmethod
     def _get_model_type(model: Any) -> str:
@@ -590,8 +569,8 @@ class EnsemblePredictor:
         model_dir: Union[str, Path],
         datamodule_dir: Optional[Union[str, Path]] = None,
         weights: Optional[Dict[str, float]] = None,
-        task: str = 'dmax',
-        label_name: Optional[str] = None,
+        # task: str = 'dmax',
+        # label_name: Optional[str] = None,
         device: str = 'cpu',
         pattern: Optional[str] = None,
     ) -> 'EnsemblePredictor':
@@ -630,16 +609,16 @@ class EnsemblePredictor:
         
         print(f"Found {len(model_files)} model files in {model_dir}")
         
-        for model_file in model_files:
+        for i, model_file in enumerate(model_files):
             model_name = model_file.stem
             
             try:
                 model, datamodule = cls._load_model_and_datamodule(
-                    model_file, task, device, datamodule_dir
+                    model_file, device, datamodule_dir
                 )
                 models[model_name] = model
                 datamodules[model_name] = datamodule
-                print(f"  Loaded: {model_name} ({cls._get_model_type(model)})")
+                print(f"  Loaded ({i+1}/{len(model_files)}): {model_name} ({cls._get_model_type(model)})")
             except Exception as e:
                 print(f"  Failed to load {model_name}: {e}")
                 continue
@@ -647,7 +626,8 @@ class EnsemblePredictor:
         if not models:
             raise ValueError(f"No models could be loaded from {model_dir}")
         
-        return cls(models, datamodules, weights, task, label_name, device)
+        # return cls(models, datamodules, weights, task, label_name, device)
+        return cls(models, datamodules, weights, device)
     
     @classmethod
     def from_weights_file(
@@ -744,7 +724,6 @@ class EnsemblePredictor:
     @staticmethod
     def _load_model_and_datamodule(
         model_path: Path,
-        task: str,
         device: str,
         datamodule_dir: Optional[Path] = None,
     ) -> Tuple[Any, Any]:
@@ -753,11 +732,11 @@ class EnsemblePredictor:
         
         if suffix == '.ckpt':
             return EnsemblePredictor._load_lightning_model(
-                model_path, task, device, datamodule_dir
+                model_path, device, datamodule_dir
             )
         elif suffix in ['.json', '.ubj', '.pkl']:
             return EnsemblePredictor._load_xgboost_model(
-                model_path, task, datamodule_dir
+                model_path, datamodule_dir
             )
         else:
             raise ValueError(f"Unsupported model format: {suffix}")
@@ -765,7 +744,6 @@ class EnsemblePredictor:
     @staticmethod
     def _load_lightning_model(
         model_path: Path,
-        task: str,
         device: str,
         datamodule_dir: Optional[Path] = None,
     ) -> Tuple[Any, Any]:
@@ -867,20 +845,15 @@ class EnsemblePredictor:
     @staticmethod
     def _load_xgboost_model(
         model_path: Path,
-        task: str,
         datamodule_dir: Optional[Path] = None,
     ) -> Tuple[Any, Any]:
-        """Load an XGBoost model."""
-        try:
-            import xgboost as xgb
-        except ImportError:
-            raise ImportError("XGBoost is required to load XGBoost models")
-        
+        """Load an XGBoost model."""        
         suffix = model_path.suffix.lower()
         
         if suffix in ['.json', '.ubj']:
             model = xgb.Booster()
             model.load_model(str(model_path))
+            model.n_jobs = 4
         elif suffix == '.pkl':
             with open(model_path, 'rb') as f:
                 model = pickle.load(f)
@@ -973,19 +946,23 @@ class EnsemblePredictor:
         """
         # Convert SampleInput to dict if needed
         if isinstance(sample, SampleInput):
-            if self._ref_datamodule is not None:
-                sample_dict = sample.to_datamodule_dict(
-                    smiles_col=self._ref_datamodule.smiles_col,
-                    poi_col=self._ref_datamodule.poi_col,
-                    poi_sequence_col=self._ref_datamodule.poi_sequence_col,
-                    ligase_col=self._ref_datamodule.ligase_col,
-                    ligase_sequence_col=self._ref_datamodule.ligase_sequence_col,
-                    cell_line_col=self._ref_datamodule.cell_line_col,
-                    assay_type_col=self._ref_datamodule.assay_type_col,
-                    treatment_time_col=self._ref_datamodule.treatment_time_col,
-                )
+            # Use the first available datamodule's column names for conversion
+            ref_dm = None
+            if model_name and model_name in self.datamodules:
+                ref_dm = self.datamodules[model_name]
             else:
-                sample_dict = sample.to_datamodule_dict()
+                ref_dm = next(iter(self.datamodules.values()))
+            
+            sample_dict = sample.to_datamodule_dict(
+                smiles_col=ref_dm.smiles_col,
+                poi_col=ref_dm.poi_col,
+                poi_sequence_col=ref_dm.poi_sequence_col,
+                ligase_col=ref_dm.ligase_col,
+                ligase_sequence_col=ref_dm.ligase_sequence_col,
+                cell_line_col=ref_dm.cell_line_col,
+                assay_type_col=ref_dm.assay_type_col,
+                treatment_time_col=ref_dm.treatment_time_col,
+            )
             precomputed = sample.precomputed_features
         else:
             sample_dict = sample
@@ -993,7 +970,7 @@ class EnsemblePredictor:
         
         featurized = {}
         
-        for name, datamodule in self.datamodules.items():
+        for i, (name, datamodule) in enumerate(self.datamodules.items()):
             if model_name is not None and name != model_name:
                 continue
             
@@ -1001,11 +978,11 @@ class EnsemblePredictor:
             
             if precomputed is not None:
                 featurized[name] = precomputed
-            elif datamodule is not None:
+            else:
                 try:
                     # Validate and fill defaults for this specific datamodule
                     filled_sample, missing_required = self.validate_and_fill_defaults(
-                        sample_dict, datamodule, verbose=False
+                        sample_dict, datamodule, verbose=True
                     )
                     
                     if missing_required:
@@ -1020,15 +997,7 @@ class EnsemblePredictor:
                     
                     # Determine format based on model type
                     if model_type == 'xgboost':
-                        # For XGBoost, get features as dict first to preserve names
-                        features_dict = datamodule.featurize_sample(filled_sample, return_tensor='np')
-                        # Build feature names matching training convention
-                        feature_names = self._build_xgb_feature_names(features_dict, datamodule)
-                        # Flatten feature values in the same sorted-key order
-                        feature_list = []
-                        for key in sorted(features_dict.keys()):
-                            feature_list.append(features_dict[key].flatten())
-                        features = (np.concatenate(feature_list).astype(np.float32), feature_names)
+                        features = datamodule.featurize_sample(filled_sample, return_tensor='xgb')
                     elif model_type == 'lightning':
                         features = datamodule.featurize_sample(filled_sample, return_tensor='pt')
                     else:
@@ -1038,9 +1007,6 @@ class EnsemblePredictor:
                 except Exception as e:
                     print(f"Warning: Featurization failed for {name}: {e}")
                     featurized[name] = None
-            else:
-                # No datamodule, pass raw input
-                featurized[name] = sample_dict
         
         return featurized
     
@@ -1071,9 +1037,7 @@ class EnsemblePredictor:
         model's expected feature order.  This avoids errors caused by the
         inference code iterating feature keys in a different order than the
         training code.
-        """
-        import xgboost as xgb
-        
+        """        
         # Handle tuple of (features, feature_names)
         feature_names = None
         if isinstance(features, tuple) and len(features) == 2:
@@ -1188,11 +1152,13 @@ class EnsemblePredictor:
         Returns:
             Denormalized prediction array
         """
-        
-        dm = datamodule or self._ref_datamodule
+        dm = datamodule
         
         if dm is None:
-            return prediction
+            raise ValueError(
+                "A datamodule must be provided for denormalization. "
+                "Cannot fall back to a reference datamodule."
+            )
         
         # Check if datamodule has normalization enabled
         if not (getattr(dm, 'normalize_labels', False) or getattr(dm, 'standardize_labels', False)):
@@ -1200,15 +1166,13 @@ class EnsemblePredictor:
         
         # Determine the transformer key
         if task_key is None:
-            # Try to infer from task or label name
-            if self.label_name and self.label_name in getattr(dm, 'label_transformers', {}):
-                task_key = self.label_name
-            elif self.task.lower() == 'dmax':
-                task_key = 'Dmax'
-            elif self.task.lower() == 'dc50':
-                task_key = 'DC50'
+            # Infer the label name from the datamodule if possible
+            task_key = dm.labels if hasattr(dm, 'labels') else None
+            if isinstance(task_key, list) and len(task_key) == 1:
+                task_key = task_key[0]
             else:
-                task_key = self.label_name
+                print(f"Warning: Multiple or no labels found in datamodule; cannot infer task key for denormalization. ")
+                return prediction
         
         try:
             return dm.inverse_transform_labels(prediction, task_key)
@@ -1224,9 +1188,9 @@ class EnsemblePredictor:
     ) -> Dict[str, EnsemblePrediction]:
         """Make ensemble prediction, returning one result per task.
 
-        When the ensemble contains models for multiple tasks (e.g. ``dmax``,
-        ``dc50``, ``bin``), each task's models are aggregated independently
-        and a separate ``EnsemblePrediction`` is returned for each.
+        Each model's raw prediction is **denormalized first** using its own
+        datamodule, then the weighted mean and uncertainty metrics are
+        computed in the original (denormalized) scale.
 
         Args:
             sample: ``SampleInput`` object or dictionary with input data.
@@ -1236,21 +1200,20 @@ class EnsemblePredictor:
 
         Returns:
             Dictionary mapping task name to ``EnsemblePrediction``.
-            If the ensemble contains only a single task this dict will have
-            one entry.
         """
         # Featurize input for all models
         features = self.featurize_input(sample)
 
-        # Group models by task
-        task_models: Dict[str, Dict[str, np.ndarray]] = {}  # task -> {model: pred}
+        # Gather raw predictions, denormalize each, and group by task
+        # Structure: {task_name: {model_name: denormalized_prediction}}
+        task_preds: Dict[str, Dict[str, np.ndarray]] = {}
         allowed_tasks = set(tasks) if tasks else None
 
         for model_name in self.models.keys():
             if model_name not in self.weights:
                 continue
 
-            model_task = self.model_tasks.get(model_name, self.task)
+            model_task = self.model_tasks.get(model_name, None)
             if allowed_tasks is not None and model_task not in allowed_tasks:
                 continue
 
@@ -1259,8 +1222,11 @@ class EnsemblePredictor:
                 continue
 
             try:
-                pred = self.predict_single_model(model_name, model_features)
-                task_models.setdefault(model_task, {})[model_name] = pred
+                raw_pred = self.predict_single_model(model_name, model_features)
+                # Denormalize using this model's own datamodule
+                dm = self.datamodules[model_name]
+                denorm_pred = self.denormalize_prediction(raw_pred, dm)
+                task_preds.setdefault(model_task, {})[model_name] = denorm_pred
             except Exception as e:
                 error_msg = str(e)
                 if 'feature_names mismatch' in error_msg:
@@ -1268,42 +1234,24 @@ class EnsemblePredictor:
                 print(f"Warning: Prediction failed for model={model_name}: {error_msg}")
                 continue
 
-        if not task_models:
+        if not task_preds:
             raise RuntimeError("All model predictions failed")
 
-        # Build one EnsemblePrediction per task
-        results: Dict[str, EnsemblePrediction] = {}
-        for task_name, preds_norm in task_models.items():
-            # Weighted average (normalized)
-            weighted_sum = np.zeros_like(list(preds_norm.values())[0], dtype=float)
+        # Build one EnsemblePrediction per task (all in denormalized scale)
+        results = {}
+        for task_name, preds_denorm in task_preds.items():
+            # Weighted average in denormalized scale
+            weighted_sum = np.zeros_like(list(preds_denorm.values())[0], dtype=float)
             weight_sum = 0.0
-            for mn, pred in preds_norm.items():
-                w = self.weights.get(mn, 0.0)
+            for model_name, pred in preds_denorm.items():
+                w = self.weights.get(model_name, 0.0)
                 weighted_sum += pred * w
                 weight_sum += w
-            weighted_mean_normalized = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
+            weighted_mean = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
 
-            all_preds_norm = np.array(list(preds_norm.values()))
-            uncertainty_std_normalized = np.std(all_preds_norm, axis=0)
-
-            # Denormalize
-            individual_predictions = {}
-            for mn, pred in preds_norm.items():
-                dm = self.datamodules.get(mn) or self._ref_datamodule
-                individual_predictions[mn] = self.denormalize_prediction(pred, dm)
-
-            weighted_mean = self.denormalize_prediction(weighted_mean_normalized)
-            upper = self.denormalize_prediction(weighted_mean_normalized + uncertainty_std_normalized)
-            lower = self.denormalize_prediction(weighted_mean_normalized - uncertainty_std_normalized)
-            uncertainty_std = (upper - lower) / 2.0
-
-            # Task label name
-            task_to_label = {
-                'dmax': 'Dmax (%) (DC50/Dmax)',
-                'dc50': 'pDC50 (DC50/Dmax)',
-                'bin': 'Binary_Activity',
-            }
-            label_name = task_to_label.get(task_name, self.label_name)
+            # Standard deviation across denormalized predictions
+            all_preds = np.array(list(preds_denorm.values()))
+            uncertainty_std = np.std(all_preds, axis=0)
 
             # Binary classification entropy
             predictive_entropy = None
@@ -1314,15 +1262,20 @@ class EnsemblePredictor:
                     + (1 - avg_pred) * np.log(1 - avg_pred)
                 )
 
+            # Task label name
+            task_to_label = {
+                'dmax': 'Dmax (%)',
+                'dc50': 'DC50 (nM)',
+                'bin': 'Binary Activity',
+            }
+            label_name = task_to_label.get(task_name, 'Unknown label name')
+
             results[task_name] = EnsemblePrediction(
                 weighted_mean=weighted_mean,
                 uncertainty_std=uncertainty_std,
-                weighted_mean_normalized=weighted_mean_normalized,
-                uncertainty_std_normalized=uncertainty_std_normalized,
-                individual_predictions=individual_predictions if return_individual else {},
-                individual_predictions_normalized=preds_norm if return_individual else {},
-                weights={k: v for k, v in self.weights.items() if k in preds_norm},
-                model_names=list(preds_norm.keys()),
+                individual_predictions=preds_denorm if return_individual else {},
+                weights={k: v for k, v in self.weights.items() if k in preds_denorm},
+                model_names=list(preds_denorm.keys()),
                 task=task_name,
                 label_name=label_name,
                 predictive_entropy=predictive_entropy,
@@ -1386,12 +1339,12 @@ class EnsemblePredictor:
                 task_results = self.predict(sample, return_individual=True)
                 for task_name, result in task_results.items():
                     suffix = f"_{task_name}" if len(task_results) > 1 else ""
-                    ci_lower = result.ci_lower_95[0] if result.ci_lower_95 is not None else np.nan
-                    ci_upper = result.ci_upper_95[0] if result.ci_upper_95 is not None else np.nan
                     row_dict[f'prediction{suffix}'] = result.weighted_mean[0] if result.weighted_mean is not None else np.nan
                     row_dict[f'uncertainty{suffix}'] = result.uncertainty_std[0] if result.uncertainty_std is not None else np.nan
-                    row_dict[f'ci_lower{suffix}'] = ci_lower
-                    row_dict[f'ci_upper{suffix}'] = ci_upper
+                    row_dict[f'ci_pctl_lower{suffix}'] = result.ci_percentile_lower_95[0] if result.ci_percentile_lower_95 is not None else np.nan
+                    row_dict[f'ci_pctl_upper{suffix}'] = result.ci_percentile_upper_95[0] if result.ci_percentile_upper_95 is not None else np.nan
+                    row_dict[f'ci_sem_lower{suffix}'] = result.ci_sem_lower_95[0] if result.ci_sem_lower_95 is not None else np.nan
+                    row_dict[f'ci_sem_upper{suffix}'] = result.ci_sem_upper_95[0] if result.ci_sem_upper_95 is not None else np.nan
             except Exception as e:
                 row_dict['error'] = str(e)
 
@@ -1408,11 +1361,8 @@ class EnsemblePredictor:
             'model_types': self.model_types,
             'model_tasks': self.model_tasks,
             'weights': self.weights,
-            'task': self.task,
             'available_tasks': self.available_tasks,
-            'label_name': self.label_name,
             'device': self.device,
-            'has_datamodule': self._ref_datamodule is not None,
             'categorical_choices': self.get_categorical_choices(),
         }
     
@@ -1424,5 +1374,5 @@ class EnsemblePredictor:
     def __repr__(self) -> str:
         return (
             f"EnsemblePredictor(n_models={len(self.models)}, "
-            f"task='{self.task}', label='{self.label_name}', device='{self.device}')"
+            f"device='{self.device}')"
         )

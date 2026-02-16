@@ -97,7 +97,7 @@ class EmbeddingMixin(object):
             filename (Optional[Union[Path, str]]): Name of the file to save the embeddings. If None, uses the default filename defined in the class.
                 If the filename is not set, it will use the default filename "embeddings.npz".
             cache_dir (Optional[str]): Directory to save the embeddings. If None, uses the default cache directory.
-                If the cache directory is not set, it will use the default cache directory defined as environment variable STAEDA_CACHE, if set, or: ~/.cache/tackai/
+                If the cache directory is not set, it will use the default cache directory defined as environment variable TACKAI_CACHE, if set, or: ~/.cache/tackai/
 
         """
         if cache_dir is None:

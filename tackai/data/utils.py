@@ -23,7 +23,7 @@ def get_cache_dir() -> str:
         str: Path to the cache directory
     """
     cache_dir = os.environ.get(
-        "STAEDA_CACHE",
+        "TACKAI_CACHE",
         os.path.join(os.path.expanduser('~'), '.cache', 'tackai')
     )
     try:

@@ -181,5 +181,6 @@ logs/
 # Do not include the `data` directory at the root level, but allow the `data`
 # directory under the `tackai` package to be included.
 /data/
+tackai_ensemble*/
 
 

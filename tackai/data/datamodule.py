@@ -32,12 +32,11 @@ from sklearn.impute import SimpleImputer, IterativeImputer
 from sklearn.decomposition import PCA
 from transformers import AutoTokenizer
 
-from tackai import (
-    ProteinEmbedding,
-    CellEmbedding,
-    MolEmbedding,
-)
-from tackai import load_config_from_yaml
+from tackai.data.embeddings.protein_embeddings import ProteinEmbedding
+from tackai.data.embeddings.cell_embeddings import CellEmbedding
+from tackai.data.embeddings.mol_embeddings import MolEmbedding
+from tackai.config import load_config_from_yaml
+
 
 class DegradationComplexDataModule(pl.LightningDataModule):
     
@@ -482,7 +481,16 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 if isinstance(value, torch.Tensor):
                     value = value.numpy()
                 feature_list.append(value.flatten())
-            features = np.concatenate(feature_list).astype(np.float32)
+            
+            # We return a tuple of (features, feature_names) for XGBoost to keep track of feature names                
+            if not self.feature_dims: 
+                feature_names = [f"{key}_{i}" for key in sorted(features.keys()) for i in range(features[key].flatten().shape[0])]
+            else:
+                feature_names = self.get_xgboost_feature_names()  # Ensure feature names are initialized
+            features = (
+                np.concatenate(feature_list).astype(np.float32),
+                feature_names
+            )   
         else:
             raise ValueError(f"Invalid return_tensor value: {return_tensor}. Must be 'np' (NumPy), 'pt' (PyTorch), or 'xgb' (XGBoost, i.e., flattened array).")
         return features
@@ -721,6 +729,32 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 self.feature_dims['token_type_ids'] = self.max_length
         
         self.logger.debug(f"Feature dimensions initialized: {self.feature_dims}")
+    
+    def get_xgboost_feature_names(self) -> List[str]:
+        """ Get the list of feature names in the order they are concatenated for XGBoost.
+        
+        Returns:
+            List of feature names.
+        """
+        # Check if self.feature_dims has been initialized
+        if not self.feature_dims:
+            raise ValueError("Feature dimensions have not been initialized. Ensure that setup() has been called and the training dataset has been featurized.")
+
+        # For certain features, like sequence embeddings, expand feature names,
+        # e.g., name each n-gram
+        feature_names_out = []
+        for feat, dim in self.feature_dims.items():
+            if self.poi_sequence_col in feat or self.ligase_sequence_col in feat:
+                if self.poi_sequence_embedding is not None:
+                    ngram_names = self.poi_sequence_embedding.sklearn_encoder.get_feature_names_out()
+                    feature_names_out.extend([f"{feat}_{ngram}" for ngram in ngram_names])
+                else:
+                    feature_names_out.extend([f"{feat}_{j}" for j in range(dim)])
+            elif "Descriptor" not in feat or dim > 1:
+                feature_names_out.extend([f"{feat}_{j}" for j in range(dim)])
+            else:
+                feature_names_out.append(feat)
+        return feature_names_out
 
     def get_feature_dims(self) -> Dict[str, int]:
         """ Return the dictionary mapping feature names to their dimensions.
