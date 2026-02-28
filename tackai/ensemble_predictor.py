@@ -15,6 +15,7 @@ import torch
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+from tqdm import tqdm
 
 from tackai.data.datamodule import load_datamodule
 from tackai.models.tackai_model import TACKModel
@@ -179,7 +180,7 @@ class SampleInput:
 # NOTE: SMILES, POI (name/sequence), and E3 ligase (name/sequence) are
 # considered *required* — no defaults are supplied for them.
 DEFAULT_VALUES = {
-    'Cell_Line_ID': 'Unknown',
+    'Cell_Line_ID': 'Unknown cell line.',
     'Assay': 'Unknown',
     'Assay_Time': 24.0,  # Default 24 hours
     'Degrader_Type': 'PROTAC',
@@ -244,12 +245,6 @@ class EnsemblePredictor:
         for name in models:
             self.model_tasks[name] = self._infer_model_task(name, datamodules.get(name))
         
-        # self.task = task.lower()
-        # # Infer label name if not provided
-        # if label_name is None:
-        #     label_name = self._infer_label_name()
-        # self.label_name = label_name
-        
         # Set up weights, if not provided, use uniform weights per task,
         # creating a dict mapping model name → weight
         self.weights = {}
@@ -283,24 +278,6 @@ class EnsemblePredictor:
                 "Each model must have a corresponding datamodule for featurization "
                 "and denormalization."
             )
-        
-        # Pre-compute categorical choices across all datamodules
-        self._categorical_choices: Dict[str, List[str]] = self._collect_categorical_choices()
-    
-    def _infer_label_name(self) -> Optional[str]:
-        """Infer label name from task or datamodule."""
-        task_to_label = {
-            'dmax': 'Dmax (%)',
-            'dc50': 'DC50 (nM)',
-            'bin': 'Binary Activity',
-        }
-        
-        # Try to get from datamodule first
-        for dm in self.datamodules.values():
-            if dm is not None and hasattr(dm, 'labels') and dm.labels:
-                return dm.labels[0]
-        
-        return None
     
     # ------------------------------------------------------------------
     # Task inference
@@ -335,26 +312,22 @@ class EnsemblePredictor:
                 return task_str
 
         return 'dmax'
-    
-    # ------------------------------------------------------------------
-    # Categorical choices
-    # ------------------------------------------------------------------
 
-    def _collect_categorical_choices(self) -> Dict[str, List[str]]:
+    def get_categorical_choices(self) -> Dict[str, List[str]]:
         """Collect unique category values from all datamodule ordinal encoders.
 
         Returns a dict mapping column names (e.g. ``'Ligase_Name'``,
         ``'Cell_Line_ID'``, ``'Assay'``) to sorted lists of known
         categories seen during training (across **all** folds / configs).
         """
-        merged: Dict[str, set] = {}
+        merged = {}
         for dm in self.datamodules.values():
             if dm is None:
                 continue
             pipeline = getattr(dm, 'category_pipeline', None)
             if pipeline is None:
                 continue
-            for _name, transformer, cols in pipeline.transformers_:
+            for _, transformer, cols in pipeline.transformers_:
                 ordinal = transformer.named_steps.get('ordinal') if hasattr(transformer, 'named_steps') else None
                 if ordinal is None or not hasattr(ordinal, 'categories_'):
                     continue
@@ -364,14 +337,6 @@ class EnsemblePredictor:
                     merged[col].update(c for c in cats if c is not None)
         # Convert to sorted lists
         return {col: sorted(vals) for col, vals in merged.items()}
-
-    def get_categorical_choices(self) -> Dict[str, List[str]]:
-        """Return known categorical values for each ordinal-encoded column.
-
-        Each list is sorted and **does not** include ``'Unknown'`` – the
-        caller should add it when building a UI.
-        """
-        return dict(self._categorical_choices)
 
     @property
     def available_tasks(self) -> List[str]:
@@ -394,11 +359,9 @@ class EnsemblePredictor:
         if model_name is not None:
             datamodules = {model_name: self.datamodules.get(model_name)}
         
+        req_cols_set = set()
+        
         for name, dm in datamodules.items():
-            if dm is None:
-                required[name] = ['SMILES']  # Minimum requirement
-                continue
-            
             req_cols = [dm.smiles_col]  # Always need SMILES
             
             # Check which features this datamodule needs
@@ -424,132 +387,9 @@ class EnsemblePredictor:
                 req_cols.append(dm.assay_type_col)
             
             required[name] = list(set(req_cols))  # Remove duplicates
+            req_cols_set.update(required[name])
         
-        return required
-    
-    def validate_and_fill_defaults(
-        self,
-        sample_dict: Dict[str, Any],
-        datamodule: Optional[Any] = None,
-        verbose: bool = True,
-    ) -> Tuple[Dict[str, Any], List[str]]:
-        """Validate inputs and fill in defaults for *optional* features.
-
-        **Required** inputs (SMILES, POI name/sequence, E3 ligase
-        name/sequence) will **not** be defaulted – a warning is emitted
-        instead and the caller can decide whether to skip the model.
-
-        The method also normalises user-supplied keys so that e.g. both
-        ``'Smiles'`` and ``'SMILES'`` are accepted.
-
-        Args:
-            sample_dict: Dictionary of input values.
-            datamodule: Datamodule to check requirements against.
-            verbose: Whether to print warnings about missing inputs.
-
-        Returns:
-            A tuple ``(filled_dict, missing_required)`` where
-            ``missing_required`` lists column names that are required by
-            the datamodule but were not provided by the user.
-        """
-        dm = datamodule
-        if dm is None:
-            raise ValueError(
-                "A datamodule must be provided for input validation. "
-                "Cannot fall back to a reference datamodule."
-            )
-
-        # --- Normalise keys --------------------------------------------------
-        # Build a map from lower-cased key → datamodule column name so that
-        # user dicts with slightly different casing still match.
-        dm_col_names = [
-            dm.smiles_col, dm.poi_col, dm.poi_sequence_col,
-            dm.ligase_col, dm.ligase_sequence_col, dm.cell_line_col,
-            dm.treatment_time_col, dm.assay_type_col,
-        ]
-        lower_to_dm = {c.lower(): c for c in dm_col_names if c}
-
-        filled: Dict[str, Any] = {}
-        for k, v in sample_dict.items():
-            canonical = lower_to_dm.get(k.lower(), k)
-            filled[canonical] = v
-
-        missing_required: List[str] = []
-        default_warnings: List[str] = []
-
-        # Columns that are *never* auto-filled – the user must provide them
-        required_cols = {dm.smiles_col, dm.poi_col, dm.poi_sequence_col,
-                         dm.ligase_col, dm.ligase_sequence_col}
-
-        # (dm_col, is_needed_check)
-        col_checks = [
-            (dm.smiles_col, lambda: True),
-            (dm.poi_col, lambda: (
-                getattr(dm, 'use_poi_name_embedding', False)
-                or getattr(dm, 'poi_embeddings_id_type', '') != 'sequence'
-            )),
-            (dm.poi_sequence_col, lambda: (
-                getattr(dm, 'use_poi_sequence_embedding', False)
-                or getattr(dm, 'use_poi_precomputed_embedding', False)
-            )),
-            (dm.ligase_col, lambda: getattr(dm, 'use_ligase_name_embedding', False)),
-            (dm.ligase_sequence_col, lambda: getattr(dm, 'use_ligase_precomputed_embedding', False)),
-            (dm.cell_line_col, lambda: (
-                getattr(dm, 'use_cell_description_embedding', False)
-                or getattr(dm, 'use_cell_name_embedding', False)
-            )),
-            (dm.treatment_time_col, lambda: getattr(dm, 'use_treatment_time', False)),
-            (dm.assay_type_col, lambda: getattr(dm, 'use_assay_type_encoding', False)),
-        ]
-
-        for dm_col, is_needed_fn in col_checks:
-            if not is_needed_fn():
-                continue
-
-            current_val = filled.get(dm_col)
-            is_missing = current_val is None or (isinstance(current_val, str) and current_val.strip() == '')
-
-            if not is_missing:
-                continue
-
-            if dm_col in required_cols:
-                missing_required.append(dm_col)
-            else:
-                # Fill optional fields with defaults
-                default_val = DEFAULT_VALUES.get(dm_col)
-                if default_val is not None:
-                    filled[dm_col] = default_val
-                    short = str(default_val) if len(str(default_val)) < 30 else str(default_val)[:30] + '...'
-                    default_warnings.append(f"  - {dm_col}: using default '{short}'")
-
-        if verbose:
-            if missing_required:
-                warnings.warn(
-                    f"Required input(s) missing: {', '.join(missing_required)}. "
-                    "Models that need these features will be skipped.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-            if default_warnings:
-                print("Note: Some inputs were missing and filled with defaults:")
-                for w in default_warnings[:5]:
-                    print(w)
-                if len(default_warnings) > 5:
-                    print(f"  ... and {len(default_warnings) - 5} more")
-
-        return filled, missing_required
-
-    def get_xgb_feature_names(self, datamodule: Any) -> List[str]:
-        """
-        Get feature names for XGBoost model from a sample featurization.
-        
-        Args:
-            datamodule: The datamodule to use for featurization
-            
-        Returns:
-            List of feature names in order they appear in concatenated features
-        """
-        return datamodule.get_xgboost_feature_names()
+        return req_cols_set, required
     
     @staticmethod
     def _get_model_type(model: Any) -> str:
@@ -926,6 +766,113 @@ class EnsemblePredictor:
                 print(f"    Warning: Failed to load datamodule from {hparams_path}: {e}")
         
         return model, datamodule
+
+    def validate_and_fill_defaults(
+        self,
+        sample_dict: Dict[str, Any],
+        datamodule: Any,
+        verbose: bool = True,
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Validate inputs and fill in defaults for *optional* features.
+
+        **Required** inputs (SMILES, POI name/sequence, E3 ligase
+        name/sequence) will **not** be defaulted – a warning is emitted
+        instead and the caller can decide whether to skip the model.
+
+        The method also normalises user-supplied keys so that e.g. both
+        ``'Smiles'`` and ``'SMILES'`` are accepted.
+
+        Args:
+            sample_dict: Dictionary of input values.
+            datamodule: Datamodule to check requirements against.
+            verbose: Whether to print warnings about missing inputs.
+
+        Returns:
+            A tuple ``(filled_dict, missing_required)`` where
+            ``missing_required`` lists column names that are required by
+            the datamodule but were not provided by the user.
+        """
+        dm = datamodule  # Just a shorter alias for convenience
+
+        # --- Normalise keys --------------------------------------------------
+        # Build a map from lower-cased key → datamodule column name so that
+        # user dicts with slightly different casing still match.
+        dm_col_names = [
+            dm.smiles_col, dm.poi_col, dm.poi_sequence_col,
+            dm.ligase_col, dm.ligase_sequence_col, dm.cell_line_col,
+            dm.treatment_time_col, dm.assay_type_col,
+        ]
+        lower_to_dm = {c.lower(): c for c in dm_col_names if c}
+
+        filled = {}
+        for k, v in sample_dict.items():
+            canonical = lower_to_dm.get(k.lower(), k)
+            filled[canonical] = v
+
+        missing_required = []
+        default_warnings = []
+
+        # Columns that are *never* auto-filled – the user must provide them
+        required_cols = {dm.smiles_col, dm.poi_col, dm.poi_sequence_col,
+                         dm.ligase_col, dm.ligase_sequence_col}
+
+        # (dm_col, is_needed_check)
+        col_checks = [
+            (dm.smiles_col, lambda: True),
+            (dm.poi_col, lambda: (
+                getattr(dm, 'use_poi_name_embedding', False)
+                or getattr(dm, 'poi_embeddings_id_type', '') != 'sequence'
+            )),
+            (dm.poi_sequence_col, lambda: (
+                getattr(dm, 'use_poi_sequence_embedding', False)
+                or getattr(dm, 'use_poi_precomputed_embedding', False)
+            )),
+            (dm.ligase_col, lambda: getattr(dm, 'use_ligase_name_embedding', False)),
+            (dm.ligase_sequence_col, lambda: getattr(dm, 'use_ligase_precomputed_embedding', False)),
+            (dm.cell_line_col, lambda: (
+                getattr(dm, 'use_cell_description_embedding', False)
+                or getattr(dm, 'use_cell_name_embedding', False)
+            )),
+            (dm.treatment_time_col, lambda: getattr(dm, 'use_treatment_time', False)),
+            (dm.assay_type_col, lambda: getattr(dm, 'use_assay_type_encoding', False)),
+        ]
+
+        for dm_col, is_needed_fn in col_checks:
+            if not is_needed_fn():
+                continue
+
+            current_val = filled.get(dm_col)
+            is_missing = current_val is None or (isinstance(current_val, str) and current_val.strip() == '')
+
+            if not is_missing:
+                continue
+
+            if dm_col in required_cols:
+                missing_required.append(dm_col)
+            else:
+                # Fill optional fields with defaults
+                default_val = DEFAULT_VALUES.get(dm_col)
+                if default_val is not None:
+                    filled[dm_col] = default_val
+                    short = str(default_val) if len(str(default_val)) < 30 else str(default_val)[:30] + '...'
+                    default_warnings.append(f"  - {dm_col}: using default '{short}'")
+
+        if verbose:
+            if missing_required:
+                warnings.warn(
+                    f"Required input(s) missing: {', '.join(missing_required)}. "
+                    "Models that need these features will be skipped.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            if default_warnings:
+                print("Note: Some inputs were missing and filled with defaults:")
+                for w in default_warnings[:5]:
+                    print(w)
+                if len(default_warnings) > 5:
+                    print(f"  ... and {len(default_warnings) - 5} more")
+
+        return filled, missing_required
     
     def featurize_input(
         self,
@@ -1009,8 +956,71 @@ class EnsemblePredictor:
                     featurized[name] = None
         
         return featurized
-    
-    def predict_single_model(
+
+    def featurize_input_batch(
+        self,
+        samples: List[Dict[str, Any]],
+    ) -> Dict[str, List[Any]]:
+        """Batch-featurize multiple samples for all (or one) model(s).
+
+        This method is much faster than calling ``featurize_input`` in a loop
+        because it:
+        1. Validates/fills defaults **once per datamodule** for the whole
+           batch (identical logic, but key-normalisation happens once).
+        2. Uses ``datamodule.featurize_samples_batch`` which runs sklearn
+           pipelines on one big DataFrame and deduplicates embedding lookups.
+        3. Passes a **shared embedding cache** across datamodules so that
+           two models that both need the same Morgan fingerprint or protein
+           embedding only compute it once.
+
+        Args:
+            samples: List of sample dicts (column-name → value).
+            model_name: Restrict to a single model (default: all models).
+
+        Returns:
+            ``{model_name: [features_sample_0, features_sample_1, ...]}``
+            where each ``features_sample_i`` has the format required by the
+            model type (xgb tuple, pt dict, etc.).
+        """
+        # Shared cache across all datamodules for this batch
+        shared_cache = {}
+        featurized = {}
+
+        for name, datamodule in self.datamodules.items():
+            # --- Validate & fill defaults once for this datamodule ----------
+            # We do this per-datamodule because different DMs may need
+            # different default columns, but we only validate once per DM
+            # for the entire batch (rather than once per sample).
+            filled_samples = []
+            for i, sample_dict in enumerate(samples):
+                filled, missing_required = self.validate_and_fill_defaults(
+                    sample_dict, datamodule, verbose=(i == 0),
+                )
+                if missing_required:
+                    raise ValueError(
+                        f"Sample {i} is missing required input(s) for model '{name}': "
+                        f"{', '.join(missing_required)}. Cannot featurize batch."
+                    )
+                filled_samples.append(filled)
+
+            # --- Batch featurize using the datamodule -----------------------
+            model_type = self.model_types.get(name, 'unknown')
+            if model_type == 'xgboost':
+                ret = 'xgb'
+            elif model_type == 'lightning':
+                ret = 'pt'
+            else:
+                ret = 'np'
+            batch_feat = datamodule.featurize_samples_batch(
+                filled_samples,
+                return_tensor=ret,
+                shared_cache=shared_cache,
+            )
+            featurized[name] = batch_feat
+
+        return featurized
+
+    def _predict_single_model(
         self,
         model_name: str,
         features: Any,
@@ -1018,10 +1028,7 @@ class EnsemblePredictor:
         """Get prediction from a single model."""
         model = self.models[model_name]
         model_type = self.model_types[model_name]
-        
-        if features is None:
-            raise ValueError(f"No features available for model {model_name}")
-        
+
         if model_type == 'xgboost':
             return self._predict_xgboost(model, features)
         elif model_type == 'lightning':
@@ -1138,8 +1145,7 @@ class EnsemblePredictor:
     def denormalize_prediction(
         self,
         prediction: np.ndarray,
-        datamodule: Optional[Any] = None,
-        task_key: Optional[str] = None,
+        datamodule: Any,
     ) -> np.ndarray:
         """
         Denormalize prediction using datamodule's inverse transform.
@@ -1147,166 +1153,339 @@ class EnsemblePredictor:
         Args:
             prediction: Normalized prediction array
             datamodule: Datamodule to use for inverse transform
-            task_key: Key for the label transformer (e.g., 'Dmax', 'DC50', or label name)
             
         Returns:
             Denormalized prediction array
         """
-        dm = datamodule
-        
-        if dm is None:
-            raise ValueError(
-                "A datamodule must be provided for denormalization. "
-                "Cannot fall back to a reference datamodule."
-            )
+        dm = datamodule  # Just a shorter alias for convenience
         
         # Check if datamodule has normalization enabled
         if not (getattr(dm, 'normalize_labels', False) or getattr(dm, 'standardize_labels', False)):
             return prediction
         
-        # Determine the transformer key
-        if task_key is None:
-            # Infer the label name from the datamodule if possible
-            task_key = dm.labels if hasattr(dm, 'labels') else None
-            if isinstance(task_key, list) and len(task_key) == 1:
-                task_key = task_key[0]
-            else:
-                print(f"Warning: Multiple or no labels found in datamodule; cannot infer task key for denormalization. ")
-                return prediction
+        # Determine the transformer key by inferring the label name from the
+        # datamodule, if possible
+        task_key = dm.labels if hasattr(dm, 'labels') else None
+        if isinstance(task_key, list) and len(task_key) == 1:
+            task_key = task_key[0]
+        else:
+            print(f"Warning: Multiple or no labels found in datamodule; cannot infer task key for denormalization. ")
+            return prediction
         
         try:
             return dm.inverse_transform_labels(prediction, task_key)
         except (ValueError, KeyError) as e:
-            print(f"Warning: Could not denormalize predictions: {e}")
-            return prediction
+            raise ValueError(
+                f"Failed to denormalize prediction for task '{task_key}'. "
+                f"Error: {e}"
+            ) from e
     
+    # ------------------------------------------------------------------
+    # Task label lookup
+    # ------------------------------------------------------------------
+    TASK_LABELS = {
+        'dmax': 'Dmax (%)',
+        'dc50': 'DC50 (nM)',
+        'bin': 'Binary Activity',
+    }
+
+    # ------------------------------------------------------------------
+    # Prediction helpers (private)
+    # ------------------------------------------------------------------
+
+    def _prepare_sample_dicts(
+        self,
+        samples: List[Union[SampleInput, Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """Convert a list of SampleInput / raw dicts into datamodule dicts.
+
+        Uses the first loaded datamodule's column names for mapping
+        ``SampleInput`` fields to the expected column keys.
+        """
+        ref_dm = next(iter(self.datamodules.values()))
+        out = []
+        for s in samples:
+            if isinstance(s, SampleInput):
+                out.append(s.to_datamodule_dict(
+                    smiles_col=ref_dm.smiles_col,
+                    poi_col=ref_dm.poi_col,
+                    poi_sequence_col=ref_dm.poi_sequence_col,
+                    ligase_col=ref_dm.ligase_col,
+                    ligase_sequence_col=ref_dm.ligase_sequence_col,
+                    cell_line_col=ref_dm.cell_line_col,
+                    assay_type_col=ref_dm.assay_type_col,
+                    treatment_time_col=ref_dm.treatment_time_col,
+                ))
+            else:
+                out.append(s)
+        return out
+
+    def _infer_and_denormalize(
+        self,
+        model_name: str,
+        feat_list: List[Any],
+    ) -> np.ndarray:
+        """Run inference for one model on a batch and denormalize the result.
+
+        Returns an ndarray of shape ``(n_samples,)`` with denormalized
+        predictions.
+        """
+        model = self.models[model_name]
+        model_type = self.model_types[model_name]
+        dm = self.datamodules[model_name]
+
+        # --- raw prediction ------------------------------------------------
+        if model_type == 'xgboost':
+            preds = self._predict_xgboost_batch(model, feat_list)
+        else:
+            # Fallback: per-sample inference for Lightning / unknown models
+            # TODO: Implement proper batch inference for Lightning models
+            per_sample = []
+            for feat in feat_list:
+                if feat is None:
+                    per_sample.append(np.array([np.nan]))
+                else:
+                    per_sample.append(self._predict_single_model(model_name, feat))
+            preds = np.array(per_sample)
+
+        # --- denormalize ---------------------------------------------------
+        preds_flat = preds.reshape(-1, 1) if preds.ndim == 1 else preds
+        denorm = np.empty_like(preds_flat, dtype=float)
+        for j in range(preds_flat.shape[0]):
+            denorm[j] = self.denormalize_prediction(preds_flat[j], dm)
+        return denorm.flatten() if preds.ndim == 1 else denorm
+
+    def _build_ensemble_prediction(
+        self,
+        preds_by_model: Dict[str, np.ndarray],
+        task_name: str,
+        return_individual: bool = True,
+    ) -> EnsemblePrediction:
+        """Build an ``EnsemblePrediction`` from per-model denormalized predictions.
+
+        This is the single place where weighted averaging, uncertainty, and
+        confidence intervals are computed.
+        """
+        # Weighted mean
+        weighted_sum = np.zeros_like(next(iter(preds_by_model.values())), dtype=float)
+        weight_sum = 0.0
+        for model_name, pred in preds_by_model.items():
+            w = self.weights.get(model_name, 0.0)
+            weighted_sum += pred * w
+            weight_sum += w
+        weighted_mean = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
+
+        # Uncertainty (std across models)
+        all_preds = np.array(list(preds_by_model.values()))
+        uncertainty_std = np.std(all_preds, axis=0)
+
+        # Binary classification entropy
+        predictive_entropy = None
+        if task_name == 'bin':
+            avg = np.clip(weighted_mean, 1e-7, 1 - 1e-7)
+            predictive_entropy = -(avg * np.log(avg) + (1 - avg) * np.log(1 - avg))
+
+        return EnsemblePrediction(
+            weighted_mean=weighted_mean,
+            uncertainty_std=uncertainty_std,
+            individual_predictions=preds_by_model if return_individual else {},
+            weights={k: v for k, v in self.weights.items() if k in preds_by_model},
+            model_names=list(preds_by_model.keys()),
+            task=task_name,
+            label_name=self.TASK_LABELS.get(task_name, 'Unknown label name'),
+            predictive_entropy=predictive_entropy,
+        )
+
+    def _assemble_batch_results(
+        self,
+        model_batch_preds: Dict[str, np.ndarray],
+        n_samples: int,
+        return_individual: bool = True,
+    ) -> List[Optional[Dict[str, EnsemblePrediction]]]:
+        """Assemble per-sample EnsemblePrediction dicts from model-level batch arrays.
+
+        Args:
+            model_batch_preds: ``{model_name: ndarray(n_samples,)}`` of
+                denormalized predictions.
+            n_samples: Number of samples in the batch.
+            return_individual: Include per-model predictions in the result.
+
+        Returns:
+            One ``{task: EnsemblePrediction}`` dict per sample
+        """
+        results = []
+
+        for i in range(n_samples):
+            # Group this sample's model predictions by task, so it's a
+            # dictionary of dictionaries: model_name → task → prediction.  This
+            # allows us to build one EnsemblePrediction per task, even if
+            # different models predict different tasks.
+            task_preds = {}
+            for model_name, batch_pred in model_batch_preds.items():
+                pred_i = batch_pred[i] if batch_pred.ndim > 1 else np.array([batch_pred[i]])
+                if np.any(np.isnan(pred_i)):
+                    raise ValueError(f"Prediction for model '{model_name}' is NaN for sample {i}; cannot include in ensemble.")
+                task = self.model_tasks.get(model_name)
+                task_preds.setdefault(task, {})[model_name] = np.atleast_1d(pred_i)
+
+            if not task_preds:
+                raise ValueError(f"No valid predictions for sample {i}; cannot build ensemble.")
+
+            sample_result = {
+                task_name: self._build_ensemble_prediction(preds, task_name, return_individual)
+                for task_name, preds in task_preds.items()
+            }
+            results.append(sample_result)
+
+        return results
+
+    # ------------------------------------------------------------------
+    # Public prediction API
+    # ------------------------------------------------------------------
+
     def predict(
         self,
         sample: Union[SampleInput, Dict[str, Any]],
         return_individual: bool = True,
         tasks: Optional[List[str]] = None,
     ) -> Dict[str, EnsemblePrediction]:
-        """Make ensemble prediction, returning one result per task.
+        """Make ensemble prediction for a single sample.
 
-        Each model's raw prediction is **denormalized first** using its own
-        datamodule, then the weighted mean and uncertainty metrics are
-        computed in the original (denormalized) scale.
+        Delegates to :meth:`predict_batch` for a consistent code path.
+        Each model's raw prediction is denormalized using its own datamodule
+        before the weighted ensemble average is computed.
 
         Args:
             sample: ``SampleInput`` object or dictionary with input data.
             return_individual: Whether to return individual model predictions.
-            tasks: Optional subset of tasks to predict.  ``None`` means all
-                available tasks.
+            tasks: Optional subset of tasks to predict (``None`` = all).
 
         Returns:
             Dictionary mapping task name to ``EnsemblePrediction``.
         """
-        # Featurize input for all models
-        features = self.featurize_input(sample)
+        return self.predict_batch([sample], return_individual, tasks)[0]
 
-        # Gather raw predictions, denormalize each, and group by task
-        # Structure: {task_name: {model_name: denormalized_prediction}}
-        task_preds: Dict[str, Dict[str, np.ndarray]] = {}
-        allowed_tasks = set(tasks) if tasks else None
-
-        for model_name in self.models.keys():
-            if model_name not in self.weights:
-                continue
-
-            model_task = self.model_tasks.get(model_name, None)
-            if allowed_tasks is not None and model_task not in allowed_tasks:
-                continue
-
-            model_features = features.get(model_name)
-            if model_features is None:
-                continue
-
-            try:
-                raw_pred = self.predict_single_model(model_name, model_features)
-                # Denormalize using this model's own datamodule
-                dm = self.datamodules[model_name]
-                denorm_pred = self.denormalize_prediction(raw_pred, dm)
-                task_preds.setdefault(model_task, {})[model_name] = denorm_pred
-            except Exception as e:
-                error_msg = str(e)
-                if 'feature_names mismatch' in error_msg:
-                    error_msg = "feature_names mismatch (training/inference feature encoding incompatible)"
-                print(f"Warning: Prediction failed for model={model_name}: {error_msg}")
-                continue
-
-        if not task_preds:
-            raise RuntimeError("All model predictions failed")
-
-        # Build one EnsemblePrediction per task (all in denormalized scale)
-        results = {}
-        for task_name, preds_denorm in task_preds.items():
-            # Weighted average in denormalized scale
-            weighted_sum = np.zeros_like(list(preds_denorm.values())[0], dtype=float)
-            weight_sum = 0.0
-            for model_name, pred in preds_denorm.items():
-                w = self.weights.get(model_name, 0.0)
-                weighted_sum += pred * w
-                weight_sum += w
-            weighted_mean = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
-
-            # Standard deviation across denormalized predictions
-            all_preds = np.array(list(preds_denorm.values()))
-            uncertainty_std = np.std(all_preds, axis=0)
-
-            # Binary classification entropy
-            predictive_entropy = None
-            if task_name == 'bin':
-                avg_pred = np.clip(weighted_mean, 1e-7, 1 - 1e-7)
-                predictive_entropy = -(
-                    avg_pred * np.log(avg_pred)
-                    + (1 - avg_pred) * np.log(1 - avg_pred)
-                )
-
-            # Task label name
-            task_to_label = {
-                'dmax': 'Dmax (%)',
-                'dc50': 'DC50 (nM)',
-                'bin': 'Binary Activity',
-            }
-            label_name = task_to_label.get(task_name, 'Unknown label name')
-
-            results[task_name] = EnsemblePrediction(
-                weighted_mean=weighted_mean,
-                uncertainty_std=uncertainty_std,
-                individual_predictions=preds_denorm if return_individual else {},
-                weights={k: v for k, v in self.weights.items() if k in preds_denorm},
-                model_names=list(preds_denorm.keys()),
-                task=task_name,
-                label_name=label_name,
-                predictive_entropy=predictive_entropy,
-            )
-
-        return results
-    
     def predict_batch(
         self,
         samples: List[Union[SampleInput, Dict[str, Any]]],
+        return_individual: bool = True,
+        tasks: Optional[List[str]] = None,
+        verbose: bool = False,
     ) -> List[Dict[str, EnsemblePrediction]]:
-        """Make batch predictions.
+        """Make batch predictions with optimized featurization.
+
+        Workflow:
+        1. Convert inputs to datamodule-compatible dicts.
+        2. Batch-featurize all samples through each datamodule (shared
+           embedding cache across models).
+        3. Run XGBoost inference with a multi-row DMatrix (Lightning
+           models fall back to per-sample inference).
+        4. Denormalize and assemble weighted ensemble results per sample.
 
         Args:
-            samples: List of SampleInput objects or dictionaries.
+            samples: List of ``SampleInput`` objects or dictionaries.
+            return_individual: Include per-model predictions in results.
+            tasks: Optional subset of tasks to predict (``None`` = all).
+            verbose: Show a progress bar over models.
 
         Returns:
-            List of dicts mapping task name to ``EnsemblePrediction``
-            (one dict per sample).
+            One ``{task: EnsemblePrediction}`` dict per sample.
+            ``None`` for samples where all models failed.
         """
-        results = []
-        
-        for i, sample in enumerate(samples):
+        n = len(samples)
+        if n == 0:
+            return []
+
+        # Check that any model is able to perform the requested tasks before
+        # starting inference
+        if tasks:
+            allowed_tasks = set(tasks)
+            model_tasks_set = set(self.model_tasks.values())
+            if not allowed_tasks.intersection(model_tasks_set):
+                raise ValueError(
+                    f"No models available for requested tasks: {allowed_tasks}. "
+                    f"Available tasks: {model_tasks_set}."
+                )
+
+        # 1. Normalise inputs
+        sample_dicts = self._prepare_sample_dicts(samples)
+
+        # 2. Batch featurize (shared cache across datamodules)
+        batch_features = self.featurize_input_batch(sample_dicts)
+
+        # 3. Inference + denormalize per model
+        allowed_tasks = set(tasks) if tasks else None
+        model_batch_preds = {}        
+
+        for model_name in tqdm(self.models, desc="Predicting", disable=not verbose):
+            if allowed_tasks and self.model_tasks.get(model_name) not in allowed_tasks:
+                continue
+
+            feat_list = batch_features.get(model_name)
+
+            if feat_list is None or all(f is None for f in feat_list):
+                raise ValueError(f"No features available for model {model_name}; cannot run prediction.")
+
             try:
-                result = self.predict(sample)
-                results.append(result)
+                model_batch_preds[model_name] = self._infer_and_denormalize(
+                    model_name, feat_list,
+                )
             except Exception as e:
-                print(f"Warning: Prediction failed for sample {i}: {e}")
-                results.append(None)
-        
-        return results
+                msg = str(e)
+                if 'feature_names mismatch' in msg:
+                    msg = "feature_names mismatch (training/inference encoding incompatible)"
+                raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
+
+        # 4. Assemble per-sample ensemble results
+        return self._assemble_batch_results(model_batch_preds, n, return_individual)
+
+    def _predict_xgboost_batch(
+        self,
+        model: Any,
+        feat_list: List[Any],
+    ) -> np.ndarray:
+        """Run XGBoost prediction on a batch of pre-featurized samples.
+
+        Stacks individual ``(array, feature_names)`` tuples into a single
+        DataFrame, aligns columns to the model's expected feature order
+        (if available), and calls ``model.predict`` once.
+        """
+        arrays = []
+        feature_names = None
+        for feat in feat_list:
+            if feat is None:
+                continue
+            if isinstance(feat, tuple) and len(feat) == 2:
+                arr, fnames = feat
+                if feature_names is None:
+                    feature_names = fnames
+                arrays.append(arr.reshape(1, -1) if arr.ndim == 1 else arr)
+            elif isinstance(feat, np.ndarray):
+                arrays.append(feat.reshape(1, -1) if feat.ndim == 1 else feat)
+            else:
+                arrays.append(np.array(feat).reshape(1, -1))
+
+        if not arrays:
+            return np.full(len(feat_list), np.nan)
+
+        X = np.vstack(arrays)
+
+        # Build DMatrix with feature-name alignment
+        if feature_names is not None:
+            df = pd.DataFrame(X, columns=feature_names)
+            # Re-order columns to match model's expected feature order
+            model_feature_names = getattr(model, 'feature_names', None)
+            if (
+                model_feature_names is not None
+                and set(feature_names) == set(model_feature_names)
+                and len(feature_names) == X.shape[1]
+            ):
+                df = df[model_feature_names]
+            dmatrix = xgb.DMatrix(df)
+        else:
+            dmatrix = xgb.DMatrix(X)
+
+        return model.predict(dmatrix)
     
     def predict_dataframe(
         self,
@@ -1320,23 +1499,30 @@ class EnsemblePredictor:
     ) -> pd.DataFrame:
         """Make predictions for a DataFrame.
 
-        Adds one set of prediction columns per task present in the ensemble.
+        Uses ``predict_batch`` for efficient batched featurization and
+        inference.  Adds one set of prediction columns per task present
+        in the ensemble.
         """
-        all_row_results = []
+        # Build SampleInput list
+        sample_list: List[SampleInput] = []
+        for _, row in df.iterrows():
+            sample_list.append(SampleInput(
+                smiles=row.get(smiles_col) if smiles_col in row.index else None,
+                poi_name=row.get(poi_col) if poi_col and poi_col in row.index else None,
+                poi_sequence=row.get(poi_sequence_col) if poi_sequence_col and poi_sequence_col in row.index else None,
+                ligase_name=row.get(ligase_col) if ligase_col and ligase_col in row.index else None,
+                cell_line=row.get(cell_line_col) if cell_line_col and cell_line_col in row.index else None,
+                treatment_time=row.get(treatment_time_col) if treatment_time_col and treatment_time_col in row.index else None,
+            ))
 
-        for idx, row in df.iterrows():
-            sample = SampleInput(
-                smiles=row.get(smiles_col) if smiles_col in row else None,
-                poi_name=row.get(poi_col) if poi_col and poi_col in row else None,
-                poi_sequence=row.get(poi_sequence_col) if poi_sequence_col and poi_sequence_col in row else None,
-                ligase_name=row.get(ligase_col) if ligase_col and ligase_col in row else None,
-                cell_line=row.get(cell_line_col) if cell_line_col and cell_line_col in row else None,
-                treatment_time=row.get(treatment_time_col) if treatment_time_col and treatment_time_col in row else None,
-            )
+        batch_results = self.predict_batch(sample_list, return_individual=True)
 
+        all_row_results: List[Dict[str, Any]] = []
+        for task_results in batch_results:
             row_dict: Dict[str, Any] = {}
-            try:
-                task_results = self.predict(sample, return_individual=True)
+            if task_results is None:
+                row_dict['error'] = 'prediction failed'
+            else:
                 for task_name, result in task_results.items():
                     suffix = f"_{task_name}" if len(task_results) > 1 else ""
                     row_dict[f'prediction{suffix}'] = result.weighted_mean[0] if result.weighted_mean is not None else np.nan
@@ -1345,9 +1531,6 @@ class EnsemblePredictor:
                     row_dict[f'ci_pctl_upper{suffix}'] = result.ci_percentile_upper_95[0] if result.ci_percentile_upper_95 is not None else np.nan
                     row_dict[f'ci_sem_lower{suffix}'] = result.ci_sem_lower_95[0] if result.ci_sem_lower_95 is not None else np.nan
                     row_dict[f'ci_sem_upper{suffix}'] = result.ci_sem_upper_95[0] if result.ci_sem_upper_95 is not None else np.nan
-            except Exception as e:
-                row_dict['error'] = str(e)
-
             all_row_results.append(row_dict)
 
         result_df = pd.DataFrame(all_row_results)

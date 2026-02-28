@@ -87,6 +87,15 @@ class MolEmbedding(EmbeddingMixin):
         self.fp_size = fp_size
         self.use_relevant_descriptors = use_relevant_descriptors
         self.selected_descriptors = selected_descriptors
+        
+        # Cache the Morgan fingerprint generator to avoid recreating it on every call
+        self._morgan_fpgen = None
+        if embeddings_type == "fingerprint":
+            self._morgan_fpgen = Chem.rdFingerprintGenerator.GetMorganGenerator(
+                radius=radius,
+                fpSize=fp_size,
+                includeChirality=True,
+            )
     
     def get_descriptor_names(self) -> List[str]:
         """ Get the list of RDKit descriptor names used in this embedding. """
@@ -162,11 +171,14 @@ class MolEmbedding(EmbeddingMixin):
 
     def _encode_smiles_as_fingerprints(self, smiles_list: List[str]) -> Dict[str, np.ndarray]:
         """ Encode SMILES as Morgan fingerprints. """
-        morgan_fpgen = Chem.rdFingerprintGenerator.GetMorganGenerator(
-            radius=self.radius,
-            fpSize=self.fp_size,
-            includeChirality=True,
-        )
+        morgan_fpgen = self._morgan_fpgen
+        if morgan_fpgen is None:
+            morgan_fpgen = Chem.rdFingerprintGenerator.GetMorganGenerator(
+                radius=self.radius,
+                fpSize=self.fp_size,
+                includeChirality=True,
+            )
+            self._morgan_fpgen = morgan_fpgen
         fingerprints = {}
         for smiles in smiles_list:
             mol = Chem.MolFromSmiles(smiles)

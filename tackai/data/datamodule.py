@@ -184,7 +184,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         self.is_bert_multitask = is_bert_multitask
         
         # Dictionary mapping feature names to their dimensions
-        self.feature_dims: Dict[str, int] = {}
+        self.feature_dims = {}
         
         # Create embedders based on flags
         self.fp_embedder = MolEmbedding(
@@ -458,7 +458,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         # NOTE: Labels are NOT normalized here - they are normalized in
         # featurize_dataset to ensure consistency and proper handling of the
         # Value_Type for BERT multi-task
-        
+
         if return_tensor == 'np':
             # Convert all features to numpy arrays
             for key, value in features.items():
@@ -474,9 +474,15 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 else:
                     features[key] = torch.tensor(np.array(value))
         elif return_tensor == 'xgb':
+            # Use feature_dims order if available (matches training), else fall back to sorted
+            if self.feature_dims:
+                feature_order = [k for k in self.feature_dims if k in features]
+            else:
+                feature_order = sorted(features.keys())
+
             # Concatenate all features into a single 1D array for XGBoost
             feature_list = []
-            for key in sorted(features.keys()):
+            for key in feature_order:
                 value = features[key]
                 if isinstance(value, torch.Tensor):
                     value = value.numpy()
@@ -484,7 +490,11 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             
             # We return a tuple of (features, feature_names) for XGBoost to keep track of feature names                
             if not self.feature_dims: 
-                feature_names = [f"{key}_{i}" for key in sorted(features.keys()) for i in range(features[key].flatten().shape[0])]
+                feature_names = [
+                    f"{key}_{i}"
+                    for key in feature_order
+                    for i in range(features[key].flatten().shape[0])
+                ]
             else:
                 feature_names = self.get_xgboost_feature_names()  # Ensure feature names are initialized
             features = (
@@ -494,6 +504,259 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         else:
             raise ValueError(f"Invalid return_tensor value: {return_tensor}. Must be 'np' (NumPy), 'pt' (PyTorch), or 'xgb' (XGBoost, i.e., flattened array).")
         return features
+
+    def featurize_samples_batch(
+        self,
+        examples: List[Dict],
+        return_tensor: str = 'np',
+        shared_cache: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Batch-featurize multiple samples efficiently.
+
+        Instead of building a 1-row DataFrame per sample for the sklearn
+        pipelines, this method:
+        1. Computes raw embeddings once per unique input value (with optional
+           cross-model shared cache).
+        2. Runs the category and numeric sklearn pipelines on **all samples
+           at once** (one DataFrame, one ``.transform()`` call each).
+        3. Applies PCA in batch (one ``pca.transform(matrix)`` call).
+
+        Args:
+            examples: List of sample dicts (column-name → value).
+            return_tensor: Output format per sample ('np', 'pt', 'xgb').
+            shared_cache: Optional dict ``{(embedder_key, input_value): embedding}``
+                shared across datamodules so that identical raw embeddings
+                are computed only once in an ensemble.
+
+        Returns:
+            List of feature dicts (same structure as ``featurize_sample``).
+            For ``return_tensor='xgb'`` each entry is a ``(flat_array, feature_names)``
+            tuple.
+        """
+        if shared_cache is None:
+            shared_cache = {}
+
+        n = len(examples)
+        if n == 0:
+            return []
+
+        # ------------------------------------------------------------------
+        # 1. Raw embeddings — compute once per unique value, using shared_cache
+        # ------------------------------------------------------------------
+        fp_results: Dict[str, np.ndarray] = {}
+        cell_desc_results: Dict[str, np.ndarray] = {}
+        poi_seq_results: Dict[str, np.ndarray] = {}
+        poi_precomp_results: Dict[str, np.ndarray] = {}
+        ligase_precomp_results: Dict[str, np.ndarray] = {}
+
+        # Fingerprints
+        if self.use_fingerprints and self.fp_embedder is not None:
+            unique_smiles = list({ex[self.smiles_col] for ex in examples})
+            for smi in unique_smiles:
+                cache_key = ('fp', self.radius, self.fp_size, smi)
+                if cache_key in shared_cache:
+                    fp_results[smi] = shared_cache[cache_key]
+                else:
+                    emb = self.fp_embedder.transform(smi)
+                    shared_cache[cache_key] = emb
+                    fp_results[smi] = emb
+
+        # Cell description embedding
+        if self.use_cell_description_embedding and self.cell_description_embedding is not None:
+            unique_cells = list({ex[self.cell_line_col] for ex in examples})
+            for cell in unique_cells:
+                cache_key = ('cell_desc', cell)
+                if cache_key in shared_cache:
+                    cell_desc_results[cell] = shared_cache[cache_key]
+                else:
+                    emb = self.cell_description_embedding.transform(cell)
+                    shared_cache[cache_key] = emb
+                    cell_desc_results[cell] = emb
+
+        # POI sequence embedding (amino acid count / tfidf)
+        # NOTE: keyed by id(embedder) because TfidfVectorizer vocabulary differs per fold
+        if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
+            emb_id = id(self.poi_sequence_embedding)
+            unique_seqs = list({ex[self.poi_sequence_col] for ex in examples})
+            for seq in unique_seqs:
+                cache_key = ('poi_seq', emb_id, seq)
+                if cache_key in shared_cache:
+                    poi_seq_results[seq] = shared_cache[cache_key]
+                else:
+                    emb = self.poi_sequence_embedding.transform(seq)
+                    shared_cache[cache_key] = emb
+                    poi_seq_results[seq] = emb
+
+        # POI precomputed embedding (raw, before PCA)
+        if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
+            unique_poi_ids = list({self._get_protein_id(ex, 'poi') for ex in examples})
+            for pid in unique_poi_ids:
+                cache_key = ('poi_precomp', pid)
+                if cache_key in shared_cache:
+                    poi_precomp_results[pid] = shared_cache[cache_key]
+                else:
+                    emb = self.poi_precomputed_embedding.transform(pid)
+                    shared_cache[cache_key] = emb
+                    poi_precomp_results[pid] = emb
+
+        # Ligase precomputed embedding (raw, before PCA)
+        if self.use_ligase_precomputed_embedding and self.ligase_precomputed_embedding is not None:
+            unique_lig_ids = list({self._get_protein_id(ex, 'ligase') for ex in examples})
+            for lid in unique_lig_ids:
+                cache_key = ('lig_precomp', lid)
+                if cache_key in shared_cache:
+                    ligase_precomp_results[lid] = shared_cache[cache_key]
+                else:
+                    emb = self.ligase_precomputed_embedding.transform(lid)
+                    shared_cache[cache_key] = emb
+                    ligase_precomp_results[lid] = emb
+
+        # ------------------------------------------------------------------
+        # 2. Batch PCA — transform all unique embeddings at once
+        # ------------------------------------------------------------------
+        poi_pca_results: Dict[str, np.ndarray] = {}
+        if self.use_poi_pca and self.poi_pca is not None and poi_precomp_results:
+            ids_list = list(poi_precomp_results.keys())
+            matrix = np.stack([poi_precomp_results[pid] for pid in ids_list])
+            pca_out = self.poi_pca.transform(matrix)
+            for pid, vec in zip(ids_list, pca_out):
+                poi_pca_results[pid] = vec
+
+        ligase_pca_results: Dict[str, np.ndarray] = {}
+        if self.use_ligase_pca and self.ligase_pca is not None and ligase_precomp_results:
+            ids_list = list(ligase_precomp_results.keys())
+            matrix = np.stack([ligase_precomp_results[lid] for lid in ids_list])
+            pca_out = self.ligase_pca.transform(matrix)
+            for lid, vec in zip(ids_list, pca_out):
+                ligase_pca_results[lid] = vec
+
+        # ------------------------------------------------------------------
+        # 3. Batch category pipeline
+        # ------------------------------------------------------------------
+        cat_results: Optional[np.ndarray] = None
+        if self.category_pipeline is not None and self.categorical_cols:
+            cat_df = pd.DataFrame({
+                col: [ex[col] for ex in examples]
+                for col in self.categorical_cols
+            })
+            cat_results = self.category_pipeline.transform(cat_df)  # shape (n, n_cat_features)
+
+        # ------------------------------------------------------------------
+        # 4. Batch numeric pipeline
+        # ------------------------------------------------------------------
+        num_results: Optional[np.ndarray] = None
+        if self.numeric_pipeline is not None:
+            data_rows = []
+            for ex in examples:
+                row: Dict[str, Any] = {}
+                if self.use_treatment_time:
+                    row[self.treatment_time_col] = ex[self.treatment_time_col]
+                if self.use_descriptors:
+                    # Use shared_cache for raw descriptors (before DM-specific scaling)
+                    smi = ex[self.smiles_col]
+                    cache_key = ('desc_raw', smi)
+                    if cache_key in shared_cache:
+                        descs = shared_cache[cache_key]
+                    else:
+                        descs = self.desc_embedder.transform(smi)
+                        shared_cache[cache_key] = descs
+                    for j, name in enumerate(self.desc_embedder.get_descriptor_names()):
+                        row[f'Descriptor_{name}'] = np.array([descs[j]], dtype=np.float32)
+                data_rows.append(row)
+            num_df = pd.DataFrame(data_rows)
+            num_results = self.numeric_pipeline.transform(num_df)  # shape (n, n_num_features)
+
+        # ------------------------------------------------------------------
+        # 5. Assemble per-sample feature dicts
+        # ------------------------------------------------------------------
+        batch_features: List[Dict[str, Any]] = []
+        for i, ex in enumerate(examples):
+            features: Dict[str, Any] = {}
+
+            if self.use_fingerprints and self.fp_embedder is not None:
+                features['Feature_Fingerprint'] = fp_results[ex[self.smiles_col]]
+
+            if self.use_cell_description_embedding and self.cell_description_embedding is not None:
+                features[f'Feature_{self.cell_line_col}_Description'] = cell_desc_results[ex[self.cell_line_col]]
+
+            if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
+                features[f'Feature_{self.poi_sequence_col}'] = poi_seq_results[ex[self.poi_sequence_col]]
+
+            if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
+                pid = self._get_protein_id(ex, 'poi')
+                if self.use_poi_pca and self.poi_pca is not None:
+                    features['Feature_POI_Precomputed_Embedding'] = poi_pca_results[pid]
+                else:
+                    features['Feature_POI_Precomputed_Embedding'] = poi_precomp_results[pid]
+
+            if self.use_ligase_precomputed_embedding and self.ligase_precomputed_embedding is not None:
+                lid = self._get_protein_id(ex, 'ligase')
+                if self.use_ligase_pca and self.ligase_pca is not None:
+                    features['Feature_Ligase_Precomputed_Embedding'] = ligase_pca_results[lid]
+                else:
+                    features['Feature_Ligase_Precomputed_Embedding'] = ligase_precomp_results[lid]
+
+            # Category pipeline — slice from batch result
+            if cat_results is not None:
+                for j, col in enumerate(self.categorical_cols):
+                    features[f'Feature_{col}'] = cat_results[i, j:j+1]
+
+            # Numeric pipeline — slice from batch result
+            if num_results is not None:
+                for j, col in enumerate(self.numerical_cols):
+                    features[f'Feature_{col}'] = num_results[i, j:j+1]
+
+            # Tokenizer
+            if self.use_tokenizer:
+                tokenized = self._tokenize_sample(ex)
+                if not self.include_prompt and 'Prompt' in tokenized:
+                    del tokenized['Prompt']
+                features.update(tokenized)
+
+            # ----------------------------------------------------------
+            # Convert to requested tensor format
+            # ----------------------------------------------------------
+            if return_tensor == 'np':
+                for key, value in features.items():
+                    if isinstance(value, torch.Tensor):
+                        features[key] = value.numpy()
+                    elif not isinstance(value, np.ndarray):
+                        features[key] = np.array(value)
+            elif return_tensor == 'pt':
+                for key, value in features.items():
+                    if isinstance(value, np.ndarray):
+                        features[key] = torch.tensor(value)
+                    else:
+                        features[key] = torch.tensor(np.array(value))
+            elif return_tensor == 'xgb':
+                # Use feature_dims order if available (matches training), else fall back to sorted
+                if self.feature_dims:
+                    feature_order = [k for k in self.feature_dims if k in features]
+                else:
+                    feature_order = sorted(features.keys())
+
+                feature_list = []
+                for key in feature_order:
+                    value = features[key]
+                    if isinstance(value, torch.Tensor):
+                        value = value.numpy()
+                    feature_list.append(value.flatten())
+                if not self.feature_dims:
+                    feature_names = [
+                        f"{key}_{j}"
+                        for key in feature_order
+                        for j in range(features[key].flatten().shape[0])
+                    ]
+                else:
+                    feature_names = self.get_xgboost_feature_names()
+                features = (
+                    np.concatenate(feature_list).astype(np.float32),
+                    feature_names,
+                )
+
+            batch_features.append(features)
+
+        return batch_features
     
     def featurize_dataset(
             self,
