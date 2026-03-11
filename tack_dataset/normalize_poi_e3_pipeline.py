@@ -378,13 +378,13 @@ def run_audit(protac_raw_path: Path, tpddb_raw_path: Path,
 
 def main():
     p = argparse.ArgumentParser(description="Normalize PROTAC-DB and TPDDB POI/E3 fields using UniProt.")
-    p.add_argument("--protacdb", required=True, help="Path to raw PROTAC-DB CSV (e.g., PROTAC-DB.csv)")
-    p.add_argument("--tpddb", required=True, help="Path to raw TPDDB CSV (e.g., tpddb_protacs.csv)")
-    p.add_argument("--out-dir", default=".", help="Output directory for normalized CSVs (default: current dir)")
+    p.add_argument("--protacdb", required=True, help="Path to raw PROTAC-DB CSV")
+    p.add_argument("--tpddb", required=True, help="Path to raw TPDDB CSV")
+    p.add_argument("--out-dir", default=".", help="Output directory for normalized CSVs")
     p.add_argument("--protacdb-out", default="protacdb_normalized.csv", help="Output filename for PROTAC-DB normalized CSV")
     p.add_argument("--tpddb-out", default="tpddb_normalized.csv", help="Output filename for TPDDB normalized CSV")
     p.add_argument("--audit", action="store_true", help="Write audit CSVs (raw + post-normalization)")
-    p.add_argument("--audit-dir", default="audit", help="Directory for audit outputs (relative to out-dir by default)")
+    p.add_argument("--audit-dir", default="audit", help="Directory for audit outputs")
     args = p.parse_args()
 
     out_dir = Path(args.out_dir)
