@@ -123,7 +123,7 @@ def main():
                         help='Path to YAML file with data configuration.')
     parser.add_argument('--model_config', type=str, default=None,
                         help='Path to YAML file with model configuration.')
-    pasrser.add_argument('--tune_hyperparameters', action='store_true',
+    parser.add_argument('--tune_hyperparameters', action='store_true',
                         help='Whether to perform hyperparameter tuning (unused, in development).')
     parser.add_argument('--n_tuning_trials', type=int, default=20,
                         help='Number of hyperparameter tuning trials (unused, in development).')
