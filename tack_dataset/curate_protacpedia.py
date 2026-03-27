@@ -1,1631 +1,1694 @@
-"""
-Data Curation Pipeline for PROTAC-Pedia Dataset.
-
-This script curates the PROTAC-Pedia dataset to match the standardized format
-used by TPD-DB and PROTAC-DB. The output includes cleaned SMILES, validated
-cell lines with Cellosaurus IDs, POI sequences from UniProt, parsed assay
-values, and standardized column names.
-
-Output format includes key columns:
-    - SMILES: Canonical SMILES string
-    - POI_Name: Protein of Interest name
-    - POI_UniProt: POI UniProt ID
-    - POI_Sequence: POI amino acid sequence
-    - Ligase_Name: E3 ligase name
-    - Ligase_UniProt: E3 ligase UniProt ID
-    - Ligase_Sequence: E3 ligase amino acid sequence
-    - Cell_Line: Standardized cell line name
-    - Cell_Line_ID: Cellosaurus accession ID (CVCL_####)
-    - Cell_Line_Species: Species of the cell line
-    - Value: Measured value (DC50 or Dmax)
-    - Value_Type: Type of measurement
-    - Value_Unit: Unit of measurement
-    - Value_Symbol: Symbol for approximate values (<, >, ~)
-    - Assay: Assay description
-    - Assay_Time: Treatment time in hours
-    - Reference: PubMed ID or source
-
-Usage:
-    python curate_protacpedia.py --output_dir ../data/curation
-"""
-
-import argparse
-import json
-import logging
+""" """
 import os
-import pickle
 import re
-import time
-from dataclasses import dataclass
-from functools import lru_cache
+import logging
+import argparse
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Optional, Tuple, Dict
 
-import numpy as np
 import pandas as pd
-import requests
-from rdkit import Chem
-from rdkit import RDLogger
-from tqdm.auto import tqdm
-from Bio import Entrez
+import numpy as np
+from tqdm import tqdm
 
-from tack_dataset.curate_protacpedia_manual_curation_utils import get_manual_curation_overrides
-from tack_dataset.logging_utils import setup_logging
-
-# Suppress RDKit warnings
-RDLogger.DisableLog('rdApp.*')
-
-# Configure logging
-log_file = setup_logging(
-    log_dir=Path('logs'),
-    log_base_name='protacpedia_curation',
-    verbose=1, # Enable INFO level logging
+from tack_dataset.logging_utils import setup_logging, set_global_logging_level
+from tack_dataset.curation_utils import canonicalize_smiles
+from tack_dataset.protacdb.assay_cleaning import parse_single_value
+from tackai.data.embeddings.cell_embeddings import (
+    CellEmbedding,
 )
-logger = logging.getLogger(__name__)
-
-logger.info(f"Log file: {log_file}")
-
-
-# =============================================================================
-# Configuration
-# =============================================================================
-
-@dataclass
-class Config:
-    """Configuration for the PROTAC-Pedia curation pipeline."""
-    
-    # Directories
-    output_dir: str = "data/curation"
-    cache_dir: str = "data/curation"
-    log_dir: str = "logs"
-    
-    # API settings
-    api_delay: float = 0.5
-    force_refetch: bool = False
-    
-    # Input file (original PROTACpedia CSV)
-    input_file: str = 'protacpedia_protac_dc50_dmax.csv'
-    
-    # Output file
-    output_file: str = 'protacpedia_protac_dc50_dmax_cleaned.csv'
-    
-    # E3 Ligase to UniProt mapping
-    e3_ligase_to_uniprot: Dict[str, str] = None
-    
-    def __post_init__(self):
-        if self.e3_ligase_to_uniprot is None:
-            self.e3_ligase_to_uniprot = {
-                'VHL': 'P40337',
-                'CRBN': 'Q96SW2',
-                'DCAF1': 'Q9Y4B6',
-                'DCAF11': 'Q8TEB1',
-                'DCAF15': 'Q66K64',
-                'DCAF16': 'Q9NXF7',
-                'MDM2': 'Q00987',
-                'XIAP': 'P98170',
-                'IAP': 'P98170',
-                'cIAP1': 'Q13490',
-                'AhR': 'P35869',
-                'RNF4': 'P78317',
-                'RNF114': 'Q9Y508',
-                'FEM1B': 'Q9UK73',
-                'UBR1': 'Q8IWV7',
-                'UBR box': 'G3V2G3',
-                'KLHL20': 'Q9Y2M5',
-                'KLHDC2': 'Q9Y2U9',
-                'FBXO22': 'Q8NEZ5',
-                'KEAP1': 'Q14145',
-            }
+from tack_dataset.cell_utils import (
+    standardize_cell_line,
+    get_cell_species,
+)
+from tack_dataset.protacdb.protein_utils import (
+    E3_TO_ORGANISM_TO_UNIPROT,
+    fetch_protein_info,
+    fetch_uniprot_for_gene,
+    apply_mutation,
+)
+from tack_dataset.protacdb.utils import load_dict, save_dict
 
 
-# =============================================================================
-# Utility Functions
-# =============================================================================
-
-def get_doi_from_pubmed(pmid: int, email: str) -> str:
-    """ Get DOI from PubMed using the Entrez API.
+def clean_cell_name(
+        cell_name: str,
+        cell_embedding: Optional[CellEmbedding],
+        manual_cell_mapping: Optional[Dict[str, str]] = None,
+        logger: Optional[logging.Logger] = None,
+        fuzzy_matching_threshold: float = 0.6,
+) -> Tuple[Optional[str], Optional[str]]:
+    """" Wraps standardize_cell_line with manual overrides for known problematic cases in the PROTACpedia dataset.
     
     Args:
-        pmid (int): PubMed ID to fetch the DOI for.
-        email (str): Email address to use for Entrez API requests.
+        cell_name (str): The raw cell line name to clean.
+        manual_cell_mapping (Optional[Dict[str, str]]): A dictionary of manual mappings from raw cell line names to standardized names. This will be merged with the default mappings for PROTACpedia.
+        logger (Optional[logging.Logger]): An optional logger for logging warnings or info during the cleaning process.
+        fuzzy_matching_threshold (float): The threshold for fuzzy matching when standardizing cell line names. Default is 0.6.
         
     Returns:
-        str: DOI if available, otherwise a link to the PubMed article.
+        Tuple[Optional[str], Optional[str]]: A tuple containing the cleaned cell line name and its corresponding Cellosaurus ID. Both values will be None if the cell line name cannot be cleaned
     """
-    Entrez.email = email
-    handle = Entrez.efetch(db="pubmed", id=pmid, retmode="xml")
-    records = Entrez.read(handle)
-    handle.close()
-
-    # Extracting DOI
-    try:
-        article = records['PubmedArticle'][0]
-        for el in article['MedlineCitation']['Article']['ELocationID']:
-            if el.attributes['EIdType'] == 'doi':
-                return el
-    except IndexError:
-        return f'https://pubmed.ncbi.nlm.nih.gov/{pmid}/'
-
-
-def canonicalize_smiles(smiles: str) -> Optional[str]:
-    """
-    Canonicalize a SMILES string using RDKit.
-    
-    Args:
-        smiles: Input SMILES string
-        
-    Returns:
-        Canonical SMILES or None if invalid
-    """
-    if pd.isna(smiles) or not smiles:
-        return None
-    try:
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is not None:
-            return Chem.MolToSmiles(mol, canonical=True)
-    except Exception:
-        pass
-    return None
-
-
-def parse_value_symbol_unit(s):
-    """
-    Parses a string like '53 nM', '< 1 uM', '~ 3 nM', '> 10 uM' and returns (value, symbol, unit).
-    - value: float
-    - symbol: '', '<', '>', '~'
-    - unit: 'nM' or 'μM' (unicode mu)
-    """
-    s = s.strip()
-    # Regex: optional symbol, value (float), unit (nM/uM)
-    match = re.match(r'^(?P<symbol>[<>=~]*)\s*(?P<value>[0-9.]+)\s*(?P<unit>nM|uM)$', s)
-    if not match:
-        raise ValueError(f"Could not parse: {s}")
-    symbol = match.group('symbol')
-    value = float(match.group('value'))
-    unit = match.group('unit')
-    if unit == 'uM':
-        unit = 'μM'  # Unicode mu
-    return value, symbol, unit
-
-
-def parse_percent_value_symbol(s):
-    """
-    Parses strings like '100 %', '~ 90 %', '> 85 %', '< 70 %', '0.03 %', '0' and returns (value, symbol, unit).
-    - value: float
-    - symbol: '', '<', '>', '~'
-    - unit: '%' (always percent)
-    """
-    s = s.strip()
-    # Handle missing percent sign (e.g., '0', '55')
-    if not s.endswith('%'):
-        s = s + ' %'
-    match = re.match(r'^(?P<symbol>[<>=~]*)\s*(?P<value>[0-9.]+)\s*%$', s)
-    if not match:
-        raise ValueError(f"Could not parse: {s}")
-    symbol = match.group('symbol')
-    value = float(match.group('value'))
-    unit = '%'
-    return value, symbol, unit
-
-
-# =============================================================================
-# Cellosaurus API Functions
-# =============================================================================
-
-CELLOSAURUS_API = "https://api.cellosaurus.org/cell-line/{}"
-CELLOSAURUS_SEARCH_API = "https://api.cellosaurus.org/search/cell-line"
-
-
-@lru_cache(maxsize=2048)
-def fetch_cellosaurus_by_name(cell_line_name: str) -> Optional[dict]:
-    """
-    Fetch cell line metadata from Cellosaurus API by name.
-    
-    Args:
-        cell_line_name: Cell line name to search for
-        
-    Returns:
-        Dictionary with cell line metadata or None
-    """
-    if not cell_line_name:
-        return None
-    
-    try:
-        # Use search endpoint (the direct endpoint requires accession IDs, not names)
-        params = {'q': cell_line_name}
-        resp = requests.get(CELLOSAURUS_SEARCH_API, params=params, timeout=10)
-        resp.raise_for_status()
-        
-        data = resp.json()
-        cell_lines = data.get('Cellosaurus', {}).get('cell-line-list', [])
-        
-        if cell_lines:
-            # Return first match (usually the best match)
-            return cell_lines[0]
-    except Exception as e:
-        logger.debug(f"Failed to fetch Cellosaurus data for {cell_line_name}: {e}")
-    
-    return None
-
-
-def clean_cell_line_name(cell_line: Optional[str]) -> Optional[str]:
-    """
-    Standardize cell line name for Cellosaurus lookup.
-    
-    Args:
-        cell_line: Raw cell line string
-        
-    Returns:
-        Cleaned cell line name
-    """
-    if pd.isna(cell_line) or not cell_line:
-        return None
-    
-    s = str(cell_line).strip()
-    
-    # If multiple cell lines are listed (comma or semicolon separated), take only the first one
-    if ',' in s or ';' in s:
-        s = re.split(r'[,;]', s)[0].strip()
-    
-    # Remove parenthetical annotations
-    s = re.sub(r'\s*\(.*?\)', '', s).strip()
-    
-    # Remove common suffixes
-    s = re.sub(r'\s+(cells?|cell\s+line|monocytes?|cancer|breast|leukemia|carcinoma)$', '', s, flags=re.IGNORECASE).strip()
-    
-    # Remove common prefixes
-    s = re.sub(r'^(human|mouse|rat)\s+', '', s, flags=re.IGNORECASE).strip()
-    
-    # Common normalizations
-    replacements = {
-        'MOLT4': 'MOLT-4',
-        'Hela': 'HeLa',
-        'hela': 'HeLa',
-        'HT1080': 'HT-1080',
-        'HT 1080': 'HT-1080',
-        'THP': 'THP-1',  # THP is usually THP-1
-        'Hs578t': 'Hs 578T',  # Standard Cellosaurus format
-        'Panc0213': 'Panc 02.13',
-        'Panc02.13': 'Panc 02.13',
-        'NAMALWA': 'Namalwa',  # Case normalization
-    }
-    
-    for old, new in replacements.items():
-        if s.lower() == old.lower():
-            return new
-    
-    return s if s else None
-
-
-def get_cellosaurus_accession(cell_line: str) -> Optional[str]:
-    """
-    Get Cellosaurus accession ID (CVCL_####) for a cell line.
-    
-    Args:
-        cell_line: Cell line name
-        
-    Returns:
-        Cellosaurus accession ID or None
-    """
-    if not cell_line:
-        return None
-    
-    metadata = fetch_cellosaurus_by_name(cell_line)
-    if metadata:
-        # New API format: accession-list with type "primary"
-        accession_list = metadata.get('accession-list', [])
-        for acc_item in accession_list:
-            if isinstance(acc_item, dict) and acc_item.get('type') == 'primary':
-                value = acc_item.get('value', '')
-                if value.startswith('CVCL_'):
-                    return value
-        
-        # Fallback to direct accession field
-        for key in ['accession', 'accession-id', 'id', 'ac']:
-            if key in metadata:
-                acc = metadata[key]
-                if isinstance(acc, str) and acc.startswith('CVCL_'):
-                    return acc
-                if isinstance(acc, list) and acc and acc[0].startswith('CVCL_'):
-                    return acc[0]
-    
-    return None
-
-
-def get_cellosaurus_species(cell_line: str) -> Optional[str]:
-    """
-    Get species information from Cellosaurus.
-    
-    Args:
-        cell_line: Cell line name
-        
-    Returns:
-        Species name or None
-    """
-    if not cell_line:
-        return None
-    
-    metadata = fetch_cellosaurus_by_name(cell_line)
-    if metadata:
-        # New API format: species-list with label field
-        species_list = metadata.get('species-list', [])
-        if species_list:
-            if isinstance(species_list[0], dict):
-                # Extract from label (e.g., "Homo sapiens (Human)")
-                label = species_list[0].get('label', '')
-                if label:
-                    # Extract just species name before parentheses
-                    species = label.split('(')[0].strip()
-                    return species
-                return species_list[0].get('value') or species_list[0].get('name')
-            return str(species_list[0])
-        
-        # Fallback to other possible keys
-        for key in ['species', 'organism']:
-            if key in metadata:
-                species_data = metadata[key]
-                if isinstance(species_data, str):
-                    return species_data
-                if isinstance(species_data, list) and species_data:
-                    if isinstance(species_data[0], dict):
-                        return species_data[0].get('value') or species_data[0].get('name')
-                    return str(species_data[0])
-    
-    # Fallback heuristics based on cell line name
-    s = cell_line.lower()
-    if any(k in s for k in ['mouse', 'murine', '3t3', 'baf3', 'ba/f3']):
-        return 'Mus musculus'
-    if 'rat' in s:
-        return 'Rattus norvegicus'
-    
-    # Common human cell lines
-    human_hints = ['hela', 'a549', 'hct', 'ht', 'k562', 'molt', 'calu', 
-                   'h358', 'h1975', 'mia', 'panc', 'pc3', 'lncap']
-    if any(k in s for k in human_hints):
-        return 'Homo sapiens'
-    
-    return 'Unknown'
-
-
-# =============================================================================
-# UniProt API Functions
-# =============================================================================
-
-class UniProtFetcher:
-    """Handles UniProt API requests with caching."""
-    
-    def __init__(self, cache_dir: str, delay: float = 0.5):
-        self.cache_dir = Path(cache_dir)
-        self.delay = delay
-        self.cache_file = self.cache_dir / 'uniprot_cache.json'
-        self.cache = self._load_cache()
-    
-    def _load_cache(self) -> dict:
-        """Load cache from disk."""
-        if self.cache_file.exists():
-            try:
-                with open(self.cache_file, 'r') as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {}
-    
-    def save_cache(self):
-        """Save cache to disk."""
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.cache_file, 'w') as f:
-            json.dump(self.cache, f, indent=2)
-    
-    def fetch_entry(self, uniprot_id: str) -> Optional[dict]:
-        """
-        Fetch a UniProt entry by ID.
-        
-        Args:
-            uniprot_id: UniProt accession ID
-            
-        Returns:
-            UniProt entry as dictionary or None
-        """
-        if uniprot_id in self.cache:
-            return self.cache[uniprot_id]
-        
-        url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.json"
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            time.sleep(self.delay)
-            entry = response.json()
-            self.cache[uniprot_id] = entry
-            return entry
-        except Exception as e:
-            logger.warning(f"Failed to fetch UniProt entry {uniprot_id}: {e}")
-            return None
-    
-    def get_sequence(self, uniprot_id: str) -> Optional[str]:
-        """
-        Get the canonical sequence for a UniProt ID.
-        
-        Args:
-            uniprot_id: UniProt accession ID
-            
-        Returns:
-            Amino acid sequence or None
-        """
-        entry = self.fetch_entry(uniprot_id)
-        if entry and 'sequence' in entry:
-            return entry['sequence'].get('value')
-        return None
-    
-    def get_gene_names(self, uniprot_id: str) -> List[str]:
-        """
-        Get gene names for a UniProt ID.
-        
-        Args:
-            uniprot_id: UniProt accession ID
-            
-        Returns:
-            List of gene names
-        """
-        entry = self.fetch_entry(uniprot_id)
-        if not entry:
-            return []
-        
-        names = []
-        for gene in entry.get('genes', []):
-            if 'geneName' in gene:
-                names.append(gene['geneName'].get('value', ''))
-            for syn in gene.get('synonyms', []):
-                names.append(syn.get('value', ''))
-        
-        return [n for n in names if n]
-
-
-# =============================================================================
-# Assay Time Extraction
-# =============================================================================
-
-def extract_assay_time(row: pd.Series) -> Optional[int]:
-    """
-    Extract assay time in hours from Comments or Time column.
-    
-    Args:
-        row: DataFrame row
-        
-    Returns:
-        Assay time in hours or None
-    """
-    # Try Time column first
-    if 'Time' in row and pd.notna(row['Time']):
-        time_str = str(row['Time']).strip()
-        # Match patterns like "48", "24 h", "16 hours", etc.
-        match = re.search(r'(\d+)\s*(?:h|hr|hrs|hour|hours)?', time_str, re.I)
-        if match:
-            return int(match.group(1))
-    
-    # Try Comments column
-    if 'Comments' in row and pd.notna(row['Comments']):
-        comments = str(row['Comments'])
-        # Look for time mentions in comments
-        match = re.search(r'(\d+)\s*(?:h|hr|hrs|hour|hours)', comments, re.I)
-        if match:
-            return int(match.group(1))
-    
-    return None
-
-
-def parse_value_with_symbol(value_str: str) -> Tuple[Optional[float], str]:
-    """
-    Parse value with optional symbol.
-    
-    Args:
-        value_str: String like "100", ">50", "~90", "< 10"
-        
-    Returns:
-        (value, symbol) tuple
-    """
-    value_str = value_str.strip()
-    symbol = ''
-    
-    # Extract symbol
-    match = re.match(r'^([<>~≤≥]+)\s*([\d.]+)', value_str)
-    if match:
-        symbol = match.group(1)
-        value_str = match.group(2)
-    
-    # Normalize symbols
-    symbol = symbol.replace('≤', '<=').replace('≥', '>=')
-    if symbol in ['<=', '<']:
-        symbol = '<'
-    elif symbol in ['>=', '>']:
-        symbol = '>'
-    elif symbol in ['~', '≈']:
-        symbol = '~'
-    
-    try:
-        value = float(value_str)
-    except ValueError:
-        value = None
-    
-    return value, symbol
-
-
-def parse_single_value(value_str: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse a single numeric value with optional operator, error bar, and unit.
-    
-    Examples:
-        "0.785±0.03μM" -> {'mean': 0.785, 'error': 0.03, 'unit': 'μM', 'operator': None}
-        ">10μM" -> {'mean': 10.0, 'error': None, 'unit': 'μM', 'operator': '>'}
-        "~58.7%" -> {'mean': 58.7, 'error': None, 'unit': '%', 'operator': '~'}
-    
-    Args:
-        value_str: String containing a value
-        
-    Returns:
-        Dict with mean, error, unit, operator or None
-    """
-    value_str = value_str.strip()
-    
-    # Pattern 1: Error bar with optional tilde prefix (0.785±0.03μM, 67±1.4%, ~58.7±0.03%)
-    match = re.match(r'^~?\s*(-?\d+\.?\d*|\d*\.\d+)\s*[±]\s*(\d+\.?\d*|\d*\.\d+)\s*([a-zA-Zμµ%]+)?$', value_str)
-    if match:
-        return {
-            'mean': float(match.group(1)),
-            'error': float(match.group(2)),
-            'unit': match.group(3),
-            'operator': None
-        }
-    
-    # Pattern 2: Operator with optional spaces (>10μM, <100nM, ≥150nM, <=100nM, > 3.16E-07M)
-    match = re.match(r'^([>≥<≤]+|<=|>=)\s*(\d+\.?\d*(?:[eE][+-]?\d+)?|\d*\.\d+)\s*([a-zA-Zμµ%/]+)?$', value_str)
-    if match:
-        operator = match.group(1)
-        # Normalize operators
-        operator = operator.replace('≤', '<=').replace('≥', '>=')
-        if operator in ['<=', '<']:
-            operator = '<'
-        elif operator in ['>=', '>']:
-            operator = '>'
-        return {
-            'mean': float(match.group(2)),
-            'error': None,
-            'unit': match.group(3),
-            'operator': operator
-        }
-    
-    # Pattern 3: Tilde prefix (~58.7%, ~3nM, ~30.1 %)
-    match = re.match(r'^~\s*(-?\d+\.?\d*|\d*\.\d+)\s*([a-zA-Zμµ%]+)?$', value_str)
-    if match:
-        return {
-            'mean': float(match.group(1)),
-            'error': None,
-            'unit': match.group(2),
-            'operator': '~'
-        }
-
-    # Pattern 4: Numeric with exponential notation (1.2e3 nM, 3.5E-2 μM, 3.16E-07M)
-    match = re.match(r'^(-?\d+\.?\d*|\d*\.\d+)[eE][+-]?\d+\s*([a-zA-Zμµ%/]+)?$', value_str)
-    if match:
-        numeric_part = value_str
-        if match.group(2):
-            numeric_part = value_str[:value_str.rfind(match.group(2))].strip()
-        return {
-            'mean': float(numeric_part),
-            'error': None,
-            'unit': match.group(2),
-            'operator': None
-        }
-    
-    # Pattern 5: Standard numeric (2.63nM, 0.701μM, 67%, 0.001µM)
-    match = re.match(r'^(-?\d+\.?\d*|\d*\.\d+)\s*([a-zA-Zμµ%/]+)?$', value_str)
-    if match:
-        return {
-            'mean': float(match.group(1)),
-            'error': None,
-            'unit': match.group(2),
-            'operator': None
-        }
-    
-    return None
-
-
-def parse_range_value(value_str: str) -> Optional[Dict[str, Any]]:
-    """
-    Parse range values like '10nM≤x<100nM', '0.01-0.1μM', or '150-200'.
-    
-    Args:
-        value_str: String containing a range
-        
-    Returns:
-        Dict with min, max, unit or None
-    """
-    value_str = value_str.strip()
-    
-    # Pattern 1: Hyphen ranges with unit (0.01-0.1μM, 100nM-300nM, 1-5μM)
-    match = re.match(r'^(\d+\.?\d*|\d*\.\d+)\s*([a-zA-Zμµ%]+)?\s*-\s*(\d+\.?\d*|\d*\.\d+)\s*([a-zA-Zμµ%]+)?$', value_str)
-    if match:
-        return {
-            'min': float(match.group(1)),
-            'max': float(match.group(3)),
-            'unit': match.group(2) or match.group(4)
-        }
-    
-    # Pattern 2: Inequality ranges with x (10nM≤x<100nM, 1.0μM≤x<3.0μM)
-    match = re.search(
-        r'(\d+\.?\d*|\d*\.\d+)\s*([a-zA-Zμµ%]+)?\s*[<≤]\s*x\s*[<≤]\s*(\d+\.?\d*|\d*\.\d+)\s*([a-zA-Zμµ%]+)?',
-        value_str
+    if pd.isna(cell_name):
+        return None, None
+    cell_name = cell_name.replace('cell line', '').strip()
+    if not cell_name:
+        return None, None
+    if manual_cell_mapping is None:
+        manual_cell_mapping = {}
+    return standardize_cell_line(
+        cell_name,
+        cell_embedding,
+        manual_cell_mapping=dict(**{
+            'K562 CML': 'K-562',
+            '293FTCRBN−/−': 'HEK293FT',
+            'CRBN-/-': 'HEK293FT',
+            'PBMCs': 'PBMC iPSC #1',
+            'Hela': 'HeLa',
+            'Hella': 'HeLa',
+            'hela': 'HeLa',
+            'HeLa (EGFR Exon 20 Ins)': 'HeLa',
+            'GFP-KRASG12C reporter  in Flp-In 293': 'Flp-In 293',
+            'OVCAR8 (WT EGFR)': 'OVCAR8',
+            'MCF-7 breast cancer cells': 'MCF-7',
+            'KYSE520 esophageal cancer': 'KYSE520',
+            'WI38 platelets': 'MOLT-4',
+            'DU145/Cy': 'DU-145',
+            '5W1573': 'SW1573',
+            'BBL358': 'BL-358',
+            'IgEMM': 'U266B1',
+            'Human THP-1 monocytes': 'THP-1',
+            'DLBCL': 'HBL-1 [Human diffuse large B-cell lymphoma]',
+            'MM1.SCRBN−/−': 'MM.1S',
+            'INC-H23': 'NCI-H23', # Typo in original data
+            'PC-3': 'PC-3',
+            'Cy': 'CY-6',
+        }, **manual_cell_mapping),
+        fuzzy_matching_threshold=fuzzy_matching_threshold,
+        logger=logger,
     )
-    if match:
-        return {
-            'min': float(match.group(1)),
-            'max': float(match.group(3)),
-            'unit': match.group(2) or match.group(4)
-        }
-    
-    # Pattern 3: Operator with inequality (≥150nM, <100, >10μM, <=100nM, >=10)
-    match = re.match(r'^([>≥<≤]+|<=|>=)\s*(\d+\.?\d*|\d*\.\d+)\s*([a-zA-Zμµ%]+)?$', value_str)
-    if match:
-        operator = match.group(1)
-        val = float(match.group(2))
-        unit = match.group(3)
-        
-        operator = operator.replace('≤', '<=').replace('≥', '>=')
-        if operator in ['>', '≥', '>=']:
-            return {'min': val, 'max': None, 'unit': unit}
-        elif operator in ['<', '≤', '<=']:
-            return {'min': None, 'max': val, 'unit': unit}
-    
-    return None
-
-
-def normalize_units(unit: Optional[str]) -> Optional[str]:
-    """Normalize units to standard forms."""
-    if not unit:
-        return None
-    
-    unit_mapping = {
-        'nm': 'nM',
-        'nM': 'nM',
-        'nmol/L': 'nM',
-        'uM': 'μM',
-        'µM': 'μM',
-        'um': 'μM',
-        'μM': 'μM',
-        'M': 'M',
-        '%': '%',
-    }
-    
-    return unit_mapping.get(unit, unit)
-
-
-def parse_cell_line_specific_values(comments: str) -> List[Dict[str, Any]]:
-    """
-    Parse comments to extract cell-line-specific DC50/Dmax values.
-    
-    Examples:
-        "DC50 is 0.86nM in LNCaP, 0.76 in VCaP and 10.4 nM at 1uM in 22Rv1"
-        "Dmax for KYSE520 cell: >95%; Dmax for MV4;11 cell: >90%"
-        "DC50: 0.25~0.76uM; Dmax: ~75%-90%"
-    
-    Args:
-        comments: Comment text
-        
-    Returns:
-        List of dicts with cell_line, value_type, value, unit, symbol
-    """
-    if pd.isna(comments):
-        return []
-    
-    results = []
-    text = str(comments)
-    
-    # Pattern 1: "DC50 is X nM in CellLine, Y nM in CellLine2"
-    pattern1 = r'DC50\s+is\s+([<>~≤≥]?\s*[\d.]+)\s*(nM|μM|uM|pM|M)\s+in\s+([A-Za-z0-9\-]+)'
-    for match in re.finditer(pattern1, text, re.IGNORECASE):
-        value_str, unit, cell_line = match.groups()
-        value, symbol = parse_value_with_symbol(value_str.strip())
-        if unit.lower() == 'um':
-            unit = 'μM'
-        results.append({
-            'cell_line': cell_line.strip(),
-            'value_type': 'DC50',
-            'value': value,
-            'unit': unit,
-            'symbol': symbol
-        })
-    
-    # Pattern 2: "DC50 for CellLine: X nM" or "DC50 for CellLine cell: X nM"
-    pattern2 = r'DC50\s+(?:for|in)\s+([A-Za-z0-9\-\s]+?)(?:\s+cells?)?\s*:\s*([<>~≤≥]?\s*[\d.]+)\s*(nM|μM|uM|pM|M)'
-    for match in re.finditer(pattern2, text, re.IGNORECASE):
-        cell_line, value_str, unit = match.groups()
-        # Clean up cell line name
-        cell_line = cell_line.strip()
-        # Skip if it looks like a protein name (contains lowercase or slash)
-        if '/' in cell_line or any(c.islower() for c in cell_line.replace(' ', '')):
-            continue
-        value, symbol = parse_value_with_symbol(value_str.strip())
-        if unit.lower() == 'um':
-            unit = 'μM'
-        results.append({
-            'cell_line': cell_line,
-            'value_type': 'DC50',
-            'value': value,
-            'unit': unit,
-            'symbol': symbol
-        })
-    
-    # Pattern 3: "Dmax for CellLine: X%" or "Dmax for CellLine cells: X%"
-    pattern3 = r'Dmax\s+(?:for|in)\s+([A-Za-z0-9\-\s]+?)(?:\s+cells?)?\s*:\s*([<>~≤≥]?\s*[\d.]+)\s*%'
-    for match in re.finditer(pattern3, text, re.IGNORECASE):
-        cell_line, value_str = match.groups()
-        cell_line = cell_line.strip()
-        # Skip protein names
-        if '/' in cell_line or any(c.islower() for c in cell_line.replace(' ', '')):
-            continue
-        value, symbol = parse_value_with_symbol(value_str.strip())
-        results.append({
-            'cell_line': cell_line,
-            'value_type': 'Dmax',
-            'value': value,
-            'unit': '%',
-            'symbol': symbol
-        })
-    
-    # Pattern 4: "Dmax in CellLine/CellLine2: X%±Y% and Z%±W%, respectively"
-    pattern4 = r'Dmax\s+in\s+([A-Za-z0-9\-]+)/([A-Za-z0-9\-]+)\s*:\s*([<>~≤≥]?\s*[\d.]+)%?[^,]*and\s+([<>~≤≥]?\s*[\d.]+)%'
-    for match in re.finditer(pattern4, text, re.IGNORECASE):
-        cell1, cell2, val1_str, val2_str = match.groups()
-        value1, symbol1 = parse_value_with_symbol(val1_str.strip())
-        value2, symbol2 = parse_value_with_symbol(val2_str.strip())
-        results.append({
-            'cell_line': cell1.strip(),
-            'value_type': 'Dmax',
-            'value': value1,
-            'unit': '%',
-            'symbol': symbol1
-        })
-        results.append({
-            'cell_line': cell2.strip(),
-            'value_type': 'Dmax',
-            'value': value2,
-            'unit': '%',
-            'symbol': symbol2
-        })
-    
-    return results
-
-
-def extract_additional_metrics_from_comments(comments: str) -> Dict[str, Any]:
-    """
-    Extract additional metrics from comments like IC50, EC50, pDC50, pEC50, etc.
-    
-    Examples:
-        "IC50 of ligand is 51.0 nM (WT BTK), 30.7 (C481S)"
-        "EC50 of PROTAC is 28nM in MV-4-11, 68nM in NCI-H1568"
-        "pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 7.0/7.0/6.5/6.2"
-    
-    Args:
-        comments: Comment text
-        
-    Returns:
-        Dict with extracted metrics
-    """
-    if pd.isna(comments):
-        return {}
-    
-    metrics = {}
-    text = str(comments)
-    
-    # Extract Ligand IC50
-    match = re.search(r'IC50\s+of\s+(?:the\s+)?ligand\s+is\s+(?:between\s+)?([<>~]?\s*[\d.]+)\s*-?\s*[\d.]*\s*(nM|μM|uM|pM)', text, re.IGNORECASE)
-    if match:
-        metrics['Ligand_IC50'] = match.group(1).strip()
-        metrics['Ligand_IC50_Unit'] = match.group(2)
-    
-    # Extract Ligand EC50
-    match = re.search(r'EC50\s+of\s+(?:the\s+)?ligand\s+is\s+(?:between\s+)?([<>~]?\s*[\d.]+)\s*-?\s*[\d.]*\s*(nM|μM|uM)', text, re.IGNORECASE)
-    if match:
-        metrics['Ligand_EC50'] = match.group(1).strip()
-        metrics['Ligand_EC50_Unit'] = match.group(2)
-    
-    # Extract PROTAC IC50
-    match = re.search(r'IC50\s+of\s+(?:the\s+)?PROTAC\s+is\s+(?:between\s+)?([<>~]?\s*[\d.]+)\s*-?\s*[\d.]*\s*(nM|μM|uM)', text, re.IGNORECASE)
-    if match:
-        metrics['PROTAC_IC50'] = match.group(1).strip()
-        metrics['PROTAC_IC50_Unit'] = match.group(2)
-    
-    # Extract PROTAC EC50
-    match = re.search(r'EC50\s+of\s+(?:the\s+)?PROTAC\s+is\s+(?:between\s+)?([<>~]?\s*[\d.]+)\s*-?\s*[\d.]*\s*(nM|μM|uM)', text, re.IGNORECASE)
-    if match:
-        metrics['PROTAC_EC50'] = match.group(1).strip()
-        metrics['PROTAC_EC50_Unit'] = match.group(2)
-    
-    # Extract assay time from specific patterns
-    match = re.search(r'(\d+)\s*h(?:our)?(?:s)?\s+(?:post-treatment|of\s+treatment)', text, re.IGNORECASE)
-    if match:
-        metrics['Treatment_Time'] = int(match.group(1))
-    
-    # Check for structural information
-    if re.search(r'(?:crystal|ternary)\s+(?:complex\s+)?structure', text, re.IGNORECASE):
-        metrics['Has_Structure'] = True
-        # Try to extract PDB ID
-        pdb_match = re.search(r'\b([0-9][A-Z0-9]{3})\b', text)
-        if pdb_match:
-            metrics['PDB_ID'] = pdb_match.group(1)
-    
-    # Check for selectivity information
-    if re.search(r'selectiv(?:e|ity)', text, re.IGNORECASE):
-        metrics['Selectivity_Info'] = True
-    
-    # Check for covalent binding
-    if re.search(r'covalent', text, re.IGNORECASE):
-        metrics['Covalent'] = True
-    
-    return metrics
-
-
-def parse_multi_protein_degradation(comment: str, row: pd.Series) -> List[Dict[str, Any]]:
-    """
-    Parse multi-protein degradation data.
-    
-    Example: "pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 7.0/7.0/6.5/6.2"
-    
-    Args:
-        comment: Comment text
-        row: Original row data
-        
-    Returns:
-        List of row dicts for each protein
-    """
-    results = []
-    
-    # Pattern for pDC50 with multiple proteins
-    match = re.search(
-        r'pDC50\s+for\s+([^:]+):\s+([\d./]+)',
-        comment,
-        re.IGNORECASE
-    )
-    
-    if not match:
-        return results
-    
-    proteins_str = match.group(1)
-    values_str = match.group(2)
-    
-    # Split proteins and values
-    proteins = [p.strip() for p in proteins_str.split('/')]
-    values = [v.strip() for v in values_str.split('/')]
-    
-    if len(proteins) != len(values):
-        logger.warning(f"Mismatch in proteins ({len(proteins)}) and values ({len(values)})")
-        return results
-    
-    # Also check for Dmax values
-    dmax_match = re.search(
-        r'Dmax\s+for\s+([^:]+):\s+([\d./%]+)',
-        comment,
-        re.IGNORECASE
-    )
-    
-    dmax_values = []
-    if dmax_match:
-        dmax_str = dmax_match.group(2)
-        dmax_values = [v.strip().replace('%', '') for v in dmax_str.split('/')]
-    
-    # Create a row for each protein
-    for i, (protein, pdc50_val) in enumerate(zip(proteins, values)):
-        # Skip if value is NA or invalid
-        if pdc50_val.upper() in ['NA', 'N.A.', 'ND']:
-            continue
-        
-        try:
-            pdc50_float = float(pdc50_val)
-        except ValueError:
-            continue
-        
-        result_row = {
-            'POI_Name': protein,
-            'Value': pdc50_float,
-            'Value_Type': 'pDC50',
-            'Value_Unit': 'log(M)',
-            'Value_Symbol': '',
-        }
-        
-        # Add Dmax if available
-        if i < len(dmax_values):
-            try:
-                dmax_float = float(dmax_values[i])
-                # Create a separate Dmax row
-                dmax_row = result_row.copy()
-                dmax_row.update({
-                    'Value': dmax_float,
-                    'Value_Type': 'Dmax',
-                    'Value_Unit': '%',
-                })
-                results.append(dmax_row)
-            except ValueError:
-                pass
-        
-        results.append(result_row)
-    
-    return results
-
-
-def parse_dual_cell_line_dmax(comment: str, row: pd.Series) -> List[Dict[str, Any]]:
-    """
-    Parse Dmax values for two cell lines with error bars.
-    
-    Example: "Dmax in BBL358/T47D: 93%±5% and 87%±3%, respectively"
-    
-    Args:
-        comment: Comment text
-        row: Original row data
-        
-    Returns:
-        List of row dicts for each cell line
-    """
-    results = []
-    
-    match = re.search(
-        r'Dmax\s+in\s+([A-Za-z0-9\-]+)/([A-Za-z0-9\-]+):\s*([\d.]+)%±([\d.]+)%\s+and\s+([\d.]+)%±([\d.]+)%',
-        comment,
-        re.IGNORECASE
-    )
-    
-    if not match:
-        return results
-    
-    cell1, cell2, val1, err1, val2, err2 = match.groups()
-    
-    results.append({
-        'Cell_Line': cell1,
-        'Value': float(val1),
-        'Value_Type': 'Dmax',
-        'Value_Unit': '%',
-        'Value_Error': float(err1),
-        'Value_Symbol': '',
-    })
-    
-    results.append({
-        'Cell_Line': cell2,
-        'Value': float(val2),
-        'Value_Type': 'Dmax',
-        'Value_Unit': '%',
-        'Value_Error': float(err2),
-        'Value_Symbol': '',
-    })
-    
-    return results
-
-
-def parse_concentration_dependent_dmax(comment: str, row: pd.Series) -> List[Dict[str, Any]]:
-    """
-    Parse concentration-dependent Dmax measurements.
-    
-    Example: "DCmax was measured in 100nM (at 10 nM 99.6 %)"
-    
-    Args:
-        comment: Comment text
-        row: Original row data
-        
-    Returns:
-        List of row dicts with concentration information
-    """
-    results = []
-    
-    # Pattern: "at X nM Y %"
-    matches = re.finditer(
-        r'at\s+([\d.]+)\s*([nμ]M)\s+([\d.]+)\s*%',
-        comment,
-        re.IGNORECASE
-    )
-    
-    for match in matches:
-        conc, unit, dmax_val = match.groups()
-        results.append({
-            'Value': float(dmax_val),
-            'Value_Type': 'Dmax',
-            'Value_Unit': '%',
-            'Value_Concentration': float(conc),
-            'Value_Concentration_Unit': normalize_units(unit),
-            'Value_Symbol': '',
-        })
-    
-    return results
-
-# =============================================================================
-# Reference Processing
-# =============================================================================
-
-def process_reference(row: pd.Series) -> str:
-    """
-    Process reference information to create a standardized reference string.
-    
-    Args:
-        row: DataFrame row
-        
-    Returns:
-        Reference string (PubMed ID or other identifier)
-    """
-    if 'Pubmed' in row and pd.notna(row['Pubmed']):
-        return str(row['Pubmed'])
-    
-    if 'PATENT' in row and pd.notna(row['PATENT']):
-        return f"{row['PATENT']} (patent)"
-    
-    if 'PROTACDB ID' in row and pd.notna(row['PROTACDB ID']):
-        return f"PROTACDB-{row['PROTACDB ID']}"
-    
-    return "Unknown"
-
-
-# =============================================================================
-# Main Curation Pipeline
-# =============================================================================
-
-class ProtacPediaCurator:
-    """Main class for curating PROTAC-Pedia dataset."""
-    
-    def __init__(self, config: Config):
-        self.config = config
-        self.uniprot_fetcher = UniProtFetcher(config.cache_dir, config.api_delay)
-        
-        # Create output directories
-        Path(config.output_dir).mkdir(parents=True, exist_ok=True)
-        Path(config.cache_dir).mkdir(parents=True, exist_ok=True)
-        Path(config.log_dir).mkdir(parents=True, exist_ok=True)
-    
-    def load_data(self) -> pd.DataFrame:
-        """Load the partially processed PROTAC-Pedia data."""
-        filepath = Path(self.config.input_file)
-        
-        if not filepath.exists():
-            raise FileNotFoundError(f"Input file not found: {filepath}")
-        
-        df = pd.read_csv(filepath)
-        logger.info(f"Loaded {len(df)} rows from {filepath}")
-        return df
-    
-    def preprocess_and_rename_columns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Preprocess column names to standardize them."""
-        df = df.dropna(subset=['Dc50', 'Dmax'], how='all')
-
-        # Rename columns to match other datasets
-        df = df.rename(columns={
-            'PROTAC SMILES': 'SMILES',
-            'Target': 'POI_UniProt',
-            'E3 Ligase': 'Ligase_Name',
-            'Cells': 'Cell_Line',
-            'Dc50': 'DC50',
-        })
-
-        df['SMILES'] = df['SMILES'].apply(canonicalize_smiles)
-
-        # In 'Ligase_Name', rename 'Cereblon' to 'CRBN', 'Mdm2' to 'MDM2', 'Iap' to 'IAP', 'Ubr1' to 'UBR box'
-        df['Ligase_Name'] = df['Ligase_Name'].replace({
-            'Cereblon': 'CRBN',
-            'Mdm2': 'MDM2',
-            'Iap': 'IAP',
-            'Ubr1': 'UBR1'
-        })
-
-        e3ligase2uniprot = {
-            'VHL': 'P40337',
-            'CRBN': 'Q96SW2',
-            'DCAF1': 'Q9Y4B6',
-            'DCAF11': 'Q8TEB1',
-            'DCAF15': 'Q66K64',
-            'DCAF16': 'Q9NXF7',
-            'MDM2': 'Q00987',
-            'XIAP': 'P98170',
-            'IAP': 'P98170', # IAP is too generic, so we set it to XIAP instead
-            'cIAP1': 'Q13490',
-            'AhR': 'P35869',
-            'RNF4': 'P78317',
-            'RNF114': 'Q9Y508',
-            'FEM1B': 'Q9UK73',
-            'UBR1': 'Q8IWV7',
-            'UBR box': 'G3V2G3', # We associate the UBR box with the UBR7 gene
-            'KLHL20': 'Q9Y2M5',
-            'KLHDC2': 'Q9Y2U9',
-            'FBXO22': 'Q8NEZ5',
-            'KEAP1': 'Q14145',
-        }
-        df['Ligase_UniProt'] = df['Ligase_Name'].map(e3ligase2uniprot)
-
-        # Parse DC50 values
-        dc50_values = []
-        dc50_symbols = []
-        dc50_units = []
-        for s in df['DC50']:
-            if pd.isna(s):
-                dc50_values.append(pd.NA)
-                dc50_symbols.append(pd.NA)
-                dc50_units.append(pd.NA)
-            else:
-                value, symbol, unit = parse_value_symbol_unit(s)
-                dc50_values.append(value)
-                dc50_symbols.append(symbol)
-                dc50_units.append(unit)
-        df['DC50_Value'] = dc50_values
-        df['DC50_Value_Symbol'] = dc50_symbols
-        df['DC50_Value_Unit'] = dc50_units
-
-        # Parse Dmax values
-        dmax_values = []
-        dmax_symbols = []
-        dmax_units = []
-        for s in df['Dmax']:
-            if pd.isna(s):
-                dmax_values.append(pd.NA)
-                dmax_symbols.append(pd.NA)
-                dmax_units.append(pd.NA)
-            else:
-                value, symbol, unit = parse_percent_value_symbol(s)
-                dmax_values.append(value)
-                dmax_symbols.append(symbol)
-                dmax_units.append(unit)
-        df['Dmax_Value'] = dmax_values
-        df['Dmax_Value_Symbol'] = dmax_symbols
-        df['Dmax_Value_Unit'] = dmax_units
-        
-        return df
-    
-    def enrich_with_poi_names(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Extract POI names from UniProt IDs using UniProt API.
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with POI_Name column
-        """
-        logger.info("Extracting POI names from UniProt...")
-        
-        poi_names = []
-        unique_uniprots = df['POI_UniProt'].dropna().unique()
-        
-        uniprot_to_name = {}
-        for uniprot_id in tqdm(unique_uniprots, desc="Fetching POI names"):
-            gene_names = self.uniprot_fetcher.get_gene_names(uniprot_id)
-            if gene_names:
-                uniprot_to_name[uniprot_id] = gene_names[0]
-            else:
-                uniprot_to_name[uniprot_id] = None
-        
-        df['POI_Name'] = df['POI_UniProt'].map(uniprot_to_name)
-        
-        # Fill missing POI names with UniProt ID
-        df['POI_Name'] = df['POI_Name'].fillna(df['POI_UniProt'])
-        
-        return df
-    
-    def enrich_with_poi_sequences(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Fetch POI sequences from UniProt.
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with POI_Sequence column
-        """
-        logger.info("Fetching POI sequences from UniProt...")
-        
-        unique_uniprots = df['POI_UniProt'].dropna().unique()
-        sequences = {}
-        
-        for uniprot_id in tqdm(unique_uniprots, desc="Fetching POI sequences"):
-            seq = self.uniprot_fetcher.get_sequence(uniprot_id)
-            if seq:
-                sequences[uniprot_id] = seq
-        
-        df['POI_Sequence'] = df['POI_UniProt'].map(sequences)
-        
-        missing = df['POI_Sequence'].isna().sum()
-        if missing > 0:
-            logger.warning(f"{missing} rows missing POI sequences")
-        
-        return df
-    
-    def enrich_with_ligase_sequences(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Fetch E3 ligase sequences from UniProt.
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with Ligase_Sequence column
-        """
-        logger.info("Fetching E3 ligase sequences from UniProt...")
-        
-        unique_uniprots = df['Ligase_UniProt'].dropna().unique()
-        sequences = {}
-        
-        for uniprot_id in tqdm(unique_uniprots, desc="Fetching ligase sequences"):
-            seq = self.uniprot_fetcher.get_sequence(uniprot_id)
-            if seq:
-                sequences[uniprot_id] = seq
-        
-        df['Ligase_Sequence'] = df['Ligase_UniProt'].map(sequences)
-        
-        return df
-    
-    def validate_and_enrich_cell_lines(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Validate cell lines against Cellosaurus and add IDs and species.
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with Cell_Line_ID and Cell_Line_Species columns
-        """
-        logger.info("Validating cell lines with Cellosaurus...")
-        
-        # Clean cell line names
-        df['Cell_Line_Clean'] = df['Cell_Line'].apply(clean_cell_line_name)
-        
-        # Get unique cell lines
-        unique_cell_lines = df['Cell_Line_Clean'].dropna().unique()
-        
-        # Fetch Cellosaurus data
-        cell_line_map = {}
-        for cell_line in tqdm(unique_cell_lines, desc="Fetching Cellosaurus data"):
-            accession = get_cellosaurus_accession(cell_line)
-            species = get_cellosaurus_species(cell_line)
-            cell_line_map[cell_line] = {
-                'accession': accession,
-                'species': species
-            }
-            # Add small delay to avoid overwhelming the API
-            time.sleep(0.1)
-        
-        # Map results back to dataframe
-        df['Cell_Line'] = df['Cell_Line_Clean']
-        df['Cell_Line_ID'] = df['Cell_Line'].map(lambda x: cell_line_map.get(x, {}).get('accession'))
-        df['Cell_Line_Species'] = df['Cell_Line'].map(lambda x: cell_line_map.get(x, {}).get('species'))
-        
-        # Drop temporary column
-        df = df.drop(columns=['Cell_Line_Clean'])
-        
-        # Report validation results
-        total = len(df)
-        with_id = df['Cell_Line_ID'].notna().sum()
-        logger.info(f"Cell line validation: {with_id}/{total} ({100*with_id/total:.1f}%) matched to Cellosaurus")
-        
-        return df
-    
-    def extract_assay_information(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Extract assay time and create assay description.
-        
-        Args:
-            df: Input DataFrame
-            
-        Returns:
-            DataFrame with Assay_Time and Assay columns
-        """
-        logger.info("Extracting assay information...")
-        
-        # Extract assay time
-        df['Assay_Time'] = df.apply(extract_assay_time, axis=1)
-        
-        # Create assay description from Comments
-        def create_assay_description(row):
-            if pd.notna(row.get('Comments')):
-                return str(row['Comments'])
-            if pd.notna(row.get('Time')):
-                return f"Degradation assay ({row['Time']})"
-            return "Degradation assay"
-        
-        df['Assay'] = df.apply(create_assay_description, axis=1)
-        
-        return df
-    
-    def transform_to_long_format(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Transform wide format to long format with separate rows for DC50 and Dmax.
-        Also parses Comments to extract cell-line-specific values and additional metrics.
-        
-        New columns added:
-            - Value_Mean: Numeric mean value
-            - Value_Error: Error bar (±)
-            - Value_Operator: Comparison operator (<, >, ~)
-            - Value_Range_Min: Range minimum
-            - Value_Range_Max: Range maximum
-            - Value_Concentration: Concentration at which value was measured
-            - Value_Concentration_Unit: Unit of concentration
-            - Value_Category: Type of value (numeric, range, text, etc.)
-            - Additional metrics: Ligand_IC50, Ligand_EC50, PROTAC_IC50, PROTAC_EC50, etc.
-        
-        Args:
-            df: Input DataFrame in wide format
-            
-        Returns:
-            DataFrame in long format
-        """
-        logger.info("Transforming to long format with enhanced parsing...")
-        
-        rows = []
-        manual_overrides = get_manual_curation_overrides()
-        
-        for idx, row in df.iterrows():
-            base_row = {
-                'SMILES': row.get('SMILES'),
-                'POI_Name': row.get('POI_Name'),
-                'POI_UniProt': row.get('POI_UniProt'),
-                'POI_Sequence': row.get('POI_Sequence'),
-                'Ligase_Name': row.get('Ligase_Name'),
-                'Ligase_UniProt': row.get('Ligase_UniProt'),
-                'Ligase_Sequence': row.get('Ligase_Sequence'),
-                'Cell_Line': row.get('Cell_Line'),
-                'Cell_Line_ID': row.get('Cell_Line_ID'),
-                'Cell_Line_Species': row.get('Cell_Line_Species'),
-                'Assay': row.get('Assay'),
-                'Assay_Time': row.get('Assay_Time'),
-                'Reference': process_reference(row),
-                'Modality': 'PROteolysis-TArgeting Chimera (PROTAC)',
-            }
-            
-            # Extract additional metrics from comments
-            additional_metrics = extract_additional_metrics_from_comments(row.get('Comments'))
-            base_row.update(additional_metrics)
-            
-            # Check for manual overrides
-            comments = str(row.get('Comments', ''))
-            handled_by_override = False
-            
-            for override_id, override_config in manual_overrides.items():
-                pattern = override_config.get('pattern')
-                if pattern and re.search(pattern, comments, re.IGNORECASE):
-                    handler_name = override_config.get('handler')
-                    if handler_name:
-                        handler = globals().get(handler_name)
-                        if handler:
-                            try:
-                                override_rows = handler(comments, row)
-                                for override_row in override_rows:
-                                    merged_row = base_row.copy()
-                                    merged_row.update(override_row)
-                                    rows.append(merged_row)
-                                handled_by_override = True
-                                logger.debug(f"Row {idx}: Handled by {handler_name}, created {len(override_rows)} rows")
-                            except Exception as e:
-                                logger.warning(f"Row {idx}: Override handler {handler_name} failed: {e}")
-            
-            if handled_by_override:
-                continue
-            
-            # Try to parse cell-line-specific values from Comments
-            cell_line_values = parse_cell_line_specific_values(row.get('Comments'))
-            
-            # If we found cell-line-specific values, create rows for each
-            if cell_line_values:
-                for cl_value in cell_line_values:
-                    # Skip if no valid value
-                    if cl_value['value'] is None:
-                        continue
-                    
-                    # Create a modified base row with the specific cell line
-                    specific_row = base_row.copy()
-                    if cl_value.get('cell_line'):
-                        # Clean and validate the cell line name
-                        cleaned_cl = clean_cell_line_name(cl_value['cell_line'])
-                        if cleaned_cl:
-                            specific_row['Cell_Line'] = cleaned_cl
-                            # Try to get Cellosaurus info for this cell line
-                            accession = get_cellosaurus_accession(cleaned_cl)
-                            species = get_cellosaurus_species(cleaned_cl)
-                            if accession:
-                                specific_row['Cell_Line_ID'] = accession
-                            if species:
-                                specific_row['Cell_Line_Species'] = species
-                    
-                    specific_row.update({
-                        'Value': cl_value['value'],
-                        'Value_Mean': cl_value['value'],
-                        'Value_Type': cl_value['value_type'],
-                        'Value_Unit': normalize_units(cl_value['unit']),
-                        'Value_Symbol': cl_value['symbol'],
-                        'Value_Operator': cl_value['symbol'] if cl_value['symbol'] else None,
-                        'Value_Category': 'numeric',
-                    })
-                    rows.append(specific_row)
-            else:
-                # No cell-line-specific values found in comments, use regular approach
-                # Add DC50 row if present
-                if pd.notna(row.get('DC50_Value')):
-                    dc50_row = base_row.copy()
-                    parsed_value = parse_single_value(str(row.get('DC50', '')))
-                    
-                    dc50_row.update({
-                        'Value': row['DC50_Value'],
-                        'Value_Mean': row['DC50_Value'],
-                        'Value_Type': 'DC50',
-                        'Value_Unit': normalize_units(row.get('DC50_Value_Unit', 'nM')),
-                        'Value_Symbol': row.get('DC50_Value_Symbol', ''),
-                        'Value_Operator': row.get('DC50_Value_Symbol', '') if row.get('DC50_Value_Symbol') else None,
-                        'Value_Category': 'numeric',
-                    })
-                    
-                    if parsed_value:
-                        dc50_row['Value_Error'] = parsed_value.get('error')
-                    
-                    rows.append(dc50_row)
-                
-                # Add Dmax row if present
-                if pd.notna(row.get('Dmax_Value')):
-                    dmax_row = base_row.copy()
-                    parsed_value = parse_single_value(str(row.get('Dmax', '')))
-                    
-                    dmax_row.update({
-                        'Value': row['Dmax_Value'],
-                        'Value_Mean': row['Dmax_Value'],
-                        'Value_Type': 'Dmax',
-                        'Value_Unit': normalize_units(row.get('Dmax_Value_Unit', '%')),
-                        'Value_Symbol': row.get('Dmax_Value_Symbol', ''),
-                        'Value_Operator': row.get('Dmax_Value_Symbol', '') if row.get('Dmax_Value_Symbol') else None,
-                        'Value_Category': 'numeric',
-                    })
-                    
-                    if parsed_value:
-                        dmax_row['Value_Error'] = parsed_value.get('error')
-                    
-                    rows.append(dmax_row)
-        
-        result = pd.DataFrame(rows)
-        
-        # Ensure all value columns exist
-        value_columns = [
-            'Value_Mean', 'Value_Error', 'Value_Operator', 
-            'Value_Range_Min', 'Value_Range_Max',
-            'Value_Concentration', 'Value_Concentration_Unit',
-            'Value_Category'
-        ]
-        for col in value_columns:
-            if col not in result.columns:
-                result[col] = None
-        
-        logger.info(f"Created {len(result)} rows in long format from {len(df)} input rows")
-        
-        return result
-    
-    def curate(self) -> pd.DataFrame:
-        """
-        Run the full curation pipeline.
-        
-        Returns:
-            Curated DataFrame
-        """
-        logger.info("Starting PROTAC-Pedia curation pipeline...")
-        
-        # Load data
-        df = self.load_data()
-        
-        # Preprocess and rename columns
-        df = self.preprocess_and_rename_columns(df)
-        
-        # Enrich with POI information
-        df = self.enrich_with_poi_names(df)
-        df = self.enrich_with_poi_sequences(df)
-        
-        # Enrich with ligase sequences
-        df = self.enrich_with_ligase_sequences(df)
-        
-        # Validate and enrich cell lines
-        df = self.validate_and_enrich_cell_lines(df)
-        
-        # Extract assay information
-        df = self.extract_assay_information(df)
-        
-        # Transform to long format
-        df_long = self.transform_to_long_format(df)
-        
-        # Save cache
-        self.uniprot_fetcher.save_cache()
-        
-        # Save output
-        output_path = Path(self.config.output_dir) / self.config.output_file
-        df_long.to_csv(output_path, index=False)
-        logger.info(f"Saved curated data to {output_path}")
-        
-        # Print summary statistics
-        self._print_summary(df_long)
-        
-        return df_long
-    
-    def _print_summary(self, df: pd.DataFrame):
-        """Print summary statistics."""
-        logger.info("=" * 80)
-        logger.info("Curation Summary")
-        logger.info("=" * 80)
-        logger.info(f"Total rows: {len(df)}")
-        logger.info(f"Unique SMILES: {df['SMILES'].nunique()}")
-        logger.info(f"Unique POIs: {df['POI_Name'].nunique()}")
-        logger.info(f"Unique E3 ligases: {df['Ligase_Name'].nunique()}")
-        logger.info(f"Unique cell lines: {df['Cell_Line'].nunique()}")
-        
-        logger.info("Value types:")
-        for vt, count in df['Value_Type'].value_counts().items():
-            logger.info(f"  {vt}: {count}")
-        
-        logger.info("Data completeness:")
-        logger.info(f"  POI sequences: {df['POI_Sequence'].notna().sum()}/{len(df)} ({100*df['POI_Sequence'].notna().sum()/len(df):.1f}%)")
-        logger.info(f"  Ligase sequences: {df['Ligase_Sequence'].notna().sum()}/{len(df)} ({100*df['Ligase_Sequence'].notna().sum()/len(df):.1f}%)")
-        logger.info(f"  Cell line IDs: {df['Cell_Line_ID'].notna().sum()}/{len(df)} ({100*df['Cell_Line_ID'].notna().sum()/len(df):.1f}%)")
-        logger.info(f"  Assay times: {df['Assay_Time'].notna().sum()}/{len(df)} ({100*df['Assay_Time'].notna().sum()/len(df):.1f}%)")
-
-        logger.info("=" * 80)
-        logger.info("Final files:")
-        logger.info("=" * 80)
-        logger.info(f"Curated dataset: {self.config.output_dir}/{self.config.output_file}")
-        logger.info(f"UniProt cache: {self.config.cache_dir}/uniprot_cache.json")
-        logger.info(f"Log file: {log_file}")
-
-
-# =============================================================================
-# CLI
-# =============================================================================
-
-def parse_args():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(
-        description="Curate PROTAC-Pedia dataset with Cellosaurus validation"
-    )
-
-    parser.add_argument(
-        "--input-file",
-        type=str,
-        default="data/original/PROTAC-Pedia.csv",
-        help="Input CSV filename",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="../data/curation",
-        help="Output directory for curated data",
-    )
-    parser.add_argument(
-        "--output-file",
-        type=str,
-        default="protacpedia_protac_dc50_dmax_cleaned.csv",
-        help="Output CSV filename",
-    )
-    parser.add_argument(
-        "--force-refetch",
-        action="store_true",
-        help="Force re-fetching of UniProt data",
-    )
-    parser.add_argument(
-        "--log-dir",
-        type=str,
-        default="logs",
-        help="Directory to store log files",
-    )
-    
-    return parser.parse_args()
 
 
 def main():
-    """Main entry point."""
-    args = parse_args()
-    
-    # Create configuration
-    config = Config(
-        output_dir=args.output_dir,
-        cache_dir=args.output_dir,
-        log_dir=args.log_dir,
-        input_file=args.input_file,
-        output_file=args.output_file,
-        force_refetch=args.force_refetch,
-    )
-    
-    # Run curation
-    curator = ProtacPediaCurator(config)
-    curator.curate()
+    parser = argparse.ArgumentParser(description='Curate PROTAC-Pedia dataset.')
+    parser.add_argument('--input_path', type=str, default=Path('data/original/PROTAC-Pedia.csv'), help='Path to the raw PROTAC-Pedia CSV file.')
+    parser.add_argument('--input_dir', type=str, default=Path('data/original'), help='Directory containing the raw PROTAC-Pedia CSV file (alternative to --input_path).')
+    parser.add_argument('--output_dir', type=str, default=Path('data/curation'), help='Directory to save the curated dataset and intermediate files.')
+    parser.add_argument('--force_refetch', action='store_true', help='Force refetching of UniProt entries even if cached files exist.')
+    parser.add_argument('--log_dir', type=str, default=Path('logs'), help='Directory to save log files.')
+    parser.add_argument('--verbose', '-v', action='count', default=0, help='Increase output verbosity (e.g. -v for INFO, -vv for DEBUG, -vvv for more detailed DEBUG).')
+
+    args = parser.parse_args()
+
+    # Setup logging
+    log_file = setup_logging(args.log_dir, log_base_name='protacpedia_curation', verbose=args.verbose)
+    set_global_logging_level(logging.DEBUG if args.verbose >= 3 else logging.INFO if args.verbose == 2 else logging.WARNING)
+    logger = logging.getLogger(__name__)
+
+
+    # Setup working directories
+    data_curation_dir = Path(args.output_dir)
+    os.makedirs(data_curation_dir, exist_ok=True)
+
+    # Make the data_curation_dir / 'uniprot_infos' directory if it doesn't exist
+    uniprot_infos_dir = data_curation_dir / 'uniprot_infos'
+    os.makedirs(uniprot_infos_dir, exist_ok=True)
+
+    protacpedia_file = Path(args.input_path) # Path('data/original/PROTAC-Pedia.csv')
+    if os.path.exists(protacpedia_file):
+        protacpedia_df = pd.read_csv(protacpedia_file).reset_index(drop=True)
+    else:
+        raise FileNotFoundError(f"PROTAC-Pedia file not found at: {protacpedia_file}")
+
+    logging.info(f"Number of rows in PROTAC-Pedia before curation: {len(protacpedia_df)}")
+    cols = ['Comments', 'Dc50', 'Dmax']
+    protacpedia_df = protacpedia_df.dropna(subset=cols, how='all')
+    logging.info(f"Number of rows in PROTAC-Pedia after dropping rows with all-NaN in {cols}: {len(protacpedia_df)}")
+
+    cols_to_keep = [
+        'PROTAC SMILES',
+        'E3 Ligase',
+        'Target',
+        'Cells',
+        'Dc50',
+        'Dmax',
+        'Time',
+        'Comments',
+        'Curator',
+        'PATENT',
+        'Ligand PDB',
+        'Pubmed',
+        'Ligand ID',
+        'Secondary Pubmed',
+    ]
+    protacpedia_df = protacpedia_df[cols_to_keep]
+
+    # Rename a few columns for consistency
+    protacpedia_df = protacpedia_df.rename(columns={
+        'PROTAC SMILES': 'SMILES',
+        'Dc50': 'DC50',
+        'Cells': 'Cell_Line',
+        'E3 Ligase': 'Ligase_Name',
+        'Target': 'POI_Uniprot',
+        'Time': 'Assay_Time',
+        'Comments': 'Description',
+    })
+
+    def get_reference(row):
+        """ Combine 'Secondary Pubmed', 'Pubmed', and 'PATENT' columns into a single
+        'Reference' column with priority: Secondary Pubmed > Pubmed > PATENT. """
+        if pd.notna(row['Secondary Pubmed']):
+            return f"https://pubmed.ncbi.nlm.nih.gov/{int(row['Secondary Pubmed'])}/"
+        elif pd.notna(row['Pubmed']):
+            return f"https://pubmed.ncbi.nlm.nih.gov/{int(row['Pubmed'])}/"
+        elif pd.notna(row['PATENT']):
+            return f"Patent: {row['PATENT']}"
+
+    protacpedia_df['Reference'] = protacpedia_df.apply(get_reference, axis=1)
+
+    # ## Standardize SMILES
+
+    logging.info(f"Number of unique SMILES before canonicalization: {protacpedia_df['SMILES'].nunique()}")
+    protacpedia_df['SMILES'] = protacpedia_df['SMILES'].apply(canonicalize_smiles)
+    protacpedia_df = protacpedia_df.dropna(subset=['SMILES']).reset_index(drop=True)
+    logging.info(f"Number of unique SMILES after canonicalization:  {protacpedia_df['SMILES'].nunique()}")
+
+    # ## POI Resolution
+
+    all_e3_uniprots = []
+    for species, ligase2uniprot in E3_TO_ORGANISM_TO_UNIPROT.items():
+        for ligase, uniprot in ligase2uniprot.items():
+            all_e3_uniprots.append(uniprot)
+    logging.info(f"All E3 ligase Uniprot IDs from E3_LIGASE_2_UNIPROT: {all_e3_uniprots}")
+
+    # Add manual mappings for corner cases in the dataset
+    GENE_TO_UNIPROT = {
+        'PBRM1': 'Q86U86',
+        'BTK WT': 'Q06187',
+        'BTK C481S': 'Q06187',
+        'BRD4 LONG': 'O60885-1',
+        'BRD4 SHORT': 'O60885-2',
+        'EGFR WT': 'P00533',
+        'EGFR Exon 20 Ins': 'P00533',
+        'EGFR Exon 19 del': 'P00533',
+        'EGFR L858R': 'P00533',
+        'BCL-XL': 'Q64373',
+    }
+
+    # Replace ',' with '' in the POI_Uniprot column, to split on spaces later
+    protacpedia_df['POI_Uniprot'] = protacpedia_df['POI_Uniprot'].str.replace(',', '', regex=False)
+
+    # Print all POI_Uniprot for which there are characters other than letters, numbers and spaces
+    for uniprot_id in protacpedia_df['POI_Uniprot'].unique():
+        if re.search(r'[^a-zA-Z0-9\- ]', uniprot_id):
+            logging.warning(f"WARNING: Uniprot ID '{uniprot_id}' contains non-alphanumeric characters.")
+
+    uniprots = set(GENE_TO_UNIPROT.values())
+    uniprots.update(all_e3_uniprots)
+    for uniprot_id in protacpedia_df['POI_Uniprot'].dropna().unique():
+        if len(uniprot_id.split(' ')) > 1:
+            for part in uniprot_id.split(' '):
+                uniprots.add(part)
+        else:
+            uniprots.add(uniprot_id)
+    logging.info(f"Unique Uniprot IDs (after splitting on spaces): {uniprots}")
+
+    # Map uniprots to their gene names using the Uniprot API
+    uniprot2info = {}
+    uniprot2gene = {}
+    uniprot2seq = {}
+            
+    # -- Fetch and cache UniProt entries defined above --
+    for uniprot_id in tqdm(uniprots, desc='Fetching UniProt entries'):
+        json_info = load_dict(data_curation_dir / 'uniprot_infos' / f'{uniprot_id}.json')
+        if json_info and not args.force_refetch:
+            uniprot2info[uniprot_id] = json_info
+            uniprot2gene[uniprot_id] = json_info['gene_primary']
+            uniprot2seq[uniprot_id] = json_info['sequence']
+            for isoform in json_info.get('isoforms', []):
+                uniprot_id = isoform['accession']
+                # NOTE: We do not add isoforms to uniprot2gene since they share the
+                # same gene name
+                uniprot2info[uniprot_id] = isoform
+                uniprot2seq[uniprot_id] = isoform['sequence']
+        else:
+            infos = fetch_protein_info(uniprot_id, skip_isoforms=False)
+            if infos:
+                # Save each entry to a separate JSON file
+                save_dict(infos, data_curation_dir / 'uniprot_infos' / f'{uniprot_id}.json')
+                uniprot2gene[uniprot_id] = infos['gene_primary']
+                uniprot2seq[uniprot_id] = infos['sequence']
+                uniprot2info[uniprot_id] = infos
+                for isoform in infos.get('isoforms', []):
+                    uniprot_id = isoform['accession']
+                    save_dict(isoform, data_curation_dir / 'uniprot_infos' / f'{uniprot_id}.json')
+                    uniprot2gene[uniprot_id] = isoform['gene_primary']
+                    uniprot2seq[uniprot_id] = isoform['sequence']
+            else:
+                uniprot2gene[uniprot_id] = None
+            
+    gene2uniprot = {gene: uniprot for uniprot, gene in uniprot2gene.items() if gene is not None}
+    gene2uniprot = {**gene2uniprot, **GENE_TO_UNIPROT}
+
+    logging.info(f"Gene Name to Uniprot mapping: {gene2uniprot}")
+    logging.info(f"Uniprot to Gene Name mapping: {uniprot2gene}")
+    logging.info(f"Mapped Uniprots: {list(uniprot2info.keys())}")
+
+    # Mapping (dict of dict): ('Curator', 'POI_Uniprot') -> ('Description', 'Cell_Line', 'DC50', 'Dmax') - > POI Uniprot
+    MANUAL_POI_MAP = {
+        ("Ronen Gabizon", "O14976 O75385 P06239 P07332 P11802 P16591 P24941 P30291 P35991 P36888 P42680 P50613 P50750 P51451 P53671 Q00534 Q00537 Q05397 Q08881 Q13131 Q14004 Q14289 Q2M2I8 Q7KZI7 Q91820 Q96GD4 Q96SZ6 Q9NYV4"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/29129717/
+            ("General kinase PROTAC, DCmax is for the most degraded kinase. IC50 of the ligand is for 193 kinases in the panel. IC50 of the PROTAC is by FLT3 kinase activity.", "MOLT-4, MOLM14", "< 100 nM", "> 85 %"): "P36888",
+        },
+        ("Ella Livnah", "O15264 Q16539"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30631068/
+            ("DC50 error ± 1.0 nM. DMAX error ± 1.1 %.", "MDA-MB-231, HeLa", "9.5 nM", "99.6 %"): "Q16539",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30631068/
+            ("DC50 error ± 81.3 nM. DMAX error ± 10.1 %.", "MDA-MB-231, HeLa", "45.9 nM", "34.5 %"): "Q16539",
+        },
+        ("Yangwode Jing", "O15379 Q13547 Q92769"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32201871/
+            (None, "E14 mouse embryonic stem cells; Human colon cancer cell line HCT116", "~ 10 uM", None): "Q13547",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32201871/
+            ("For HDAC1/HDAC2/HDAC3, the Dmax of this PROTAC is: >85%, >76%, >63%, respectively.", "E14 mouse embryonic stem cells; Human colon cancer cell line HCT116", "~ 1 uM", None): "Q13547",
+        },
+        ("Ronen Gabizon", "O60674 P23458"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", "2.5 uM", "60 %"): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", "> 5 uM", "30 %"): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", "> 5 uM", "50 %"): "P23458",
+        },
+        ("Ronen Gabizon", "O60674 P23458 P52333"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", "~ 5 uM", "60 %"): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper. IC50 of PROTAC is between 10nM-50nM.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper. IC50 of PROTAC is between 10nM-50nM.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Structutre with ligand is modeled in the paper.", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("DC50 is between 1uM-2uM. Dmax is for JAK1.", "THP", "< 2 uM", "50 %"): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("IC50 of PROTAC is 10-100 nM", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("Dmax is for JAK1", "THP", "~ 2.5 uM", "60 %"): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("IC50 of PROTAC is 10-100 nM", "THP", None, None): "P23458",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32001089/
+            ("IC50 of PROTAC is 10-100 nM", "THP", None, None): "P23458",
+        },
+        ("Daniel Zaidman", "O60885 P25440"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31767403/
+            ("EC50 of ligand is 0.370 uM for MV4- 11, 3.369 uM for Molm-13. EC50 of PROTAC is 1.648uM for MV4-11, >10uM for Molm-13", "MV4-11, Molm-13", None, None): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31767403/
+            ("EC50 of ligand is 0.370 uM for MV4- 11, 3.369 uM for Molm-13. EC50 of PROTAC is 0.025uM for MV4-11, 0.18uM for Molm-13", "MV4-11, Molm-13", None, None): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31767403/
+            ("EC50 of ligand is 0.370 uM for MV4- 11, 3.369 uM for Molm-13. EC50 of PROTAC is 0.012uM for MV4-11, 0.052uM for Molm-13.", "Big sellection of cacer cell lines", None, None): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31767403/
+            ("EC50 of ligand is 0.370 uM for MV4- 11, 3.369 uM for Molm-13. EC50 of PROTAC is 0.032uM for MV4-11, 0.177uM for Molm-13.", "MV4-11, Molm-13", None, None): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31767403/
+            ("EC50 of ligand is 0.370 uM for MV4- 11, 3.369 uM for Molm-13. EC50 of PROTAC is 3.429uM for MV4-11, >10uM for Molm-13.", "MV4-11, Molm-13", None, None): "O60885",
+        },
+        ("Ronen Gabizon", "O60885 P25440 Q15059"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28339196/
+            ("Direct degration studies in this paper only conducted for first and final compounds; during the med chem campaign cell viability was used as the read out. Complex structure with the ligand was modeled based on 4Z93. IC50 of the ligand is between 2nM and 7nM, depending on which BRD. DC50 is between 3nM-10nM.", "RS4;11, MOLM-13", "< 10 nM", "100 %"): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28339196/
+            ("Complex structure with the ligand was modeled based on 4Z93. IC50 of the ligand is between 2nM and 7nM, depending on which BRD", "RS4;11, MOLM-13", "< 1 nM", "100 %"): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28339196/
+            ("Complex structure with the ligand was modeled based on 4Z93. IC50 of the ligand is between 2nM and 7nM, depending on which BRD", "RS4;11, MOLM-13", "< 1 nM", "100 %"): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28339196/
+            ("Complex structure with the ligand was modeled based on 4Z93. IC50 of the ligand is between 2nM and 7nM, depending on which BRD", "RS4;11, MOLM-13", "~ 3 nM", None): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28339196/
+            ("Complex structure with the ligand was modeled based on 4Z93. IC50 of the ligand is between 2nM and 7nM, depending on which BRD", "RS4;11, MOLM-13", "~ 10 nM", None): "O60885",
+        },
+        ("Yangwode Jing", "O60885 P25440 Q15059"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
+            ("""pEC50 for MV4;11 and HL60 cells: 6.75±0.03 and 5.84±0.06, respectively.
+    pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 7.0/7.0/6.5/6.2, respectively (24h, HeLa cells).
+    Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 96%/97%/97%/93%, respectively (HeLa cells).""", "HeLa, HL60, MV4;11", "< 0.1 uM", "> 93 %"): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
+            ("pEC50 for MV4;11 and HL60 cells: 7.57±0.03 and 6.66±0.05, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 8.1/8.6/7.0/7.4, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 98%/100%/100%/98%, respectively (HeLa cells).", "HeLa, HL60, MV4;11", "< 2.5 nM", "> 98 %"): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
+            ("pEC50 for MV4;11 and HL60 cells: 6.91±0.04 and 5.90±0.05, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 8.4/8.0/6.5/6.7, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 99%/100%/99%/97%, respectively (HeLa cells).", "HeLa, HL60, MV4;11", "< 4 nM", "> 97 %"): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
+            ("pEC50 for MV4;11 and HL60 cells: 7.77±0.06 and 7.46±0.03, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 9.2/9.0/9.1/8.2, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 97%/100%/98%/83%, respectively (HeLa cells).", "HeLa, HL60, MV4;11", "< 1 nM", "> 83 %"): "O60885",
+        },
+        ("Ronen Gabizon", "O60885 P53350"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31708096/
+            ("They show \"dual\" degradation but don't do any test that the dual degradation actually made any difference. They make it sound novel but of course we can call our PROTACs \"dual\" degraders if you can the off-targets \"targets\". EC50 of ligand is in measured in MV4-11 cell line. EC50 of PROTAC is between 4.5nM-6.94nM (depended on the cell line).", "MV4-11, MOLM-13, KG1", "< 5 nM", "~ 100 %"): "O60885",
+        },
+        ("Yangwode Jing", "O60885 Q15059"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
+            ("pEC50 for MV4;11 and HL60 cells: 6.24±0.05 and 6.17±0.03, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 6.9/6.7/6.8/NA, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 94%/78%/74%/37%, respectively (HeLa cells).", "HeLa, HL60, MV4;11", "~ 0.1 uM", None): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
+            ("pEC50 for MV4;11 and HL60 cells: 7.31±0.03 and 6.57±0.02, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 8.1/7.6/7.3/NA, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 98%/95%/91%/43%, respectively (HeLa cells).", "HeLa, HL60, MV4;11", "~ 7.9 nM", "> 90 %"): "O60885",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
+            ("pEC50 for MV4;11 and HL60 cells: 7.08±0.05 and 6.37±0.03, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 8.1/7.5/7.7/NA, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 95%/93%/92%/26%, respectively (HeLa cells).", "HeLa, HL60, MV4;11", "~ 7.9 nM", "> 90 %"): "O60885",
+        },
+        ("Shimrit Azulay", "O75530 Q15022 Q15910"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31831267/
+            (None, "HeLa", None, "47 %"): "O75530",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31831267/
+            ("DC50 value is for HeLa cells. DC50 is 0.61 uM for DLBCL cells. DMAX value is for HeLa cells. DMAX is 96 % for DLBCL cells.", "HeLa, DLBCL", "0.79 uM", "92 %"): "O75530",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31831267/
+            (None, "HeLa", None, "24 %"): "O75530",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31831267/
+            (None, "HeLa", None, "0.03 %"): "O75530",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31831267/
+            (None, "HeLa", None, "0.04 %"): "O75530",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31831267/
+            (None, "HeLa", None, "29 %"): "O75530",
+        },
+        ("Barr Tivon", "P00533 P04626"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/29129716/
+            ("DC50 is for WT EGFR. DC50 for EGFR Exon 20 Ins is 736.2 nM. DMAX is for WT EGFR. DMAX for EGFR Exon 20 Ins is 68.8 %.", "OVCAR8 (WT EGFR), HeLa (EGFR Exon 20 Ins), SKBr3 (HER2)", "39.2 nM", "97.6 %"): "P00533",
+        },
+        ("Daniel Zaidman", "P11802 Q00534"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30595531/
+            (None, "AML cells", None, "~ 100 %"): "Q00534",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32184044/
+            ("inactive for CDK4, active for CDK6", "Jurkat", None, None): "Q00534",
+        },
+        ("Yangwode Jing", "P11802 Q00534"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30802347/
+            ("IC50: 77nM/27.6nM for CDK4/CDK6, respectively.", "Jurkat", None, None): "Q00534",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30802347/
+            ("IC50: 25.7nM/7.57nM for CDK4/CDK6, respectively. BSJ-02-162 is capable of degrading both CDK4 and CDK6.", "Jurkat; Molt4; Granta-519; Mino; Jeko; Rec1; Maver", None, None): "Q00534",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30802347/
+            ("IC50: 69.6nM/34.6nM for CDK4/CDK6, respectively.", "Jurkat", None, None): "Q00534",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30802347/
+            ("IC50: 130nM/45.1nM for CDK4/CDK6 respectively.", "Jurkat", None, None): "Q00534",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30802347/
+            ("IC50: 175nM/142nM for CDK4/CDK6, respectively.", "Jurkat", None, None): "Q00534",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30802347/
+            ("IC50: 79.7nM/65.5nM for CDK4/CDK6, respectively.", "Jurkat", None, None): "Q00534",
+        },
+        ("Ella Livnah", "P24941 P50750"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31846828/
+            ("Controls were done against CDK2. tested competition with ligand and with pomalidomide", "PC-3", None, None): "P50750",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31846828/
+            ("preferentially degrades CDK9 over CDK2. Controls were done against CDK2 and CDK9. tested competition with ligand and with pomalidomide. DC50 is CDK2: 62 nM, CDK9: 33 nM.", "PC-3", "< 62 nM", None): "P50750",
+        },
+        ("Yangwode Jing, Ronen Gabizon", "P29373 Q13490"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/22658364/
+            (None, "HT1080, IMR-32", "~ 1 uM", None): "Q13490",
+        },
+        ("Shimrit Azulay, Daniel Zaidman", "P36507 Q02750"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31804822/
+            ("IC50 value of PROTAC tested with MEK1", "A375", None, None): "Q02750",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31804822/
+            ("IC50 value of PROTAC tested with MEK1", "A375", None, None): "Q02750",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31804822/
+            ("IC50 value of PROTAC tested with MEK1", "A375", None, None): "Q02750",
+        },
+        ("Efrat Resnick", "P51531 P51532"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31178587/
+            ("poor cellular permeability, ternary complex crystal structure: 6HAY (VCB:PROTAC 1:SMARCA2). DC50 is SMARCA2 300nM, SMARCA4 250nM. DCmax isSMARCA2 65%, SMARCA4 70%.", "MV-4-11", "< 300 nM", "< 70 %"): "P51531",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31178587/
+            ("ternary complex crystal structure: 6HAX (VCB:PROTAC 2:SMARCA2BD), 6HAR2 (VCB:PROTAC 2:SMARCA4BD)", None, None, None): "P51531",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31178587/
+            ("EC50 of PROTAC is 28nM in MV-4-11, 68nM in NCI-H1568. DC50 is (SMARCA2 6nM, SMARCA4 11nM, PBRM1 32nM in MV-4-11; SMARCA2 3.3nM, PBRM1 15.6nM in NCI-H1568)", "MV-4-11 SK-MEL-5, NCI-H1568", "< 32 nM", None): "P51531",
+        },
+        ("Yangwode Jing", "Q05397 Q14289"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 70 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 60 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 90 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 95 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 90 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 80 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 65 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 90 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 94 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 80 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 90 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 90 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 90 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 90 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 95 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 90 %"): "Q05397",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/33062164/
+            (None, "PA1", None, "> 85 %"): "Q05397",
+        },
+        ("Yangwode Jing, Ronen Gabizon", "Q05397 Q14289"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/32451721/
+            ("This is an article that use a previously reported PROTAC (PMID: 33062164) as chemical biology tool to investigate the non-enzymatic FAK function in mice. Therefore, the relevant data were not given in this article.", "Mice primary Sertoli cells and primary Germ cells", "~ 1 nM", "~ 100 %"): "Q05397",
+        },
+        ("Efrat Resnick", "Q07820 Q92934"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 0.87 uM, for PROTAC ± 3.66 uM", "hela", None, None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 0.87 uM, for PROTAC ± 2.13 uM", "hela", None, None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 0.87 uM, for PROTAC ± 0.58 uM", "hela", None, None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 0.87 uM, for PROTAC ± 4.44 uM", "hela", None, None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 0.87 uM, for PROTAC ± 0.89 uM", "hela", None, None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 1.39 uM, for PROTAC ± 4.33 uM", "hela", None, None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 1.39 uM, for PROTAC ± 2.90 uM", "hela", None, None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 1.39 uM, for PROTAC ± 0.27 uM", "hela", None, None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 1.39 uM, for PROTAC ± 4.57 uM", "hela", None, None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 1.39 uM, for PROTAC ± 1.36 uM", "hela", "3 uM", None): "Q07820",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/31389699/
+            ("IC50 error: for ligand ± 1.39 uM, for PROTAC ± 2.28 uM", "hela", None, None): "Q07820",
+        },
+        ("Daniel Zaidman", "Q92830 Q92831"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30200762/
+            ("DC50 is 1.5nM/3nM. DCmax is 97%/91%.", "THP1", "< 3 nM", "> 91 %"): "Q92830",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30200762/
+            (None, "THP1", None, "97 %"): "Q92830",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30200762/
+            ("only slightly active", "THP1", None, "38 %"): "Q92830",
+        },
+        ("Daniel Zaidman, Yangwode Jing", "Q9H8M2 Q9NPI1"): {
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            ("Engagment was tested in-vitro", "Hella", None, "32 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella", None, "46 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella", None, "20 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella", None, "5 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            ("Engagment was tested in-vitro", "Hella", "560 nM", "10 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella", None, "12 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella", None, "5 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella", None, "11 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella", None, "2 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "92 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "97 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            ("DC50 is 1.76 nM and 4.5 nM", "Hella, RI-1, EOL-1, A-204", "< 4.5 nM", "90 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "35 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "17 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "71 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "47 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "2 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "15 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "75 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "46 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "69 %"): "Q9H8M2",
+            # Link: https://pubmed.ncbi.nlm.nih.gov/30540463/
+            (None, "Hella, RI-1", None, "3 %"): "Q9H8M2",
+        },
+    }
+
+    # Assign the 'Unclear_POI' column based on whether 'POI_Uniprot' is NaN or contains multiple entries
+    protacpedia_df['Unclear_POI'] = protacpedia_df['POI_Uniprot'].apply(lambda x: pd.isna(x) or (pd.notna(x) and len(x.split()) > 1))
+
+    # ## Manual curation of Comments
+
+    # Group by 'Curator' and get their respective comments
+    curator_comments = protacpedia_df.groupby('Curator')['Description'].apply(list).to_dict()
+
+    # Remove NaN values from comments
+    for curator, comments in curator_comments.items():
+        curator_comments[curator] = [comment for comment in comments if pd.notnull(comment)]
+        curator_comments[curator] = list(set(curator_comments[curator]))  # Keep only unique comments
+
+    # Remove curators with no comments
+    curator_comments = {curator: comments for curator, comments in curator_comments.items() if len(comments) > 0}
+
+    # Sort comments by number of comments per curator
+    curator_comments = dict(sorted(curator_comments.items(), key=lambda item: len(item[1]), reverse=True))
+
+    logger.debug(f'Number of curators: {len(curator_comments)}')
+    logger.debug(f'Number of unique comments: {len(protacpedia_df["Description"].dropna().unique())}')
+    logger.debug('-' * 80)
+
+    num_comments = 0
+
+    for curator, comments in curator_comments.items():
+        # Filter comments that contain the words: "degradation", "dmax", "dc"
+        in_words = ['degradation', 'dmax', 'dc']
+        out_words = ['dcmax']
+        comments = [comment for comment in comments if any(word in comment.lower() for word in in_words) and not any(word in comment.lower() for word in out_words)]
+        
+        if len(comments) == 0:
+            continue
+        
+        num_comments += len(comments)
+
+        # print(f"Curator: {curator}")
+        # print(f"Number of comments: {len(comments)}")
+        # print("Sample comments:")
+        
+        for i, comment in enumerate(comments):
+            # print(f"\"\"\"{comment}\"\"\"")
+            # print(f"{i+1}. {comment}")
+            # print("-" * 40)
+            pass
+
+    logger.debug(f'Total number of comments containing "degradation", "dmax", or "dc" (but not "dcmax"): {num_comments}')
+
+    # Helper: default dict template
+    def _d(Value_Type, Value, Value_Unit='%', Cell_Line=None, Assay=None,
+        Assay_Time=None, POI_Name=None, Value_Operator=None,
+        Value_Category='numeric', Value_Range_Min=None, Value_Range_Max=None,
+        Value_Error=None, Value_Concentration=None,
+        Value_Concentration_Unit=None, Value_Mean=None):
+        return {
+            'Cell_Line': Cell_Line,
+            'POI_Name': POI_Name,
+            'Assay': Assay,
+            'Assay_Time': Assay_Time,
+            'Value': Value,
+            'Value_Type': Value_Type,
+            'Value_Unit': Value_Unit,
+            'Value_Operator': Value_Operator,
+            'Value_Category': Value_Category,
+            'Value_Range_Min': Value_Range_Min,
+            'Value_Range_Max': Value_Range_Max,
+            'Value_Error': Value_Error,
+            'Value_Concentration': Value_Concentration,
+            'Value_Concentration_Unit': Value_Concentration_Unit,
+            'Value_Mean': Value_Mean,
+        }
+
+
+    MANUAL_PARSED_COMMENTS = {
+        "Dmax in BBL358/T47D: 74%±3% and 16%±13%, respectively.": [
+            _d('Dmax', 74, '%', Cell_Line='BBL358', Value_Error=3),
+            _d('Dmax', 16, '%', Cell_Line='T47D', Value_Error=13),
+        ],
+        "Dmax in BBL358/T47D: 67%±17% and 47%±32%, respectively.": [
+            _d('Dmax', 67, '%', Cell_Line='BBL358', Value_Error=17),
+            _d('Dmax', 47, '%', Cell_Line='T47D', Value_Error=32),
+        ],
+        "Dmax for KYSE520 cell: >95%; Degradation rate in MV4;11 cell: 6% (0.1uM compound)": [
+            _d('Dmax', 95, '%', Cell_Line='KYSE520', Value_Operator='>'),
+            _d('Dmax', 6, '%', Cell_Line='MV4;11',
+            Value_Concentration=0.1, Value_Concentration_Unit='uM'),
+        ],
+        "IC50: 70.8nM/52.2nM for CDK4/CDK6, respectively; Show selective degradation of CDK4 (therefore active for CDK4 and inactive for CDK6).": [
+            _d('IC50', 70.8, 'nM', POI_Name='CDK4'),
+            _d('IC50', 52.2, 'nM', POI_Name='CDK6'),
+        ],
+        "EC50/DC50/Dmax reported above were obtained using NCI-H2030 cells. DC50: 0.25~0.76uM; Dmax: ~75%-90%, specific value depends on the cell line.": [
+            _d('DC50', 'original', 'uM', Cell_Line='NCI-H2030'),
+            _d('Dmax', 'original', '%', Cell_Line='NCI-H2030'),
+            _d('DC50', None, 'uM', Value_Category='range', Value_Range_Min=0.25, Value_Range_Max=0.76),
+            _d('Dmax', None, '%', Value_Category='range', Value_Range_Min=75, Value_Range_Max=90, Value_Operator='~'),
+        ],
+        "IC50: 50.6nM/30nM for CDK4/CDK6, respectively; Show selective degradation of CDK4 (therefore active for CDK4 and inactive for CDK6).": [
+            _d('IC50', 50.6, 'nM', POI_Name='CDK4'),
+            _d('IC50', 30, 'nM', POI_Name='CDK6'),
+        ],
+        "pEC50 for MV4;11 and HL60 cells: 6.91±0.04 and 5.90±0.05, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 8.4/8.0/6.5/6.7, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 99%/100%/99%/97%, respectively (HeLa cells).": [
+            _d('pEC50', 6.91, '', Cell_Line='MV4;11', Value_Error=0.04),
+            _d('pEC50', 5.90, '', Cell_Line='HL60', Value_Error=0.05),
+            _d('pDC50', 8.4, '', Cell_Line='HeLa', POI_Name='BRD4 SHORT', Assay_Time=24),
+            _d('pDC50', 8.0, '', Cell_Line='HeLa', POI_Name='BRD4 LONG', Assay_Time=24),
+            _d('pDC50', 6.5, '', Cell_Line='HeLa', POI_Name='BRD3', Assay_Time=24),
+            _d('pDC50', 6.7, '', Cell_Line='HeLa', POI_Name='BRD2', Assay_Time=24),
+            _d('Dmax', 99, '%', Cell_Line='HeLa', POI_Name='BRD4 SHORT'),
+            _d('Dmax', 100, '%', Cell_Line='HeLa', POI_Name='BRD4 LONG'),
+            _d('Dmax', 99, '%', Cell_Line='HeLa', POI_Name='BRD3'),
+            _d('Dmax', 97, '%', Cell_Line='HeLa', POI_Name='BRD2'),
+        ],
+        "Dmax in BBL358/T47D: 3%±3% and 20%±20%, respectively.": [
+            _d('Dmax', 3, '%', Cell_Line='BBL358', Value_Error=3),
+            _d('Dmax', 20, '%', Cell_Line='T47D', Value_Error=20),
+        ],
+        "Degradation rate for KYSE520 cell: 87% (1uM compound); Degradation rate for MV4;11 cell: 85% (0.1uM compound)": [
+            _d('Dmax', 87, '%', Cell_Line='KYSE520', Value_Concentration=1, Value_Concentration_Unit='uM'),
+            _d('Dmax', 85, '%', Cell_Line='MV4;11', Value_Concentration=0.1, Value_Concentration_Unit='uM'),
+        ],
+        "Dmax for KYSE520 cell: >80%; Degradation rate for MV4;11 cell: 9% (0.1uM compound)": [
+            _d('Dmax', 80, '%', Cell_Line='KYSE520', Value_Operator='>'),
+            _d('Dmax', 9, '%', Cell_Line='MV4;11', Value_Concentration=0.1, Value_Concentration_Unit='uM'),
+        ],
+        "Reported DC50 and Dmax above are in HeLa cells. DC50 for HEK293 cells: 230nM; Dmax for HEK293 cells: 98%. 14a can degrade VHL at higher concentration. See Target UniprotID P40337 for details.": [
+            _d('DC50', 'original', 'nM', Cell_Line='HeLa'),
+            _d('Dmax', 'original', '%', Cell_Line='HeLa'),
+            _d('DC50', 230, 'nM', Cell_Line='HEK293'),
+            _d('Dmax', 98, '%', Cell_Line='HEK293'),
+        ],
+        """pEC50 for MV4;11 and HL60 cells: 6.75±0.03 and 5.84±0.06, respectively.
+    pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 7.0/7.0/6.5/6.2, respectively (24h, HeLa cells).
+    Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 96%/97%/97%/93%, respectively (HeLa cells).""": [
+            _d('pEC50', 6.75, '', Cell_Line='MV4;11', Value_Error=0.03),
+            _d('pEC50', 5.84, '', Cell_Line='HL60', Value_Error=0.06),
+            _d('pDC50', 7.0, '', Cell_Line='HeLa', POI_Name='BRD4 SHORT', Assay_Time=24),
+            _d('pDC50', 7.0, '', Cell_Line='HeLa', POI_Name='BRD4 LONG', Assay_Time=24),
+            _d('pDC50', 6.5, '', Cell_Line='HeLa', POI_Name='BRD3', Assay_Time=24),
+            _d('pDC50', 6.2, '', Cell_Line='HeLa', POI_Name='BRD2', Assay_Time=24),
+            _d('Dmax', 96, '%', Cell_Line='HeLa', POI_Name='BRD4 SHORT'),
+            _d('Dmax', 97, '%', Cell_Line='HeLa', POI_Name='BRD4 LONG'),
+            _d('Dmax', 97, '%', Cell_Line='HeLa', POI_Name='BRD3'),
+            _d('Dmax', 93, '%', Cell_Line='HeLa', POI_Name='BRD2'),
+        ],
+        "Dmax in BBL358/T47D: 40%±27% and 0, respectively.": [
+            _d('Dmax', 40, '%', Cell_Line='BBL358', Value_Error=27),
+            _d('Dmax', 0, '%', Cell_Line='T47D'),
+        ],
+        "pEC50 for MV4;11 and HL60 cells: 7.57±0.03 and 6.66±0.05, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 8.1/8.6/7.0/7.4, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 98%/100%/100%/98%, respectively (HeLa cells).": [
+            _d('pEC50', 7.57, '', Cell_Line='MV4;11', Value_Error=0.03),
+            _d('pEC50', 6.66, '', Cell_Line='HL60', Value_Error=0.05),
+            _d('pDC50', 8.1, '', Cell_Line='HeLa', POI_Name='BRD4 SHORT', Assay_Time=24),
+            _d('pDC50', 8.6, '', Cell_Line='HeLa', POI_Name='BRD4 LONG', Assay_Time=24),
+            _d('pDC50', 7.0, '', Cell_Line='HeLa', POI_Name='BRD3', Assay_Time=24),
+            _d('pDC50', 7.4, '', Cell_Line='HeLa', POI_Name='BRD2', Assay_Time=24),
+            _d('Dmax', 98, '%', Cell_Line='HeLa', POI_Name='BRD4 SHORT'),
+            _d('Dmax', 100, '%', Cell_Line='HeLa', POI_Name='BRD4 LONG'),
+            _d('Dmax', 100, '%', Cell_Line='HeLa', POI_Name='BRD3'),
+            _d('Dmax', 98, '%', Cell_Line='HeLa', POI_Name='BRD2'),
+        ],
+        "pEC50 for MV4;11 and HL60 cells: 7.77±0.06 and 7.46±0.03, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 9.2/9.0/9.1/8.2, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 97%/100%/98%/83%, respectively (HeLa cells).": [
+            _d('pEC50', 7.77, '', Cell_Line='MV4;11', Value_Error=0.06),
+            _d('pEC50', 7.46, '', Cell_Line='HL60', Value_Error=0.03),
+            _d('pDC50', 9.2, '', Cell_Line='HeLa', POI_Name='BRD4 SHORT', Assay_Time=24),
+            _d('pDC50', 9.0, '', Cell_Line='HeLa', POI_Name='BRD4 LONG', Assay_Time=24),
+            _d('pDC50', 9.1, '', Cell_Line='HeLa', POI_Name='BRD3', Assay_Time=24),
+            _d('pDC50', 8.2, '', Cell_Line='HeLa', POI_Name='BRD2', Assay_Time=24),
+            _d('Dmax', 97, '%', Cell_Line='HeLa', POI_Name='BRD4 SHORT'),
+            _d('Dmax', 100, '%', Cell_Line='HeLa', POI_Name='BRD4 LONG'),
+            _d('Dmax', 98, '%', Cell_Line='HeLa', POI_Name='BRD3'),
+            _d('Dmax', 83, '%', Cell_Line='HeLa', POI_Name='BRD2'),
+        ],
+        "pEC50 for MV4;11 and HL60 cells: 7.08±0.05 and 6.37±0.03, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 8.1/7.5/7.7/NA, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 95%/93%/92%/26%, respectively (HeLa cells).": [
+            _d('pEC50', 7.08, '', Cell_Line='MV4;11', Value_Error=0.05),
+            _d('pEC50', 6.37, '', Cell_Line='HL60', Value_Error=0.03),
+            _d('pDC50', 8.1, '', Cell_Line='HeLa', POI_Name='BRD4 SHORT', Assay_Time=24),
+            _d('pDC50', 7.5, '', Cell_Line='HeLa', POI_Name='BRD4 LONG', Assay_Time=24),
+            _d('pDC50', 7.7, '', Cell_Line='HeLa', POI_Name='BRD3', Assay_Time=24),
+            _d('pDC50', None, '', Cell_Line='HeLa', POI_Name='BRD2', Assay_Time=24),
+            _d('Dmax', 95, '%', Cell_Line='HeLa', POI_Name='BRD4 SHORT'),
+            _d('Dmax', 93, '%', Cell_Line='HeLa', POI_Name='BRD4 LONG'),
+            _d('Dmax', 92, '%', Cell_Line='HeLa', POI_Name='BRD3'),
+            _d('Dmax', 26, '%', Cell_Line='HeLa', POI_Name='BRD2'),
+        ],
+        "XD2-149 was initially designed to degrade STAT3. However, experiments showed that XD2-149 down-regulate STAT3 level in a proteasome-independent manner. Proteomics data revealed that an E3 ligase, ZFP91, was the true substrate for this PROTAC. This paper reported a total of 22 PROTACs, which differed from each other in linker design and E3 binder choices (pomalidomide/thalidomide/lenalidomide). However, the authors didn't mention whether the remaining 21 molecules could degrade ZFP91 or not. It is also interesting that pomalidomide itself can induce the degradation of CRBN neo-substrates like ZFP91 (DC50: 0.42uM, 5-fold less potent than XD2-149), since pomalidomide can remodel CRBN surface for binding proteins like ZFP91 (Nat Med., 2019, doi: 10.1038/s41591-019-0668-z).": [
+            _d('DC50', 0.42, 'uM', POI_Name='STAT3'),
+        ],
+        "pEC50 for MV4;11 and HL60 cells: 6.24±0.05 and 6.17±0.03, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 6.9/6.7/6.8/NA, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 94%/78%/74%/37%, respectively (HeLa cells).": [
+            _d('pEC50', 6.24, '', Cell_Line='MV4;11', Value_Error=0.05),
+            _d('pEC50', 6.17, '', Cell_Line='HL60', Value_Error=0.03),
+            _d('pDC50', 6.9, '', Cell_Line='HeLa', POI_Name='BRD4 SHORT', Assay_Time=24),
+            _d('pDC50', 6.7, '', Cell_Line='HeLa', POI_Name='BRD4 LONG', Assay_Time=24),
+            _d('pDC50', 6.8, '', Cell_Line='HeLa', POI_Name='BRD3', Assay_Time=24),
+            _d('pDC50', None, '', Cell_Line='HeLa', POI_Name='BRD2', Assay_Time=24),
+            _d('Dmax', 94, '%', Cell_Line='HeLa', POI_Name='BRD4 SHORT'),
+            _d('Dmax', 78, '%', Cell_Line='HeLa', POI_Name='BRD4 LONG'),
+            _d('Dmax', 74, '%', Cell_Line='HeLa', POI_Name='BRD3'),
+            _d('Dmax', 37, '%', Cell_Line='HeLa', POI_Name='BRD2'),
+        ],
+        "Dmax for KYSE520 cell: >95%; Dmax for MV4;11 cell: >90%": [
+            _d('Dmax', 95, '%', Cell_Line='KYSE520', Value_Operator='>'),
+            _d('Dmax', 90, '%', Cell_Line='MV4;11', Value_Operator='>'),
+        ],
+        "IC50: 137nM/39nM for CDK4/CDK6, respectively; Show selective degradation of CDK6 (therefore active for CDK6 and inactive for CDK4).": [
+            _d('IC50', 137, 'nM', POI_Name='CDK4'),
+            _d('IC50', 39, 'nM', POI_Name='CDK6'),
+        ],
+        "Degradation rate: 20% (0.1uM compound) or 14% (1uM compound)": [
+            _d('Dmax', 20, '%', Value_Concentration=0.1, Value_Concentration_Unit='uM'),
+            _d('Dmax', 14, '%', Value_Concentration=1, Value_Concentration_Unit='uM'),
+        ],
+        "pEC50 for MV4;11 and HL60 cells: 7.31±0.03 and 6.57±0.02, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 8.1/7.6/7.3/NA, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 98%/95%/91%/43%, respectively (HeLa cells).": [
+            _d('pEC50', 7.31, '', Cell_Line='MV4;11', Value_Error=0.03),
+            _d('pEC50', 6.57, '', Cell_Line='HL60', Value_Error=0.02),
+            _d('pDC50', 8.1, '', Cell_Line='HeLa', POI_Name='BRD4 SHORT', Assay_Time=24),
+            _d('pDC50', 7.6, '', Cell_Line='HeLa', POI_Name='BRD4 LONG', Assay_Time=24),
+            _d('pDC50', 7.3, '', Cell_Line='HeLa', POI_Name='BRD3', Assay_Time=24),
+            _d('pDC50', None, '', Cell_Line='HeLa', POI_Name='BRD2', Assay_Time=24),
+            _d('Dmax', 98, '%', Cell_Line='HeLa', POI_Name='BRD4 SHORT'),
+            _d('Dmax', 95, '%', Cell_Line='HeLa', POI_Name='BRD4 LONG'),
+            _d('Dmax', 91, '%', Cell_Line='HeLa', POI_Name='BRD3'),
+            _d('Dmax', 43, '%', Cell_Line='HeLa', POI_Name='BRD2'),
+        ],
+        "Degradation rate in KYSE520 cell: 90% (1uM compound); Degradation rate in MV4;11 cell: 8% (0.1uM compound)": [
+            _d('Dmax', 90, '%', Cell_Line='KYSE520', Value_Concentration=1, Value_Concentration_Unit='uM'),
+            _d('Dmax', 8, '%', Cell_Line='MV4;11', Value_Concentration=0.1, Value_Concentration_Unit='uM'),
+        ],
+        "Dmax in BBL358/T47D: 0.5% and 76%, respectively.": [
+            _d('Dmax', 0.5, '%', Cell_Line='BBL358'),
+            _d('Dmax', 76, '%', Cell_Line='T47D'),
+        ],
+        "Dmax in BBL358/T47D: 77%±3% and 82%±10%, respectively.": [
+            _d('Dmax', 77, '%', Cell_Line='BBL358', Value_Error=3),
+            _d('Dmax', 82, '%', Cell_Line='T47D', Value_Error=10),
+        ],
+        "For HDAC1/HDAC2/HDAC3, the Dmax of this PROTAC is: >85%, >76%, >63%, respectively.": [
+            _d('Dmax', 85, '%', POI_Name='HDAC1', Value_Operator='>'),
+            _d('Dmax', 76, '%', POI_Name='HDAC2', Value_Operator='>'),
+            _d('Dmax', 63, '%', POI_Name='HDAC3', Value_Operator='>'),
+        ],
+        "Dmax in BBL358/T47D: 93%±5% and 87%±3%, respectively.": [
+            _d('Dmax', 93, '%', Cell_Line='BBL358', Value_Error=5),
+            _d('Dmax', 87, '%', Cell_Line='T47D', Value_Error=3),
+        ],
+        "Dmax for KYSE520 cell: >95%; Degradation rate in MV4;11 cell: 47% (0.1uM compound)": [
+            _d('Dmax', 95, '%', Cell_Line='KYSE520', Value_Operator='>'),
+            _d('Dmax', 47, '%', Cell_Line='MV4;11', Value_Concentration=0.1, Value_Concentration_Unit='uM'),
+        ],
+        "Dmax in BBL358/T47D: 84%±2% and 89%±2%, respectively.": [
+            _d('Dmax', 84, '%', Cell_Line='BBL358', Value_Error=2),
+            _d('Dmax', 89, '%', Cell_Line='T47D', Value_Error=2),
+        ],
+        "DC50 for KYSE520 cell: 6.0nM;DC50 for MV4;11 cell: 2.6nM; EC50 for KYSE520 cell: 0.66uM; EC50 for MV4;11 cell: 9.9nM;": [
+            _d('DC50', 6.0, 'nM', Cell_Line='KYSE520'),
+            _d('DC50', 2.6, 'nM', Cell_Line='MV4;11'),
+            _d('EC50', 0.66, 'uM', Cell_Line='KYSE520'),
+            _d('EC50', 9.9, 'nM', Cell_Line='MV4;11'),
+        ],
+        "Dmax in BBL358/T47D: 8% and 0, respectively.": [
+            _d('Dmax', 8, '%', Cell_Line='BBL358'),
+            _d('Dmax', 0, '%', Cell_Line='T47D'),
+        ],
+        "Dmax is measured in 10uM. EC50 of PROTAC is MCF-7: 2.70 ± 0.19 MDA-MB-231: 21.21 ± 1.95 HepG2: 18.70 ± 1.65 LO2: 41.11 ± 3.70 B16: 22.68 ± 2.03 uM. EC50 of ligand is MCF-7: 4.17 ± 0.31 MDA-MB-231: 21.33 ± 1.96 HepG2: 10.59 ± 0.94 LO2: 35.57 ± 2.81 B16: 14.49 ± 1.28 uM.": [
+            _d('Dmax', 'original', '%', Value_Concentration=10, Value_Concentration_Unit='uM'),
+            _d('EC50', 2.70, 'uM', Cell_Line='MCF-7', Value_Error=0.19),
+            _d('EC50', 21.21, 'uM', Cell_Line='MDA-MB-231', Value_Error=1.95),
+            _d('EC50', 18.70, 'uM', Cell_Line='HepG2', Value_Error=1.65),
+            _d('EC50', 41.11, 'uM', Cell_Line='LO2', Value_Error=3.70),
+            _d('EC50', 22.68, 'uM', Cell_Line='B16', Value_Error=2.03),
+            _d('EC50', 4.17, 'uM', Cell_Line='MCF-7', Value_Error=0.31),
+            _d('EC50', 21.33, 'uM', Cell_Line='MDA-MB-231', Value_Error=1.96),
+            _d('EC50', 10.59, 'uM', Cell_Line='HepG2', Value_Error=0.94),
+            _d('EC50', 35.57, 'uM', Cell_Line='LO2', Value_Error=2.81),
+            _d('EC50', 14.49, 'uM', Cell_Line='B16', Value_Error=1.28),
+        ],
+        "protein reduction by nearly 50% was observed as early as 1 h post\u2010treatment, and almost complete degradation was achieved after 4 h of treatment": [
+            _d('Dmax', 50, '%', Value_Operator='~', Assay_Time=1),
+            _d('Dmax', 100, '%', Value_Operator='~', Assay_Time=4),
+        ],
+        "half the paper develops the ligand and checks its selectivity. Dmax is 76% Karpas 422, 59% ULA, 84% SUDHL4, 82% OCI-Ly1, 82% Ramos.": [
+            _d('Dmax', 76, '%', Cell_Line='Karpas 422'),
+            _d('Dmax', 59, '%', Cell_Line='ULA'),
+            _d('Dmax', 84, '%', Cell_Line='SUDHL4'),
+            _d('Dmax', 82, '%', Cell_Line='OCI-Ly1'),
+            _d('Dmax', 82, '%', Cell_Line='Ramos'),
+        ],
+        "DC50 for CDK4 > 100 nM": [
+            _d('DC50', 100, 'nM', POI_Name='CDK4', Value_Operator='>'),
+        ],
+        "they heva a ternary complex crystal structure but dont give PDB. DC50 is between 25-125nM": [
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=25, Value_Range_Max=125),
+        ],
+        "DC50 for CDK4 > 500 nM": [
+            _d('DC50', 500, 'nM', POI_Name='CDK4', Value_Operator='>'),
+        ],
+        "DC50 for CDK4 > 50 nM": [
+            _d('DC50', 50, 'nM', POI_Name='CDK4', Value_Operator='>'),
+        ],
+        "EC50 of PROTAC is 28nM in MV-4-11, 68nM in NCI-H1568. DC50 is (SMARCA2 6nM, SMARCA4 11nM, PBRM1 32nM in MV-4-11; SMARCA2 3.3nM, PBRM1 15.6nM in NCI-H1568)": [
+            _d('EC50', 28, 'nM', Cell_Line='MV-4-11'),
+            _d('EC50', 68, 'nM', Cell_Line='NCI-H1568'),
+            _d('DC50', 6, 'nM', Cell_Line='MV-4-11', POI_Name='SMARCA2'),
+            _d('DC50', 11, 'nM', Cell_Line='MV-4-11', POI_Name='SMARCA4'),
+            _d('DC50', 32, 'nM', Cell_Line='MV-4-11', POI_Name='PBRM1'),
+            _d('DC50', 3.3, 'nM', Cell_Line='NCI-H1568', POI_Name='SMARCA2'),
+            _d('DC50', 15.6, 'nM', Cell_Line='NCI-H1568', POI_Name='PBRM1'),
+        ],
+        "DC50 for CDK4 > 100 nM. EC50 of PROTAC is 10nM in MM.lS 8nM in Mino.": [
+            _d('DC50', 100, 'nM', POI_Name='CDK4', Value_Operator='>'),
+            _d('EC50', 10, 'nM', Cell_Line='MM.1S'),
+            _d('EC50', 8, 'nM', Cell_Line='Mino'),
+        ],
+        "DC50 is 1-3nM": [
+            # NOTE: The corresponding Cell_Line column contains: "HeLa, MV4;11, A549"
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=1, Value_Range_Max=3, Cell_Line='HeLa'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=1, Value_Range_Max=3, Cell_Line='MV4;11'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=1, Value_Range_Max=3, Cell_Line='A549'),
+        ],
+        "DC50 is 0.86nM in LNCaP, 0.76 in VCaP and 10.4 nM at 1uM in 22Rv1. EC50 in cells is 0.25nM for LNCaP, 0.34 nM for VCaP, 183nM for 22Rv1.": [
+            _d('DC50', 0.86, 'nM', Cell_Line='LNCaP'),
+            _d('DC50', 0.76, 'nM', Cell_Line='VCaP'),
+            _d('DC50', 10.4, 'nM', Cell_Line='22Rv1', Value_Concentration=1, Value_Concentration_Unit='uM'),
+            _d('EC50', 0.25, 'nM', Cell_Line='LNCaP'),
+            _d('EC50', 0.34, 'nM', Cell_Line='VCaP'),
+            _d('EC50', 183, 'nM', Cell_Line='22Rv1'),
+        ],
+        "DC50 is 10-30nM": [
+            # NOTE: The corresponding Cell_Line column contains: "HeLa, MV4;11, A549"
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=10, Value_Range_Max=30, Cell_Line='HeLa'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=10, Value_Range_Max=30, Cell_Line='MV4;11'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=10, Value_Range_Max=30, Cell_Line='A549'),
+        ],
+        "DC50 is between 0.1uM-1uM": [
+            _d('DC50', None, 'uM', Value_Category='range', Value_Range_Min=0.1, Value_Range_Max=1),
+        ],
+        "Dmax is difficult to quantify because AC220 raises FLT3 expression levels. IC50 of ligand is 1.6 nM (binding); 1.1-4 (activity). EC50 of ligand is measured on MOLM-14 cell lines. EC50 of PROTAC was measured on MOLM-14 cell lines.": [
+            _d('IC50', 1.6, 'nM', Assay='ligand binding'),
+            _d('IC50', None, 'nM', Assay='ligand activity', Value_Category='range', Value_Range_Min=1.1, Value_Range_Max=4),
+            _d('EC50', 'original', 'nM', Cell_Line='MOLM-14'),
+            _d('EC50', 'original', 'nM', Cell_Line='MOLM-14'),
+        ],
+        "DC50 is between 1uM-2uM. Dmax is for JAK1.": [
+            _d('DC50', None, 'uM', Value_Category='range', Value_Range_Min=1, Value_Range_Max=2),
+            _d('Dmax', 'original', '%', POI_Name='JAK1'),
+        ],
+        "Dmax is for JAK1": [
+            _d('Dmax', 'original', '%', POI_Name='JAK1'),
+        ],
+        "Direct degration studies in this paper only conducted for first and final compounds; during the med chem campaign cell viability was used as the read out. Complex structure with the ligand was modeled based on 4Z93. IC50 of the ligand is between 2nM and 7nM, depending on which BRD. DC50 is between 3nM-10nM.": [
+            _d('IC50', None, 'nM', Assay='ligand vs BRD', Value_Category='range', Value_Range_Min=2, Value_Range_Max=7),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=3, Value_Range_Max=10),
+        ],
+        'They show "dual" degradation but don\'t do any test that the dual degradation actually made any difference. They make it sound novel but of course we can call our PROTACs "dual" degraders if you can the off-targets "targets". EC50 of ligand is in measured in MV4-11 cell line. EC50 of PROTAC is between 4.5nM-6.94nM (depended on the cell line).': [
+            _d('EC50', 'original', 'nM', Cell_Line='MV4-11'),
+            _d('EC50', None, 'nM', Value_Category='range', Value_Range_Min=4.5, Value_Range_Max=6.94),
+        ],
+        "DC50 value is for HeLa cells. DC50 is 0.61 uM for DLBCL cells. DMAX value is for HeLa cells. DMAX is 96 % for DLBCL cells.": [
+            _d('DC50', 'original', 'uM', Cell_Line='HeLa'),
+            _d('DC50', 0.61, 'uM', Cell_Line='DLBCL'),
+            _d('Dmax', 'original', '%', Cell_Line='HeLa'),
+            _d('Dmax', 96, '%', Cell_Line='DLBCL'),
+        ],
+        "also degrades ibrutinib-resistant C481S BTK. DC50 is 6.3 nM (HBL1), 8.5 nM (Ramos), 9.2 nM (Mino), 11.4 nM (IgE MM)": [
+            _d('DC50', 6.3, 'nM', Cell_Line='HBL1'),
+            _d('DC50', 8.5, 'nM', Cell_Line='Ramos'),
+            _d('DC50', 9.2, 'nM', Cell_Line='Mino'),
+            _d('DC50', 11.4, 'nM', Cell_Line='IgE MM'),
+        ],
+        "also tested degradation for two common mutants of ERa. EC50 of PROTAC was measured in MCF-7 cell line.": [
+            _d('EC50', 'original', 'nM', Cell_Line='MCF-7'),
+        ],
+        "achieved full degradation after 24hrs with addition of off-target CDK10 degradation. EC50 of ligand is measured on MOLT-4 cell line": [
+            _d('Dmax', 100, '%', Value_Operator='~', Assay_Time=24),
+            _d('EC50', 'original', 'nM', Cell_Line='MOLT-4'),
+        ],
+        "preferentially degrades CDK9 over CDK2. Controls were done against CDK2 and CDK9. tested competition with ligand and with pomalidomide. DC50 is CDK2: 62 nM, CDK9: 33 nM.": [
+            _d('DC50', 62, 'nM', POI_Name='CDK2'),
+            _d('DC50', 33, 'nM', POI_Name='CDK9'),
+        ],
+        "DC50 error ± 81.3 nM. DMAX error ± 10.1 %.": [
+            # NOTE: The corresponding Cell_Line column contains: "MDA-MB-231, HeLa"
+            _d('DC50', 'original', 'nM', Value_Error=81.3, Cell_Line='MDA-MB-231'),
+            _d('Dmax', 'original', '%', Value_Error=10.1, Cell_Line='HeLa'),
+        ],
+        "DC50 error ± 1.0 nM. DMAX error ± 1.1 %.": [
+            # NOTE: The corresponding Cell_Line column contains: "MDA-MB-231, HeLa"
+            _d('DC50', 'original', 'nM', Value_Error=1.0, Cell_Line='MDA-MB-231'),
+            _d('Dmax', 'original', '%', Value_Error=1.1, Cell_Line='HeLa'),
+        ],
+        "DC50 is for EGFR (Exon 19 del). DC50 for EGFR (L858R) 22.3 nM. DMAX is for EGFR (Exon 19 del). DMAX for EGFR (L858R) 96.6 %.": [
+            # NOTE: The corresponding Cell_Line column contains: "HCC827 (Exon 19 del), H3255 (L858R)"
+            _d('DC50', 'original', 'nM', POI_Name='EGFR Exon 19 del', Cell_Line='HCC827'),
+            _d('DC50', 22.3, 'nM', POI_Name='EGFR L858R', Cell_Line='H3255'),
+            _d('Dmax', 'original', '%', POI_Name='EGFR Exon 19 del', Cell_Line='HCC827'),
+            _d('Dmax', 96.6, '%', POI_Name='EGFR L858R', Cell_Line='H3255'),
+        ],
+        "DC50 is 9.1 nM (WT BTK, NAMALWA cells), 14.6 nM (WT BTK, XLA cells), 14.9 nM (C481S, XLA cells). IC50 of PROTAC is 46.9 (WT BTK), 20.9 (C481S). IC50 of ligand is 51.0 nM (WT BTK), 30.7 (C481S)": [
+            _d('DC50', 9.1, 'nM', Cell_Line='NAMALWA', POI_Name='BTK WT'),
+            _d('DC50', 14.6, 'nM', Cell_Line='XLA', POI_Name='BTK WT'),
+            _d('DC50', 14.9, 'nM', Cell_Line='XLA', POI_Name='BTK C481S'),
+            _d('IC50', 46.9, 'nM', POI_Name='BTK WT', Assay='PROTAC'),
+            _d('IC50', 20.9, 'nM', POI_Name='BTK C481S', Assay='PROTAC'),
+            _d('IC50', 51.0, 'nM', POI_Name='BTK WT', Assay='ligand'),
+            _d('IC50', 30.7, 'nM', POI_Name='BTK C481S', Assay='ligand'),
+        ],
+        "DC50 is for WT EGFR. DC50 for EGFR Exon 20 Ins is 736.2 nM. DMAX is for WT EGFR. DMAX for EGFR Exon 20 Ins is 68.8 %.": [
+            # NOTE: The corresponding Cell_Line column contains: "OVCAR8 (WT EGFR), HeLa (EGFR Exon 20 Ins), SKBr3 (HER2)"
+            _d('DC50', 'original', 'nM', POI_Name='EGFR WT', Cell_Line='OVCAR8'),
+            _d('DC50', 736.2, 'nM', POI_Name='EGFR Exon 20 Ins', Cell_Line='HeLa'),
+            _d('Dmax', 'original', '%', POI_Name='EGFR WT', Cell_Line='OVCAR8'),
+            _d('Dmax', 68.8, '%', POI_Name='EGFR Exon 20 Ins', Cell_Line='HeLa'),
+        ],
+        "DC50 and Dmax are for MCF-7 cells": [
+            _d('DC50', 'original', 'nM', Cell_Line='MCF-7'),
+            _d('Dmax', 'original', '%', Cell_Line='MCF-7'),
+        ],
+        "proteomics of PDEdelta degradation show upregulation of enzymes involved in lipid metabolism - deltasonamide 1 also causes this. Dmax was measured in Panc-Tu-1 cell line. DC50 is 83.4% (24 h, Panc-Tu-1), 85% (24 h, 1 uM, Jurkat). IC50 Deltasonamide 1 is 203 pM, and of the Bn derivative is 8 nM.": [
+            # NOTE: I think there is a typp and the annotator meant to say "Dmax" instead of "DC50".
+            _d('Dmax', 83.4, '%', Cell_Line='Panc-Tu-1', Assay_Time=24),
+            _d('Dmax', 85, '%', Cell_Line='Jurkat', Assay_Time=24, Value_Concentration=1, Value_Concentration_Unit='uM'),
+            _d('IC50', 203, 'pM', Assay='Deltasonamide 1'),
+            _d('IC50', 8, 'nM', Assay='Bn derivative'),
+        ],
+        "Selective BCLXL degradation: only in MOLT4 cells, not platelets": [
+            _d('Dmax', 'original', '%', Cell_Line='MOLT4', POI_Name='BCL-XL'),
+            # NOTE: Instead of platelets, we point to human acute megakaryoblastic
+            # leukemia cell line used to study platelet production.
+            _d('Dmax', 0, '%', Cell_Line='LK-4', POI_Name='BCL-XL'),
+        ],
+        "proteomics of PDEdelta degradation show upregulation of enzymes involved in lipid metabolism - deltasonamide 1 also causes this. IC50 Deltasonamide 1 is 203 pM, and of the Bn derivative is 8 nM.": [
+            _d('IC50', 203, 'pM', Assay='Deltasonamide 1'),
+            _d('IC50', 8, 'nM', Assay='Bn derivative'),
+        ],
+        "Tested reversal of docetaxel resistance by degradation of CYP, followed by lysis and WB, model with the ligand is available in previous publication": [
+            # No quantitative DC50/Dmax/pDC50 data to extract
+            _d('Dmax', 'original', '%', Assay='Western Blot'),
+            _d('DC50', 'original', 'nM', Assay='Western Blot'),
+        ],
+        "DC50 is 1.76 nM and 4.5 nM": [
+            _d('DC50', 1.76, 'nM'),
+            _d('DC50', 4.5, 'nM'),
+        ],
+        "competition with ligand only slightly rescued protein degradation. EC50 of ligand and PROTAC is measured on SUDHL-1 cell line. DC50 is SU-DHL-1: 3 ± 1 nM, NCI-H2228: 34 ± 9 nM.": [
+            _d('EC50', 'original', 'nM', Cell_Line='SUDHL-1'),
+            _d('EC50', 'original', 'nM', Cell_Line='SUDHL-1'),
+            _d('DC50', 3, 'nM', Cell_Line='SU-DHL-1', Value_Error=1),
+            _d('DC50', 34, 'nM', Cell_Line='NCI-H2228', Value_Error=9),
+        ],
+        "competition with ligand only slightly rescued protein degradation. EC50 of ligand and PROTAC is measured on SUDHL-1 cell line. DC50 is SU-DHL-1: 11 ± 2 nM, NCI-H2228: 59 ± 16 nM.": [
+            _d('EC50', 'original', 'nM', Cell_Line='SUDHL-1'),
+            _d('EC50', 'original', 'nM', Cell_Line='SUDHL-1'),
+            _d('DC50', 11, 'nM', Cell_Line='SU-DHL-1', Value_Error=2),
+            _d('DC50', 59, 'nM', Cell_Line='NCI-H2228', Value_Error=16),
+        ],
+        "Exhibits potent anti-HCV activity. The first demonstration of a PROTAC antiviral effect by degradation of a host protein (cyclophilin A).": [
+            # No quantitative DC50/Dmax/pDC50 data to extract
+        ],
+        # NOTE: I checked and the annotator meant DMax, not DCmax. Check: https://pmc.ncbi.nlm.nih.gov/articles/PMC6077745/
+        "Ligand name is from PMID 24068666. DCmax is 36-64%. DC50 is 1487 - 1994.5 nM.": [
+            # NOTE: The corresponding Cell_Line column contains: 'Ramos, THP-1'
+            _d('Dmax', None, '%', Value_Category='range', Value_Range_Min=36, Value_Range_Max=64, Cell_Line='Ramos'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=1487, Value_Range_Max=1994.5, Cell_Line='THP-1'),
+        ],
+        "Ligand name is from PMID 24068666. DCmax is 68-85%. DC50 is 36.9 - 398.5 nM.": [
+            # NOTE: The corresponding Cell_Line column contains: 'Ramos, THP-1'
+            _d('Dmax', None, '%', Value_Category='range', Value_Range_Min=68, Value_Range_Max=85, Cell_Line='Ramos'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=36.9, Value_Range_Max=398.5, Cell_Line='THP-1'),
+        ],
+        "Ligand name is from PMID 24068666. DCmax is 63-84%. DC50 is 21.8 - 469.9 nM.": [
+            # NOTE: The corresponding Cell_Line column contains: 'Ramos, THP-1'
+            _d('Dmax', None, '%', Value_Category='range', Value_Range_Min=63, Value_Range_Max=84, Cell_Line='Ramos'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=21.8, Value_Range_Max=469.9, Cell_Line='THP-1'),
+        ],
+        "Ligand name is from PMID 24068666. DCmax is 75-87%. DC50 is 4.5 - 90.5 nM.": [
+            # NOTE: The corresponding Cell_Line column contains: 'Ramos, THP-1'
+            _d('Dmax', None, '%', Value_Category='range', Value_Range_Min=75, Value_Range_Max=87, Cell_Line='Ramos'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=4.5, Value_Range_Max=90.5, Cell_Line='THP-1'),
+        ],
+        "Ligand name is from PMID 24068666. DCmax is 71-85%. DC50 is 5.9 - 217.7 nM.": [
+            # NOTE: The corresponding Cell_Line column contains: 'Ramos, THP-1'
+            _d('Dmax', None, '%', Value_Category='range', Value_Range_Min=71, Value_Range_Max=85, Cell_Line='Ramos'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=5.9, Value_Range_Max=217.7, Cell_Line='THP-1'),
+        ],
+        "Ligand name is from PMID 24068666. DCmax is 80-87%. DC50 is 1.1 - 37.4 nM.": [
+            # NOTE: The corresponding Cell_Line column contains: 'Ramos, THP-1'
+            _d('Dmax', None, '%', Value_Category='range', Value_Range_Min=80, Value_Range_Max=87, Cell_Line='Ramos'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=1.1, Value_Range_Max=37.4, Cell_Line='THP-1'),
+        ],
+        "Ligand name is from PMID 24068666. DCmax is 70-85%. DC50 is 9.7 - 184.1 nM.": [
+            # NOTE: The corresponding Cell_Line column contains: 'Ramos, THP-1'
+            _d('Dmax', None, '%', Value_Category='range', Value_Range_Min=70, Value_Range_Max=85, Cell_Line='Ramos'),
+            _d('DC50', None, 'nM', Value_Category='range', Value_Range_Min=9.7, Value_Range_Max=184.1, Cell_Line='THP-1'),
+        ],
+    }
+
+    total_entries = sum(len(v) for v in MANUAL_PARSED_COMMENTS.values())
+    logger.info(f"Total comments: {len(MANUAL_PARSED_COMMENTS)}")
+    logger.info(f"Total extracted entries: {total_entries}")
+    # Quick validation
+    required_keys = {
+        'Cell_Line', 'POI_Name', 'Assay', 'Assay_Time', 'Value', 'Value_Type',
+        'Value_Unit', 'Value_Operator', 'Value_Category',
+        'Value_Range_Min', 'Value_Range_Max', 'Value_Error',
+        'Value_Concentration', 'Value_Concentration_Unit', 'Value_Mean',
+    }
+    num_dc50 = sum(1 for entries in MANUAL_PARSED_COMMENTS.values() for entry in entries if entry['Value_Type'] == 'DC50')
+    num_dmax = sum(1 for entries in MANUAL_PARSED_COMMENTS.values() for entry in entries if entry['Value_Type'] == 'Dmax')
+    logger.info(f"Total DC50 entries: {num_dc50}")
+    logger.info(f"Total Dmax entries: {num_dmax}")
+
+    for i, (comment, entries) in enumerate(MANUAL_PARSED_COMMENTS.items()):
+        if comment not in protacpedia_df['Description'].values:
+            logger.info(f"Comment n.{i+1} not in DataFrame:\n```\n{comment}\n```")
+            raise ValueError("Comment not found in DataFrame")
+        for i, entry in enumerate(entries):
+            missing = required_keys - set(entry.keys())
+            extra = set(entry.keys()) - required_keys
+            if missing or extra:
+                logger.info(f"  Key issue in: {comment[:60]}... entry {i}")
+                if missing:
+                    logger.info(f"    Missing: {missing}")
+                if extra:
+                    logger.info(f"    Extra: {extra}")
+    logger.info("Validation complete.")
+
+    # ## Cells Standardization
+
+    def is_unclear_cell(reported_cell_line):
+        if pd.isna(reported_cell_line):
+            return False
+        if reported_cell_line.strip() == 'MV-4-11 SK-MEL-5':
+            return True
+        elif '; ' in reported_cell_line:  # Notice the space after the semicolon!!
+            return True
+        elif reported_cell_line.endswith(','):
+            return True
+        elif ',' in reported_cell_line:
+            return True
+        elif ' and ' in reported_cell_line:
+            return True
+        elif '/' in reported_cell_line:
+            return True
+        return False
+
+    protacpedia_df['Unclear_Cell_Line'] = protacpedia_df['Cell_Line'].apply(is_unclear_cell)
+    num_unclear = protacpedia_df['Unclear_Cell_Line'].sum()
+    logger.info(f"Number of entries with unclear cell line: {num_unclear}")
+
+    cell_embedding = CellEmbedding(verbose=1)
+
+    MANUAL_CELL_MAP = {
+        # B16 is the classic mouse melanoma line. The parental B16 doesn't have
+        # its own Cellosaurus entry separate from subclones; B16-F0 is the
+        # closest "parental" entry.
+        # TODO: If the data doesn't specify the subclone, B16-F0 (CVCL_F602) is the
+        # safest default. Alternatively we can use B16-F10 (CVCL_0159) if the paper
+        # used the metastatic variant.
+        'B16': 'B16-F0',  # CVCL_F602
+
+        # 'H3255 (L858R)' -> 'H32' (CVCL_E3Z2) — WRONG
+        # This is NCI-H3255, an NSCLC line with EGFR L858R mutation.
+        'H3255 (L858R)': 'NCI-H3255',  # CVCL_5194
+
+        # 'HBL1' -> 'HBL-1 [Human AIDS-related non-Hodgkin lymphoma]' (CVCL_M572) — WRONG
+        # In PROTAC/BTK literature, HBL-1 is the DLBCL (ABC subtype) line.
+        # CVCL_4213 = HBL-1 [Human diffuse large B-cell lymphoma]
+        'HBL1': 'HBL-1 [Human diffuse large B-cell lymphoma]',  # CVCL_4213
+
+        # HCC827 harbors EGFR exon 19 deletion; the annotation is just metadata.
+        'HCC827 (Exon 19 del)': 'HCC827',  # CVCL_2063
+
+        # KG-1 is a human AML cell line.
+        'KG1': 'KG-1',  # CVCL_0374
+
+        # Same as above, just without the hyphen.
+        'PC3': 'PC-3',  # CVCL_0035
+
+        # SK-BR-3 is a HER2+ breast cancer line.
+        'SKBr3 (HER2)': 'SK-BR-3',  # CVCL_0033
+
+        # Parsing artifact; this is 22Rv1.
+        'and 22Rv': '22Rv1',  # CVCL_1045
+
+        # This is two cell lines jammed together. Map to MV4-11 as primary;
+        # the splitting should happen upstream in your cell line parser.
+        'MV-4-11 SK-MEL-5': 'MV4-11',  # CVCL_0064
+
+        # 'HOP62/INC-H23' -> 'Ho' (CVCL_M698) — WRONG
+        # Likely a typo for "HOP-62/NCI-H23". These are two NCI-60 lines.
+        'HOP62/INC-H23': 'HOP-62',  # CVCL_1290
+
+        'AML cells': 'AML-1',  # TODO: Needs paper-level resolution
+
+        # This is a free-text description, not a cell line name.
+        'Big sellection of cacer cell lines': None,
+
+        # 'E14 mouse embryonic stem cells' -> 'CRL-6440' (CVCL_ZE35) — WRONG
+        # E14 mESCs = E14Tg2a (CVCL_9108), a widely used 129-derived mESC line.
+        'E14 mouse embryonic stem cells': 'ES-E14TG2a',  # CVCL_9108
+
+        # Flag-Cdc20 is a tagged protein construct, not a cell line.
+        # The host cell line depends on the paper. Map to None.
+        'Flag-Cdc20': None,  # Tagged construct, not a cell line
+
+        # Primary cells, not an established line.
+        'Mice primary Sertoli cells': None,  # Primary cells
+
+        # 'primary Germ cells' -> 'Ger' (CVCL_8353) — WRONG
+        # Primary cells, not an established line. We might map 'germ' -> 'SCIT-C8'
+        # which is questionable, though.
+        'primary Germ cells': 'SCIT-C8',  # Primary cells
+        '231MFP breast cancer cells': 'MDA-MB-231',  # CVCL_0062
+
+        # 'MM1.SW' -> 'MM1.S' (CVCL_8792) — POSSIBLY WRONG
+        # MM1.S-W is a dexamethasone-sensitive subline. Cellosaurus doesn't
+        # have a separate entry; MM1.S (CVCL_8792) is acceptable.
+
+        # It seems correct given the PROTAC literature context (BTK degraders tested
+        # on DLBCL cell lines; HBL-1 is the canonical ABC-DLBCL line).
+
+        # 'MM.lS' (typo in original data for MM.1S line)
+        'MM.lS': 'MM1.S',  # CVCL_8792  (lowercase L mistaken for 1)
+
+        # 'Panc-Tu-1' variant if it appears
+        'Panc-Tu-1': 'PancTu-I',  # CVCL_4012
+        'KYSE520': 'KYSE-520',  # CVCL_1355
+        'Karpas 422': 'Karpas-422',  # CVCL_1325
+
+        # 'SU-DHL-1' and 'SUDHL4' — already correct in output, but adding
+        # common variants for robustness
+        'SUDHL-1': 'SU-DHL-1',  # CVCL_0538
+        'SUDHL4': 'SU-DHL-4',  # CVCL_0539
+        'SU-DHL-1': 'SU-DHL-1',  # CVCL_0538  (identity, ensures no fuzzy mismatch)
+    }
+
+    unique_cell_lines = set()
+    cell_line2comments = {}
+
+    for reported_cell_line in protacpedia_df['Cell_Line'].dropna().unique():
+        if reported_cell_line.strip() == 'MV-4-11 SK-MEL-5':
+            print('-- Special case: splitting "MV-4-11 SK-MEL-5" into two cell lines ---')
+            cell_lines = ['MV-4-11', 'SK-MEL-5']
+        elif '; ' in reported_cell_line:  # Notice the space after the semicolon!!
+            cell_lines = [cl.strip() for cl in reported_cell_line.split('; ')]
+        elif reported_cell_line.endswith(','):
+            cell_lines = [cl.strip() for cl in reported_cell_line[:-1].split(',')]
+        elif ',' in reported_cell_line:
+            cell_lines = [cl.strip() for cl in reported_cell_line.split(',')]
+        elif ' and ' in reported_cell_line:
+            cell_lines = [cl.strip() for cl in reported_cell_line.split(' and ')]
+        elif '/' in reported_cell_line:
+            cell_lines = [cl.strip() for cl in reported_cell_line.split('/')]
+        else:
+            cell_lines = [reported_cell_line.strip()]
+        for cl in cell_lines:
+            unique_cell_lines.add(cl)
+            cell_line2comments.setdefault(cl, []).append(reported_cell_line)
+        
+    cell_line2cleaned = {}
+    for cl in sorted(unique_cell_lines):
+        clean_cl, clean_id = clean_cell_name(cl, cell_embedding, MANUAL_CELL_MAP, logger)
+        cell_line2cleaned[cl] = (clean_cl, clean_id)
+        if clean_cl is None:
+            # logger.info(f"  WARNING: Could not clean cell line name '{cl}' from reported '{reported_cell_line}'")
+            logger.warning(f" * WARNING: Failed '{cl}' - (From: '{cell_line2comments[cl]}')")
+        else:
+            # logger.info(f"'{reported_cell_line}' -> '{cl}' -> '{clean_cl}' ({clean_id})")
+            # logger.info(f"'{cl}' -> '{clean_cl}' ({clean_id}) -> (From: '{cell_line2comments[cl]}')")
+            logger.info(f"'{cl}' -> '{clean_cl}' ({clean_id})")
+
+    # ## Duplicate Rows
+
+    def pdc50_to_dc50(pdc50):
+        if pd.isna(pdc50):
+            return None
+        try:
+            return (10 ** (-pdc50)) * 1e9  # Convert M to nM
+        except Exception as e:
+            print(f"Error converting pDC50 to DC50 for value: {pdc50}")
+            raise e
+
+
+    def resolve_assay_time(
+            time_entries, index, num_parsed, num_original_vals,
+            default_standard_assay_time: float = 24,
+    ):
+        if not time_entries:
+            return None
+        if len(time_entries) == 1:
+            return time_entries[0]
+        total_entries = num_parsed + num_original_vals
+        if len(time_entries) == total_entries:
+            return time_entries[index % len(time_entries)]
+        if default_standard_assay_time in time_entries:
+            return default_standard_assay_time
+        return max(time_entries)
+
+
+    def parse_cell_lines(cell_line_str):
+        if pd.isna(cell_line_str):
+            return []
+        cl = str(cell_line_str).strip()
+        if not cl:
+            return []
+        if cl == 'MV-4-11 SK-MEL-5':
+            return ['MV-4-11', 'SK-MEL-5']
+        if '; ' in cl:
+            return [c.strip() for c in cl.split('; ') if c.strip()]
+        if cl.endswith(','):
+            return [c.strip() for c in cl[:-1].split(',') if c.strip()]
+        if ',' in cl:
+            return [c.strip() for c in cl.split(',') if c.strip()]
+        if ' and ' in cl:
+            return [c.strip() for c in cl.split(' and ') if c.strip()]
+        return [cl]
+
+
+    curated_rows = []
+
+    for _, row in protacpedia_df.iterrows():
+        curator = row.get('Curator', 'Unknown')
+        comment = row['Description']
+
+        # ── 1. Parse assay times ──────────────────────────────────────
+        time_entries = []
+        if pd.notna(row.get('Assay_Time', np.nan)):
+            time_str = str(row['Assay_Time']).replace(' ', '').replace('h', '')
+            for t in time_str.split(','):
+                try:
+                    time_entries.append(float(t))
+                except ValueError:
+                    pass
+
+        # ── 2. Parse cell lines ───────────────────────────────────────
+        raw_cell_lines = parse_cell_lines(row.get('Cell_Line'))
+        cleaned_cell_lines = []
+        for cl in raw_cell_lines:
+            if cl in cell_line2cleaned:
+                cleaned_cell_lines.append(cell_line2cleaned[cl])
+            else:
+                cleaned_cell_lines.append(clean_cell_name(cl, cell_embedding, MANUAL_CELL_MAP, logger))
+        multiple_cell_lines = len(cleaned_cell_lines) > 1
+
+        # ── 3. Parse UniProts ─────────────────────────────────────────
+        poi_str = row.get('POI_Uniprot', '')
+        if pd.isna(poi_str):
+            poi_str = ''
+
+        # Assign conflicting Uniprot IDs based on curator+POI_Name and other
+        # contextual info, if available
+        if (curator, poi_str) in MANUAL_POI_MAP:
+            desc = comment if pd.notna(comment) else None
+            cell = row['Cell_Line'] if pd.notna(row['Cell_Line']) else None
+            dc50 = row['DC50'] if pd.notna(row['DC50']) else None
+            dmax = row['Dmax'] if pd.notna(row['Dmax']) else None
+            poi_mapped = MANUAL_POI_MAP[(curator, poi_str)][desc, cell, dc50, dmax]
+            row['POI_Uniprot'] = poi_mapped
+
+        # ── 4. Parse original DC50/Dmax ───────────────────────────────
+        parsed_values = {}
+        num_original_vals = 0
+        for value_col in ['DC50', 'Dmax']:
+            if pd.notna(row.get(value_col)):
+                parsed_values[value_col] = parse_single_value(row[value_col])
+                num_original_vals += 1
+            else:
+                parsed_values[value_col] = None
+
+        num_parsed_degradation = sum(
+            1 for e in MANUAL_PARSED_COMMENTS.get(comment, [])
+            if e.get('Value_Type') in {'DC50', 'Dmax', 'pDC50'}
+        )
+
+        # ── 5. Emit rows from original DC50/Dmax columns ─────────────
+        original_entry_idx = 0
+        for value_col in ['DC50', 'Dmax']:
+            if parsed_values[value_col] is None:
+                continue
+
+            # Skip emitting the row if the comment includes references to
+            # 'original' values: in this case, the comment will include the
+            # columns
+            entries = MANUAL_PARSED_COMMENTS.get(comment, [])
+            entries = [e for e in entries if e.get('Value_Type') == value_col and e.get('Value') == 'original']
+            if len(entries) > 0:
+                continue
+
+            curated_row = row.copy().to_dict()
+            curated_row['Value_Type'] = value_col
+            curated_row['Value'] = parsed_values[value_col]['mean']
+            curated_row['Value_Unit'] = parsed_values[value_col]['unit']
+            curated_row['Value_Operator'] = parsed_values[value_col]['operator']
+            curated_row['Value_Category'] = 'numeric'
+            curated_row['Description'] = comment
+
+            # Cell line: both DC50 and Dmax come from same experiment
+            if cleaned_cell_lines:
+                curated_row['Cell_Line'] = cleaned_cell_lines[0][0]
+                curated_row['Cell_Line_ID'] = cleaned_cell_lines[0][1]
+            else:
+                curated_row['Cell_Line'] = None
+                curated_row['Cell_Line_ID'] = None
+            curated_row['Unclear_Cell_Line'] = multiple_cell_lines
+
+            curated_row['Assay_Time'] = resolve_assay_time(
+                time_entries, original_entry_idx,
+                num_parsed_degradation, num_original_vals,
+            )
+            
+            curated_row['Manually_Curated'] = False
+
+            curated_rows.append(curated_row)
+            original_entry_idx += 1
+
+        # ── 6. Emit rows from parsed comments ────────────────────────
+        if comment in MANUAL_PARSED_COMMENTS:
+            for i, entry in enumerate(MANUAL_PARSED_COMMENTS[comment]):
+                if entry['Value_Type'] not in {'DC50', 'Dmax', 'pDC50'}:
+                    continue
+
+                curated_row = row.to_dict()
+                
+                # Overwrite with parsed values from comment (e.g. Cell_Line,
+                # Assay, POI_Name) which may be more specific than the row-level
+                # values. The Value/Value_Type columns will be overwritten below
+                curated_row.update(entry)
+
+                # Time
+                if time_entries and pd.isna(curated_row.get('Assay_Time')):
+                    curated_row['Assay_Time'] = resolve_assay_time(
+                        time_entries, num_original_vals + i,
+                        num_parsed_degradation, num_original_vals,
+                    )
+
+                # pDC50 → DC50
+                if entry['Value_Type'] == 'pDC50':
+                    curated_row['Value_Type'] = 'DC50'
+                    if entry['Value'] == 'original':
+                        if pd.notna(row.get('pDC50')):
+                            pdc50_val = row['pDC50']
+                            if isinstance(pdc50_val, str):
+                                pdc50_val = float(pdc50_val)
+                            curated_row['Value'] = pdc50_to_dc50(pdc50_val)
+                            curated_row['Value_Unit'] = 'nM'
+                            if parsed_values.get('DC50'):
+                                curated_row['Value_Operator'] = parsed_values['DC50']['operator']
+                        else:
+                            curated_row['Value'] = None
+                    else:
+                        curated_row['Value'] = pdc50_to_dc50(entry['Value'])
+                        curated_row['Value_Unit'] = 'nM'
+                        curated_row['Value_Operator'] = entry.get('Value_Operator', '')
+
+                # 'original' value
+                elif entry['Value'] == 'original':
+                    vtype = entry['Value_Type']
+                    if parsed_values.get(vtype) is not None:
+                        curated_row['Value'] = parsed_values[vtype]['mean']
+                        curated_row['Value_Unit'] = parsed_values[vtype]['unit']
+                        curated_row['Value_Operator'] = parsed_values[vtype]['operator']
+                    else:
+                        curated_row['Value'] = None
+
+                # Range → mean
+                if entry.get('Value_Category') == 'range' and entry['Value'] is None:
+                    range_min = entry['Value_Range_Min']
+                    range_max = entry['Value_Range_Max']
+                    curated_row['Value'] = (range_min + range_max) / 2
+                    curated_row['Value_Mean'] = (range_min + range_max) / 2
+
+                if curated_row['Value'] is None:
+                    print(f"WARNING: Could not assign value for entry from comment: '{comment}...' entry: {entry}")
+
+                # Cell line
+                if entry.get('Cell_Line') is not None:
+                    cl_name, cl_id = clean_cell_name(entry['Cell_Line'], cell_embedding, MANUAL_CELL_MAP, logger)
+                    curated_row['Cell_Line'] = cl_name
+                    curated_row['Cell_Line_ID'] = cl_id
+                    curated_row['Unclear_Cell_Line'] = False
+                elif cleaned_cell_lines:
+                    curated_row['Cell_Line'] = cleaned_cell_lines[0][0]
+                    curated_row['Cell_Line_ID'] = cleaned_cell_lines[0][1]
+                    curated_row['Unclear_Cell_Line'] = (len(cleaned_cell_lines) > 1)
+                else:
+                    curated_row['Cell_Line'] = None
+                    curated_row['Cell_Line_ID'] = None
+                    curated_row['Unclear_Cell_Line'] = False
+
+                # POI_Name → POI_Uniprot resolution: if a comment specifies a
+                # POI_Name, this is likely more accurate than the row-level
+                # POI_Uniprot annotation which may be missing or incorrect.
+                # So we attempt to resolve the POI_Name to a UniProt ID and
+                # overwrite the row-level POI_Uniprot with the resolved value.
+                if entry.get('POI_Name') is not None:
+                    poi_uniprot = gene2uniprot.get(entry['POI_Name'])
+                    if poi_uniprot is None:
+                        logger.warning(f"WARNING: Could not resolve POI_Name '{entry['POI_Name']}' to UniProt ID for comment: '{comment[:60]}...'")
+                    curated_row['POI_Uniprot'] = poi_uniprot
+                
+                curated_row['Manually_Curated'] = True
+                curated_rows.append(curated_row)
+
+    curated_df = pd.DataFrame(curated_rows)
+    curated_df['Dataset'] = 'PROTACpedia'
+    curated_df['Modality'] = 'PROTAC'
+
+    # Assign all Dmax type entries the Value_Unit to '%'
+    curated_df.loc[curated_df['Value_Type'] == 'Dmax', 'Value_Unit'] = '%'
+
+    # Isolate relevant columns only
+    curated_df = curated_df[[
+        'SMILES',
+        'Ligase_Name',
+        'POI_Name',
+        'POI_Uniprot',
+        'Unclear_POI',
+        'Value',
+        'Value_Type',
+        'Value_Unit',
+        'Value_Operator',
+        'Cell_Line',
+        'Cell_Line_ID',
+        'Unclear_Cell_Line',
+        'Assay',
+        'Assay_Time',
+        'Value_Category',
+        'Value_Range_Min',
+        'Value_Range_Max',
+        'Value_Error',
+        'Value_Concentration',
+        'Value_Concentration_Unit',
+        'Value_Mean',
+        'Reference',
+        'Description',
+        'Modality',
+        'Dataset',
+        'Manually_Curated',
+    ]]
+
+    # Convert all molar values to nM for consistency
+    def convert_to_nM(row):
+        if row['Value_Type'] in {'DC50', 'EC50', 'IC50'} and pd.notna(row['Value']) and pd.notna(row['Value_Unit']):
+            try:
+                if row['Value_Unit'] == 'M':
+                    return row['Value'] * 1e9
+                elif row['Value_Unit'] == 'uM':
+                    return row['Value'] * 1e3
+                elif row['Value_Unit'] == 'nM':
+                    return row['Value']
+                elif row['Value_Unit'] == 'pM':
+                    return row['Value'] * 1e-3
+                else:
+                    print(f"WARNING: Unrecognized {row['Value_Type']} unit '{row['Value_Unit']}' for value: {row['Value']} in comment: '{row['Description']}'")
+                    return row['Value']
+            except Exception as e:
+                print(f"Error converting value to nM for value: {row['Value']} with unit: {row['Value_Unit']} in comment: '{row['Description']}'")
+                raise e
+        else:
+            return row['Value']
+
+    curated_df['Value'] = curated_df.apply(convert_to_nM, axis=1)
+    # Convert all DC50 units to nM
+    curated_df.loc[curated_df['Value_Type'] == 'DC50', 'Value_Unit'] = 'nM'
+
+    # Rename POI_Name values for consistency
+    curated_df['POI_Name'] = curated_df['POI_Name'].replace({
+        'BCLXL': 'BCL-XL',
+        'BTK WT': 'BTK',
+        'Brd2': 'BRD2',
+        'Brd3': 'BRD3',
+        'Brd4': 'BRD4',
+        'Brd4 long': 'BRD4 LONG',
+        'Brd4 short': 'BRD4 SHORT',
+    })
+    logger.info(curated_df['POI_Name'].value_counts())
+
+    # ## Assign Species
+
+    # Get all Cell_Line_Species
+    curated_df['Cell_Line_Species'] = curated_df['Cell_Line'].apply(lambda cl: get_cell_species(cl, cell_embedding))
+    logger.info(curated_df['Cell_Line_Species'].value_counts())
+
+    # Replace Ligase_Name with standardized ones
+    curated_df['Ligase_Name'] = curated_df['Ligase_Name'].replace({
+        'Cereblon': 'CRBN',
+        'Mdm2': 'MDM2',
+        'Iap': 'IAP',
+        'Ubr1': 'UBR1', # Typo in original data
+    })
+
+    # Map E3 ligases to UniProt IDs
+    def get_e3_uniprot(row: pd.Series) -> Optional[str]:
+        e3 = row.get('Ligase_Name')
+        species = row.get('Cell_Line_Species')
+        if pd.isna(e3):
+            raise ValueError(f"Missing Ligase_Name in row with comment: '{row['Description'][:60]}...'")
+        
+        e3_mapping = E3_TO_ORGANISM_TO_UNIPROT.get(species)
+        if e3_mapping is None:
+            # Get the default human mapping
+            e3_mapping = E3_TO_ORGANISM_TO_UNIPROT.get('Homo sapiens', {})
+
+        e3_uniprot = e3_mapping.get(e3)
+        if e3_uniprot is None:
+            raise ValueError(f"E3 Ligase '{e3}' is not in the known ones!")
+        
+        return e3_uniprot
+
+    curated_df['Ligase_Uniprot'] = curated_df.apply(get_e3_uniprot, axis=1)
+    logger.info(curated_df['Ligase_Uniprot'].value_counts())
+
+    def update_uniprot(row, logger):
+        infos = fetch_uniprot_for_gene(row['POI_Name'], row['Cell_Line_Species'])
+        new_uniprot = infos['uniprot'] if infos is not None else row['POI_Uniprot']
+        if new_uniprot is not None and new_uniprot != row['POI_Uniprot']:
+            logger.warning(f"Updating Uniprot {row['POI_Uniprot']} with {new_uniprot}, for organism: {row['Cell_Line_Species']}")
+        return new_uniprot
+
+    curated_df['POI_Uniprot'] = curated_df.apply(lambda x: update_uniprot(x, logger), axis=1)
+    uniprots_to_fetch = list(curated_df['POI_Uniprot'].unique()) + list(curated_df['Ligase_Uniprot'].unique())
+
+    # Update dictionaries with newly found Uniprots
+    for uniprot_id in tqdm(uniprots_to_fetch, desc='Fetching UniProt entries'):
+        json_info = load_dict(data_curation_dir / 'uniprot_infos' / f'{uniprot_id}.json')
+        if json_info:
+            uniprot2info[uniprot_id] = json_info
+            uniprot2gene[uniprot_id] = json_info['gene_primary']
+            uniprot2seq[uniprot_id] = json_info['sequence']
+            gene2uniprot[json_info['gene_primary']] = uniprot_id
+            for isoform in json_info.get('isoforms', []):
+                uniprot_id = isoform['accession']
+                # NOTE: We do not add isoforms to uniprot2gene since they share the
+                # same gene name
+                uniprot2info[uniprot_id] = isoform
+                uniprot2seq[uniprot_id] = isoform['sequence']
+        else:
+            infos = fetch_protein_info(uniprot_id, skip_isoforms=False)
+            if infos:
+                # Save each entry to a separate JSON file
+                save_dict(infos, data_curation_dir / 'uniprot_infos' / f'{uniprot_id}.json')
+                uniprot2gene[uniprot_id] = infos['gene_primary']
+                uniprot2seq[uniprot_id] = infos['sequence']
+                uniprot2info[uniprot_id] = infos
+                gene2uniprot[infos['gene_primary']] = uniprot_id
+                for isoform in infos.get('isoforms', []):
+                    uniprot_id = isoform['accession']
+                    save_dict(isoform, data_curation_dir / 'uniprot_infos' / f'{uniprot_id}.json')
+                    uniprot2gene[uniprot_id] = isoform['gene_primary']
+                    uniprot2seq[uniprot_id] = isoform['sequence']
+            else:
+                uniprot2gene[uniprot_id] = None
+
+    # Assign missing POI_Name values based on UniProt ID
+    def assign_poi_name(row):
+        if pd.isna(row['POI_Name']) and pd.notna(row['POI_Uniprot']):
+            uniprot_id = row['POI_Uniprot']
+            gene_name = uniprot2gene.get(uniprot_id)
+            if gene_name:
+                return gene_name
+        return row['POI_Name']
+
+    curated_df['POI_Name'] = curated_df.apply(assign_poi_name, axis=1)
+
+    # Clean 'BRD4 LONG' and 'BRD4 SHORT' entries with their isoforms (based on POI_Uniprot)
+    def assign_brd4_isoform(row):
+        if pd.notnull(row['POI_Name']) and 'BRD4' in row['POI_Name']:
+            if 'LONG' in row['POI_Name']:
+                return row['POI_Uniprot'] + '-1'
+            elif 'SHORT' in row['POI_Name']:
+                return row['POI_Uniprot'] + '-2'
+        return row['POI_Uniprot']
+
+    curated_df['POI_Uniprot'] = curated_df.apply(assign_brd4_isoform, axis=1)
+
+    # ## Get Sequences and Apply Mutations
+
+    curated_df['POI_Sequence'] = curated_df['POI_Uniprot'].apply(lambda uid: uniprot2seq.get(uid))
+    curated_df['Ligase_Sequence'] = curated_df['Ligase_Uniprot'].apply(lambda uid: uniprot2seq.get(uid))
+
+    curated_df['POI_Sequence'] = curated_df.apply(lambda row: apply_mutation(row['POI_Sequence'], row['POI_Name']), axis=1)
+
+    curated_df = curated_df.dropna(subset=['Value'])
+
+    # ## Resolve Duplicates
+
+    def resolve_duplicates(df, duplicate_subset):
+        """ Resolve duplicates by keeping all manually curated entries and dropping
+            automatically parsed ones only if there is a manually curated entry in
+            the same group. """
+        df = df.copy()
+
+        df['_has_manual'] = df.groupby(duplicate_subset, dropna=False)['Manually_Curated'].transform('any')
+        df['_keep'] = ~df['_has_manual'] | df['Manually_Curated']
+
+        resolved = df[df['_keep']].drop(columns=['_has_manual', '_keep'])
+        return resolved
+
+    duplicate_subset = ['SMILES', 'Cell_Line', 'Ligase_Name', 'POI_Name', 'POI_Uniprot', 'Value_Type', 'Assay', 'Assay_Time']
+    curated_df = resolve_duplicates(curated_df, duplicate_subset)
+
+    # Check the amount of missing data in each column
+    missing_data = curated_df.isna().sum()
+    logger.info("Missing data counts per column:")
+    logger.info('\n' + str(missing_data))
+
+    # ## Save to CSV
+    curated_df.to_csv(data_curation_dir / 'protacpedia_protac_dc50_dmax.csv', index=False)
+
+    print('-' * 80)
+    print(f"Logs saved to: {log_file}")
+    print('-' * 80)
+
+
+    # import numpy as np
+    # import matplotlib.pyplot as plt
+    # import seaborn as sns
+
+    # # Plot the distribution of DC50 and Dmax values
+
+    # def dc50_to_pdc50(dc50):
+    #     if pd.isna(dc50):
+    #         return None
+    #     try:
+    #         return -np.log10(dc50 * 1e-9)  # Convert nM to M and then to pDC50
+    #     except Exception as e:
+    #         print(f"Error converting DC50 to pDC50 for value: {dc50}")
+    #         raise e
+
+    # plt.figure(figsize=(12, 6))
+    # sns.histplot([dc50_to_pdc50(x) for x in curated_df[curated_df['Value_Type'] == 'DC50']['Value'].dropna()], bins=30, kde=True)
+    # plt.title('Distribution of pDC50 Values')
+    # plt.xlabel('pDC50 (-Log10(nM))')
+    # plt.ylabel('Frequency')
+    # plt.show()
+
+    # # Plot the distribution of Dmax values
+    # plt.figure(figsize=(12, 6))
+    # sns.histplot(curated_df[curated_df['Value_Type'] == 'Dmax']['Value'].dropna(), bins=30, kde=True)
+    # plt.title('Distribution of Dmax Values')
+    # plt.xlabel('Dmax (%)')
+    # plt.ylabel('Frequency')
+    # plt.show()
 
 
 if __name__ == "__main__":

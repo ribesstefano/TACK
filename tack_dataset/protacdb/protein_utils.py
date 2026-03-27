@@ -1,10 +1,64 @@
-import requests
-import time
 import re
+import time
+import requests
+from pathlib import Path
+from io import StringIO
 from typing import Optional, Union, Literal
 from functools import lru_cache
 
 import pandas as pd
+from tqdm import tqdm
+
+from tack_dataset.protacdb.utils import save_dict, load_dict
+
+
+E3_TO_ORGANISM_TO_UNIPROT = {
+    'Homo sapiens': {
+        'VHL': 'P40337',
+        'CRBN': 'Q96SW2',
+        'DCAF1': 'Q9Y4B6',
+        'DCAF11': 'Q8TEB1',
+        'DCAF15': 'Q66K64',
+        'DCAF16': 'Q9NXF7',
+        'MDM2': 'Q00987',
+        'XIAP': 'P98170',
+        'IAP': 'P98170', # IAP is too generic, so we set it to XIAP instead
+        'cIAP1': 'Q13490', # BIRC2_HUMAN
+        'AhR': 'P35869',
+        'RNF4': 'P78317',
+        'RNF114': 'Q9Y508',
+        'FEM1B': 'Q9UK73',
+        'UBR1': 'Q8IWV7',
+        'UBR box': 'G3V2G3', # We associate the UBR box with the UBR7 gene
+        'KLHL20': 'Q9Y2M5',
+        'KLHDC2': 'Q9Y2U9',
+        'FBXO22': 'Q8NEZ5',
+        'KEAP1': 'Q14145',
+    },
+    'Mus musculus': {
+        'CRBN': 'Q8C7D2',
+        'VHL': 'P40338',
+        'cIAP1': 'Q62210', # BIRC2_MOUSE
+        'MDM2': 'P23804',
+        'FEM1B': 'Q9Z2G0',
+    },
+    'Cricetulus griseus': {
+        'CRBN': 'Q96SW2', # <- It's safer to use the human one # 'G3ICB0', # G3ICB0_CRIGR
+    },
+    'Rattus norvegicus': {
+        'CRBN': 'Q56AP7',
+    },
+}
+
+
+ORGANISM_2_ID = {
+    'Homo sapiens': 9606,
+    'Mus musculus': 10090,
+    'Cricetulus griseus': 10029,
+    'Rattus norvegicus': 10116,
+}
+
+
 
 
 @lru_cache()
@@ -19,7 +73,8 @@ def fetch_uniprot_entry(uniprot_id: str) -> Optional[dict]:
         print(f"[UniProt] fetch failed for {uniprot_id}: {e}")
         return None
 
-def extract_protein_info(uniprot_id: str, skip_isoforms: bool = False) -> Optional[dict]:
+
+def fetch_protein_info(uniprot_id: str, skip_isoforms: bool = False) -> Optional[dict]:
     """ Extracts detailed information about a protein from UniProt.
         Fetch and filter the Uniprot JSON entries.
     
@@ -38,6 +93,8 @@ def extract_protein_info(uniprot_id: str, skip_isoforms: bool = False) -> Option
             - 'locations': List of subcellular locations.
             - 'natural_variants': List of natural variant sequences.
             - 'natural_variants_ids': List of IDs for the natural variants.
+            - 'gene_primary': Primary gene name (if available).
+            - 'primary_name': The first full name in the alternative names list, which is often the primary name of the protein (if available).
     """
     # Fetch the UniProt entry
     entry = fetch_uniprot_entry(uniprot_id)
@@ -51,12 +108,14 @@ def extract_protein_info(uniprot_id: str, skip_isoforms: bool = False) -> Option
         'secondary_accessions': entry.get('secondaryAccessions'),
         'sequence': entry.get('sequence', {}).get('value'),
         'organism': entry.get('organism', {}).get('scientificName'),
+        'gene_primary': entry.get('genes', [{}])[0].get('geneName', {}).get('value') if entry.get('genes') else None,
     }
 
     # Obtain full names and short names
     alternative_names = entry.get('proteinDescription', {}).get('alternativeNames', [])
     info['full_names'] = [n.get('fullName', {}).get('value', 'N/A') for n in alternative_names]
     info['short_names'] = [n.get('value', 'N/A') for an in alternative_names for n in an.get('shortNames', [])]
+    info['primary_name'] = info['full_names'][0] if info['full_names'] else None
 
     # Parse comments for isoforms and locations in cell
     info['isoforms'] = []
@@ -108,10 +167,128 @@ def extract_protein_info(uniprot_id: str, skip_isoforms: bool = False) -> Option
 
     # If isoforms are not skipped, fetch their details recursively
     # NOTE: Recursion is disabled within an isoform extraction.
-    info['isoforms'] = [extract_protein_info(iso_id, skip_isoforms=True) for iso_id in info['isoforms']]
+    info['isoforms'] = [fetch_protein_info(iso_id, skip_isoforms=True) for iso_id in info['isoforms']]
     info['isoforms'] = [iso for iso in info['isoforms'] if iso is not None]
     
     return info
+
+
+def fetch_protein_infos_batch(
+        uniprot_ids: list,
+        uniprot_dir: Path,
+        force_refetch: bool = False,
+        verbose: int = 0,
+) -> dict:
+    """ Fetch protein information for a batch of UniProt IDs.
+    
+    Args:
+        uniprot_ids (list): A list of UniProt IDs to fetch information for.
+        uniprot_dir (Path): The directory where UniProt JSON files are stored.
+        force_refetch (bool): If True, forces refetching the information even if a JSON file already exists. Default is False.
+        verbose (int): Verbosity level for logging progress. Default is 0 (no logging).
+        
+    Returns:
+        dict: A dictionary mapping each UniProt ID to its corresponding protein information.
+    """
+    uniprot2infos = {}
+    if verbose > 0:
+        uniprot_ids_iter = tqdm(uniprot_ids, desc="Fetching protein infos", unit="protein")
+    else:
+        uniprot_ids_iter = uniprot_ids
+    for uniprot_id in uniprot_ids_iter:
+        json_info = load_dict(uniprot_dir / f'{uniprot_id}.json')
+        if json_info and not force_refetch:
+            uniprot2infos[uniprot_id] = json_info
+            for isoform in json_info.get('isoforms', []):
+                uniprot2infos[isoform['accession']] = isoform
+        else:
+            info = fetch_protein_info(uniprot_id, skip_isoforms=False)
+            if info:
+                uniprot2infos[uniprot_id] = info
+                # Save each entry to a separate JSON file
+                save_dict(info, uniprot_dir / f'{uniprot_id}.json')
+                for isoform in info.get('isoforms', []):
+                    uniprot2infos[isoform['accession']] = isoform
+                    save_dict(isoform, uniprot_dir / f"{isoform['accession']}.json")
+    return uniprot2infos
+
+
+def _get_with_retry(
+        url: str, params: dict,
+        headers: Optional[dict] = None,
+        timeout: int = 60,
+        retries: int = 3,
+        backoff: float = 1.5,
+) -> requests.Response:
+    """ Helper function to perform a GET request with retries and exponential backoff. 
+    
+    Args:
+        url (str): The URL to send the GET request to.
+        params (dict): The query parameters to include in the request.
+        headers (dict, optional): Additional headers to include in the request. Defaults to None.
+        timeout (int, optional): The timeout for the request in seconds. Defaults to 60.
+        retries (int, optional): The number of retry attempts in case of failure. Defaults to 3.
+        backoff (float, optional): The backoff factor for exponential backoff between retries. Defaults to 1.5.
+        
+    Returns:
+        requests.Response: The response object from the successful GET request.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if r.status_code in (429, 500, 502, 503, 504):
+                # transient / rate-limit
+                time.sleep(backoff * (attempt + 1))
+                last_err = RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                continue
+            return r
+        except Exception as e:
+            last_err = e
+            time.sleep(backoff * (attempt + 1))
+    raise RuntimeError(f"Request failed after {retries} attempts: {last_err}")
+
+
+@lru_cache()
+def fetch_uniprot_for_gene(gene_symbol: str, organism: str = 'Homo sapiens') -> Optional[dict]:
+    """ Fetch Uniprot information based on provided gene name and organism.
+    
+    Args:
+        gene_symbol (str):
+        organism (str):
+
+    Returns:
+
+    """
+    organism_id = ORGANISM_2_ID.get(organism, ORGANISM_2_ID['Homo sapiens'])
+
+    url = "https://rest.uniprot.org/uniprotkb/search"
+    query = f"(gene_exact:{gene_symbol}) AND (organism_id:{organism_id}) AND (reviewed:true)"
+
+    r = _get_with_retry(
+        url,
+        params={
+            "query": query,
+            "format": "tsv",
+            "fields": "accession,gene_primary,protein_name",
+            "size": 5,
+        },
+        headers={"User-Agent": "protac-e3-normalize/1.0"},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"UniProt request failed: {r.status_code}\n{r.text[:500]}")
+
+    tab = pd.read_csv(StringIO(r.text), sep="\t")
+    if tab.empty:
+        return None
+
+    return {
+        "uniprot": tab.iloc[0, 0],
+        "gene_primary": tab.iloc[0, 1] if tab.shape[1] > 1 else None,
+        "protein_name": tab.iloc[0, 2] if tab.shape[1] > 2 else None,
+    }
+
 
 def clean_target(t: str) -> str:
     """ Clean the target string by removing special characters and extra spaces. """
@@ -213,6 +390,7 @@ def clean_target(t: str) -> str:
 
     return t
 
+
 def apply_mutation(
         seq: str,
         gene: str,
@@ -295,6 +473,7 @@ def apply_mutation(
 
     return seq
 
+
 def assign_missing_uniprot(
         row,
         df_name,
@@ -340,6 +519,7 @@ def update_e3ligase_uniprot(row, e3ligase2uniprot):
         return uniprot
     return current_uniprot
 
+
 def update_e3ligase_sequence(row, uniprot2infos):
     uniprot_id = row['E3 Ligase Uniprot']
     current_sequence = row['E3 Ligase Sequence']
@@ -352,6 +532,7 @@ def update_e3ligase_sequence(row, uniprot2infos):
         return info['sequence']
     return current_sequence
 
+
 def get_poi_species(uniprot, uniprot2infos):
     if pd.isna(uniprot):
         return None
@@ -360,6 +541,7 @@ def get_poi_species(uniprot, uniprot2infos):
         return infos['organism']
     return None
 
+
 def get_sequence_from_uniprot(uniprot_id, uniprot2infos):
     if pd.isnull(uniprot_id):
         return None
@@ -367,6 +549,7 @@ def get_sequence_from_uniprot(uniprot_id, uniprot2infos):
     if info is not None and 'sequence' in info:
         return info['sequence']
     return None
+
 
 def apply_mutation_to_sequence(row):
     uniprot = row['Uniprot']
@@ -383,6 +566,7 @@ def apply_mutation_to_sequence(row):
         print(f"Error applying mutation for {row['Uniprot']} with target '{target}': {e}")
         return seq
 
+
 def map_poi_uniprot_from_species(row, species2uniprot):
     uniprot = row['Uniprot']
     poi_species = row['Cell Species']
@@ -392,6 +576,7 @@ def map_poi_uniprot_from_species(row, species2uniprot):
         return species2uniprot[poi_species][uniprot]
     return uniprot
 
+
 def map_poi_sequence_from_uniprot(row, uniprot2infos):
     uniprot = row['Uniprot']
     seq = row['POI Sequence']
@@ -400,6 +585,7 @@ def map_poi_sequence_from_uniprot(row, uniprot2infos):
     if uniprot in uniprot2infos:
         return uniprot2infos[uniprot]['sequence']
     return seq
+
 
 def add_location(row, uniprot2locations: dict):
     """Add the location information to the row based on the Uniprot ID."""

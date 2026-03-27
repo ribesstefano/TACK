@@ -32,41 +32,62 @@ import logging
 import re
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 import pandas as pd
 import requests
-from rdkit import Chem
+from rdkit import Chem, RDLogger
+
 from rdkit.Chem.MolStandardize import rdMolStandardize
 
+RDLogger.DisableLog('rdApp.*')
 
 # =============================================================================
 # Chemistry
 # =============================================================================
 
-def canonicalize_smiles(smiles: str) -> Optional[str]:
-    """
-    Convert a SMILES string to its canonical form using RDKit.
-
-    Returns None if the input is missing or the SMILES cannot be parsed.
+def canonicalize_smiles(smiles: str, unique_inchikeys: Optional[Dict[str, Chem.Mol]] = None) -> Optional[str]:
+    """ Convert a SMILES string to its canonical form using RDKit.
+    
+    Args:
+        smiles (str): The input SMILES string to canonicalize.
+        unique_inchikeys (dict, optional): A dictionary to track unique InChI.
+            If provided, the function will return None for any molecule whose
+            InChIKey is already in the dictionary, effectively filtering out
+            duplicates. The dictionary is updated with new InChIKeys for unique
+            molecules.
+            
+    Returns:
+        str or None: The canonical SMILES string, or None if invalid or duplicate.
     """
     if pd.isna(smiles) or not smiles:
         return None
+
+    mol = Chem.MolFromSmiles(str(smiles), sanitize=False)
+    if mol is None:
+        return None
     try:
-        mol = Chem.MolFromSmiles(str(smiles))
-        if mol is not None:
-            # Keep only the largest fragment (i.e., remove salts)
-            lfg = rdMolStandardize.LargestFragmentChooser()
-            mol = lfg.choose(mol)
-
-            # Uncharge the molecule (i.e., remove formal charges)
-            uncharger = rdMolStandardize.Uncharger()
-            mol = uncharger.uncharge(mol)
-
-            return Chem.MolToSmiles(mol, canonical=True)
+        Chem.SanitizeMol(mol)
     except Exception:
-        pass
-    return None
+        return None
+
+    try:
+        # Keep only the largest fragment (i.e., remove salts)
+        mol = rdMolStandardize.FragmentParent(mol)
+        
+        # Uncharge the molecule (i.e., remove formal charges)
+        uncharger = rdMolStandardize.Uncharger()
+        mol = uncharger.uncharge(mol)
+
+        if unique_inchikeys is not None:
+            inchikey = Chem.MolToInchiKey(mol)
+            if inchikey in unique_inchikeys:
+                return None
+            unique_inchikeys[inchikey] = mol
+
+        return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+    except Exception:
+        return None
 
 
 # =============================================================================

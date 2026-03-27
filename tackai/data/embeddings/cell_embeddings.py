@@ -5,6 +5,7 @@ from typing import Optional, List, Union, Literal, Dict, Tuple
 import requests
 import logging
 import json
+from difflib import get_close_matches
 
 import numpy as np
 import torch
@@ -418,6 +419,17 @@ class CellEmbedding(EmbeddingMixin):
                     self.logger.debug(f"Using synonym '{closest_match}' for cell line '{cell_line}' with score {score}.")
                     return closest_synonym, score
             else:
+                matches = get_close_matches(cell_line, all_cell_lines + all_synonyms, n=1, cutoff=min_similarity_score/100)
+                if matches:
+                    closest_match = matches[0]
+                    if closest_match in self.cell2description:
+                        self.logger.debug(f"Using close match '{closest_match}' for cell line '{cell_line}' with score {score}.")
+                        return closest_match, score
+                    else:
+                        closest_synonym = self.synonym2cell_line.get(closest_match, closest_match)
+                        self.logger.debug(f"Using close synonym '{closest_match}' for cell line '{cell_line}' with score {score}.")
+                        return closest_synonym, score
+                
                 self.logger.debug(f"No suitable match found for cell line '{cell_line}' with minimum score {min_similarity_score}.")
                 return self.not_found_description, 0
         else:
