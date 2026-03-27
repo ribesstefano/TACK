@@ -3,11 +3,13 @@ import time
 import requests
 from pathlib import Path
 from io import StringIO
-from typing import Optional, Union, Literal
+from typing import Optional, Union, Literal, Tuple, List
 from functools import lru_cache
 
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
+from Bio.Align import PairwiseAligner, substitution_matrices
 
 from tack_dataset.protacdb.utils import save_dict, load_dict
 
@@ -57,8 +59,6 @@ ORGANISM_2_ID = {
     'Cricetulus griseus': 10029,
     'Rattus norvegicus': 10116,
 }
-
-
 
 
 @lru_cache()
@@ -173,46 +173,6 @@ def fetch_protein_info(uniprot_id: str, skip_isoforms: bool = False) -> Optional
     return info
 
 
-def fetch_protein_infos_batch(
-        uniprot_ids: list,
-        uniprot_dir: Path,
-        force_refetch: bool = False,
-        verbose: int = 0,
-) -> dict:
-    """ Fetch protein information for a batch of UniProt IDs.
-    
-    Args:
-        uniprot_ids (list): A list of UniProt IDs to fetch information for.
-        uniprot_dir (Path): The directory where UniProt JSON files are stored.
-        force_refetch (bool): If True, forces refetching the information even if a JSON file already exists. Default is False.
-        verbose (int): Verbosity level for logging progress. Default is 0 (no logging).
-        
-    Returns:
-        dict: A dictionary mapping each UniProt ID to its corresponding protein information.
-    """
-    uniprot2infos = {}
-    if verbose > 0:
-        uniprot_ids_iter = tqdm(uniprot_ids, desc="Fetching protein infos", unit="protein")
-    else:
-        uniprot_ids_iter = uniprot_ids
-    for uniprot_id in uniprot_ids_iter:
-        json_info = load_dict(uniprot_dir / f'{uniprot_id}.json')
-        if json_info and not force_refetch:
-            uniprot2infos[uniprot_id] = json_info
-            for isoform in json_info.get('isoforms', []):
-                uniprot2infos[isoform['accession']] = isoform
-        else:
-            info = fetch_protein_info(uniprot_id, skip_isoforms=False)
-            if info:
-                uniprot2infos[uniprot_id] = info
-                # Save each entry to a separate JSON file
-                save_dict(info, uniprot_dir / f'{uniprot_id}.json')
-                for isoform in info.get('isoforms', []):
-                    uniprot2infos[isoform['accession']] = isoform
-                    save_dict(isoform, uniprot_dir / f"{isoform['accession']}.json")
-    return uniprot2infos
-
-
 def _get_with_retry(
         url: str, params: dict,
         headers: Optional[dict] = None,
@@ -288,6 +248,287 @@ def fetch_uniprot_for_gene(gene_symbol: str, organism: str = 'Homo sapiens') -> 
         "gene_primary": tab.iloc[0, 1] if tab.shape[1] > 1 else None,
         "protein_name": tab.iloc[0, 2] if tab.shape[1] > 2 else None,
     }
+
+
+def apply_mutation(
+        seq: str,
+        gene: str,
+        on_error: Union[bool, Literal['raise', 'ignore']] = 'raise',
+        verbose: int = 0,
+) -> str:
+    """ Apply the mutation to the sequence, if possible.
+    
+    Args:
+        uniprot (str): The UniProt ID of the protein.
+        gene (str): The gene name or mutation description.
+        seq (str): The original protein sequence.
+        on_error (str): What to do on error ('raise' or 'ignore').
+        
+    Returns:
+        str: The mutated sequence if the mutation is valid, otherwise the original sequence.
+        
+    Raises:
+        ValueError: If the mutation cannot be applied and `on_error` is 'raise'.
+    """
+    # Check if both gene and sequence are not nan
+    if pd.isna(gene) or pd.isna(seq):
+        return seq
+
+    # Use regex to get all mutations in the gene string
+    if re.search(r'\b[A-Z]\d+[A-Z]\b', gene) or re.search(r'\bDEL', gene):
+        mutations = re.findall(r'\b[A-Z]\d+[A-Z]\b|\bDEL\d+\b', gene.upper())
+    else:
+        return seq
+
+    if verbose > 0:
+        print(f'Applying mutations: {mutations} to sequence: {seq} (length: {len(seq)})')
+
+    original_seq = seq
+    del_ops = 0
+    for op in mutations:
+        if 'del' in op.lower():
+            idx = int(op.lower().split('del')[1]) - 1
+            seq = seq[:idx] + seq[idx + 1:]
+            del_ops += 1
+        else:
+            # Replace aminoacid at a specific index
+            # NOTE: The indexing starts from one, not zero.
+            curr, idx, mutation = op[0].upper(), int(op[1:-1])-1, op[-1].upper()
+            # NOTE: If a deletion has happened before, the index is still
+            # relative to the whole sequence lenght (weird...)
+            idx -= del_ops
+            if verbose > 1:
+                print(f'Operation: {op} on ...{seq[idx-8:idx]}[{seq[idx]} -> {mutation}]{seq[idx+1:idx+8]}...')
+            if idx < 0 or idx >= len(seq):
+                msg = f'Index {idx} out of bounds for sequence of length {len(seq)}.'
+                if on_error == 'raise' or on_error is True:
+                    raise ValueError('ERROR. ' + msg)
+                else:
+                    if verbose > 0:
+                        print('WARNING. ' + msg + ' No mutation is applied.')
+                    return original_seq
+
+            if curr != seq[idx]:
+                msg = f'Replacement at position {idx} failed. Expected "{curr}", found: "{seq[idx]}".'
+                if on_error == 'raise' or on_error is True:
+                    raise ValueError('ERROR. ' + msg)
+                else:
+                    if verbose > 0:
+                        print('WARNING. ' + msg + ' No mutation is applied.')
+                    return original_seq
+            seq = seq[:idx] + mutation + seq[idx + 1:]
+
+    return seq
+
+
+def _sanitize_protein(
+    seq: str,
+    allowed: str,
+    *,
+    strip_gaps: bool = True,
+    strip_whitespace: bool = True,
+    drop_stops: bool = True,
+    map_rare_to_x: bool = True,
+    rare_map: dict = None,
+) -> str:
+    """Sanitize a protein sequence to be compatible with substitution matrix alphabet.
+    
+    This function cleans and standardizes protein sequences by removing unwanted
+    characters, mapping rare amino acids, and ensuring compatibility with
+    substitution matrices used in sequence alignment.
+    
+    Args:
+        seq: Input protein sequence string to sanitize
+        allowed: String containing allowed amino acid characters (e.g., from substitution matrix alphabet)
+        strip_gaps: If True, remove gap characters ('-') from sequence
+        strip_whitespace: If True, remove all whitespace characters
+        drop_stops: If True, remove stop codon symbols ('*')
+        map_rare_to_x: If True, map any character not in allowed alphabet to 'X'
+        rare_map: Optional dictionary for explicit character mapping before fallback-to-X
+                 (e.g., {'U': 'X', 'O': 'X'} for selenocysteine and pyrrolysine)
+    
+    Returns:
+        Sanitized protein sequence string compatible with the substitution matrix
+        
+    Raises:
+        ValueError: If map_rare_to_x=False and sequence contains characters not in allowed alphabet
+        
+    Example:
+        >>> allowed = "ARNDCQEGHILKMFPSTWYVBZX*"
+        >>> _sanitize_protein("MET-LYS U", allowed, rare_map={'U': 'X'})
+        'METKX'
+    """
+    # Handle None input gracefully
+    if seq is None:
+        return ""
+    
+    # Convert to uppercase string for standardization
+    s = str(seq).upper()
+    
+    # Remove whitespace characters (spaces, tabs, newlines)
+    if strip_whitespace:
+        s = re.sub(r"\s+", "", s)
+    
+    # Remove alignment gap characters
+    if strip_gaps:
+        s = s.replace("-", "")
+    
+    # Remove stop codon symbols (conservative approach for scoring)
+    if drop_stops:
+        s = s.replace("*", "")
+    
+    # Apply explicit character mappings for rare amino acids
+    # This allows controlled mapping before the general fallback-to-X
+    if rare_map:
+        for bad, good in rare_map.items():
+            s = s.replace(bad, good)
+    
+    # Handle characters not in the allowed alphabet
+    if map_rare_to_x:
+        # Replace any remaining non-standard characters with 'X' (unknown amino acid)
+        s = "".join(ch if ch in allowed else "X" for ch in s)
+    else:
+        # Strict mode: raise error if any disallowed characters remain
+        bad = {ch for ch in set(s) if ch not in allowed}
+        if bad:
+            raise ValueError(f"Sequence contains unsupported letters: {sorted(bad)}")
+    
+    return s
+
+
+def generate_normalized_alignment_matrix(
+    sequences: List[str],
+    *,
+    mode: Literal["global", "local"] = "local",
+    gap_open: float = -10.0,
+    gap_extend: float = -0.5,
+    matrix: str = "BLOSUM62",
+    clip: Tuple[float, float] = (0.0, 1.0),
+    return_distance: bool = False,
+    eps: float = 1e-12,
+    sanitize: bool = True,
+) -> np.ndarray:
+    """Generate a Normalized Alignment Score (NAS) matrix for protein sequences.
+
+    This function computes pairwise sequence similarity using normalized alignment scores,
+    where NAS(i,j) = S(i,j) / sqrt(S(i,i) * S(j,j)). This normalization makes the scores
+    comparable across sequences of different lengths and compositions.
+
+    - Uses BioPython's PairwiseAligner for sequence alignment scoring
+    - Self-scores S(i,i) are computed first to enable normalization
+    - Empty sequences receive zero self-score to avoid numerical issues
+    - Normalization formula: NAS(i,j) = S(i,j) / sqrt(S(i,i) * S(j,j) + eps)
+
+    Args:
+        sequences: List of protein sequences to compare
+        mode: Alignment mode - "local" (Smith-Waterman) for finding best matching regions,
+              or "global" (Needleman-Wunsch) for end-to-end alignment
+        gap_open: Penalty for opening a gap in the alignment (negative value)
+        gap_extend: Penalty for extending an existing gap (negative value, less severe than gap_open)
+        matrix: Name of substitution matrix to use (e.g., "BLOSUM62", "PAM250")
+        clip: Tuple of (min, max) values to clip the normalized scores to prevent extreme values
+        return_distance: If True, return distance matrix (1 - NAS) instead of similarity matrix
+        eps: Small epsilon value to prevent division by zero in normalization
+        sanitize: If True, clean sequences using _sanitize_protein function
+
+    Returns:
+        Symmetric matrix of normalized alignment scores (or distances if return_distance=True).
+        Shape: (n_sequences, n_sequences), dtype: float32
+        - Diagonal elements are 1.0 (perfect self-similarity)
+        - Off-diagonal elements range from clip[0] to clip[1]
+
+    Example:
+        >>> seqs = ["MKVLWAALLVTFLAGCQAKVEQAVETEPEPELRQQTEWQSGQRWELALGRFWDYLRWVQTLSEQVQEELLSSQVTQELRALMDETAQ"]
+        >>> matrix = generate_normalized_alignment_matrix(seqs, mode="global")
+        >>> logger.info(matrix.shape)  # (1, 1)
+        >>> logger.info(matrix[0, 0])  # 1.0 (perfect self-similarity)
+    """
+    n = len(sequences)
+    
+    # Handle edge case: empty input
+    if n == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    # Load substitution matrix and get allowed amino acid alphabet
+    subs = substitution_matrices.load(matrix)
+    allowed = subs.alphabet  # e.g., 'ARNDCQEGHILKMFPSTWYVBZX*' for BLOSUM62
+    
+    # Define mapping for rare/non-standard amino acids before fallback to 'X'
+    # U=Selenocysteine, O=Pyrrolysine, J=Leucine/Isoleucine ambiguity
+    rare_map = {"U": "X", "O": "X", "J": "X"}
+
+    # Sanitize all sequences for consistent processing
+    seqs = []
+    for s in sequences:
+        if sanitize:
+            # Clean sequence: remove gaps, whitespace, stops; map rare AAs to X
+            s = _sanitize_protein(
+                s, allowed,
+                strip_gaps=True, 
+                strip_whitespace=True, 
+                drop_stops=True,
+                map_rare_to_x=True, 
+                rare_map=rare_map
+            )
+        else:
+            # Use sequence as-is, but handle None values
+            s = s or ""
+        seqs.append(s)
+
+    # Configure pairwise sequence aligner
+    aligner = PairwiseAligner()
+    aligner.substitution_matrix = subs
+    aligner.mode = mode  # "local" (Smith–Waterman) or "global" (Needleman–Wunsch)
+    aligner.open_gap_score = gap_open    # Penalty for starting a gap
+    aligner.extend_gap_score = gap_extend # Penalty for extending a gap
+
+    # Step 1: Compute self-alignment scores for normalization
+    # S(i,i) represents the maximum possible score for sequence i
+    self_scores = np.empty(n, dtype=np.float64)
+    for i, s in tqdm(enumerate(seqs), total=n, desc="Computing self-alignment scores"):
+        if s:  # Non-empty sequence
+            # Self-alignment score, clipped to non-negative to handle gap penalties
+            self_scores[i] = max(aligner.score(s, s), 0.0)
+        else:  # Empty sequence
+            self_scores[i] = 0.0
+
+    # Step 2: Compute pairwise Normalized Alignment Scores
+    # Initialize with identity matrix (diagonal = 1.0 for perfect self-similarity)
+    nas = np.eye(n, dtype=np.float64)
+    
+    # Fill upper triangle, then mirror to lower triangle for symmetry
+    for i in tqdm(range(n), total=n, desc="Computing pairwise NAS"):
+        si = seqs[i]
+        for j in range(i + 1, n):
+            sj = seqs[j]
+            
+            # Compute raw alignment score S(i,j)
+            if si and sj:  # Both sequences non-empty
+                sij = aligner.score(si, sj)
+            else:  # At least one sequence is empty
+                sij = 0.0
+            
+            # Normalize: NAS(i,j) = S(i,j) / sqrt(S(i,i) * S(j,j))
+            # Add epsilon to denominator to prevent division by zero
+            denom = (self_scores[i] * self_scores[j]) ** 0.5 + eps
+            val = sij / denom
+            
+            # Apply clipping to prevent extreme values
+            if clip is not None:
+                lo, hi = clip
+                if val < lo: 
+                    val = lo
+                elif val > hi: 
+                    val = hi
+            
+            # Fill both symmetric positions
+            nas[i, j] = nas[j, i] = val
+
+    # Return distance matrix (1 - similarity) or similarity matrix
+    if return_distance:
+        return (1.0 - nas).astype(np.float32)
+    else:
+        return nas.astype(np.float32)
 
 
 def clean_target(t: str) -> str:
@@ -389,89 +630,6 @@ def clean_target(t: str) -> str:
         return corner_cases[t]
 
     return t
-
-
-def apply_mutation(
-        seq: str,
-        gene: str,
-        on_error: Union[bool, Literal['raise', 'ignore']] = 'raise',
-        verbose: int = 0,
-) -> str:
-    """ Apply the mutation to the sequence, if possible.
-    
-    Args:
-        uniprot (str): The UniProt ID of the protein.
-        gene (str): The gene name or mutation description.
-        seq (str): The original protein sequence.
-        on_error (str): What to do on error ('raise' or 'ignore').
-        
-    Returns:
-        str: The mutated sequence if the mutation is valid, otherwise the original sequence.
-        
-    Raises:
-        ValueError: If the mutation cannot be applied and `on_error` is 'raise'.
-    """
-    # Check if both gene and sequence are not nan
-    if pd.isna(gene) or pd.isna(seq):
-        return seq
-
-    # # TODO: Just use a dictionary and replace these sequences straightaway...
-    # uniprot_exceptions = {
-    #     ('O60885', 'BRD4 BD1'): uniprot2sequence['O60885'],
-    #     ('P25440', 'BRD2 BD2'): uniprot2sequence['P25440'],
-    #     ('P10275', 'AR-V7'): uniprot2sequence['P10275'],
-    #     # TODO: Not working... why???
-    #     ('P00533', 'EGFR e19d'): uniprot2sequence['P10275'],
-    # }
-    # # Handle exceptions
-    # if (uniprot, gene) in uniprot_exceptions:
-    #     return uniprot_exceptions[(uniprot, gene)]
-
-    # Use regex to get all mutations in the gene string
-    if re.search(r'\b[A-Z]\d+[A-Z]\b', gene) or re.search(r'\bDEL', gene):
-        mutations = re.findall(r'\b[A-Z]\d+[A-Z]\b|\bDEL\d+\b', gene.upper())
-    else:
-        return seq
-
-    if verbose > 0:
-        print(f'Applying mutations: {mutations} to sequence: {seq} (length: {len(seq)})')
-
-    original_seq = seq
-    del_ops = 0
-    for op in mutations:
-        if 'del' in op.lower():
-            idx = int(op.lower().split('del')[1]) - 1
-            seq = seq[:idx] + seq[idx + 1:]
-            del_ops += 1
-        else:
-            # Replace aminoacid at a specific index
-            # NOTE: The indexing starts from one, not zero.
-            curr, idx, mutation = op[0].upper(), int(op[1:-1])-1, op[-1].upper()
-            # NOTE: If a deletion has happened before, the index is still
-            # relative to the whole sequence lenght (weird...)
-            idx -= del_ops
-            if verbose > 1:
-                print(f'Operation: {op} on ...{seq[idx-8:idx]}[{seq[idx]} -> {mutation}]{seq[idx+1:idx+8]}...')
-            if idx < 0 or idx >= len(seq):
-                msg = f'Index {idx} out of bounds for sequence of length {len(seq)}.'
-                if on_error == 'raise' or on_error is True:
-                    raise ValueError('ERROR. ' + msg)
-                else:
-                    if verbose > 0:
-                        print('WARNING. ' + msg + ' No mutation is applied.')
-                    return original_seq
-
-            if curr != seq[idx]:
-                msg = f'Replacement at position {idx} failed. Expected "{curr}", found: "{seq[idx]}".'
-                if on_error == 'raise' or on_error is True:
-                    raise ValueError('ERROR. ' + msg)
-                else:
-                    if verbose > 0:
-                        print('WARNING. ' + msg + ' No mutation is applied.')
-                    return original_seq
-            seq = seq[:idx] + mutation + seq[idx + 1:]
-
-    return seq
 
 
 def assign_missing_uniprot(

@@ -25,9 +25,9 @@ from tack_dataset.protacdb.assay_cleaning import (
     extract_protac2target_ic50,
     extract_degradation_information,
 )
-from tack_dataset.protacdb.protein_utils import (
+from tack_dataset.protein_utils import (
     map_poi_sequence_from_uniprot,
-    extract_protein_info,
+    fetch_protein_info,
     clean_target,
     assign_missing_uniprot,
     update_e3ligase_uniprot,
@@ -36,11 +36,13 @@ from tack_dataset.protacdb.protein_utils import (
     get_sequence_from_uniprot,
     apply_mutation_to_sequence,
     map_poi_uniprot_from_species,
+    E3_TO_ORGANISM_TO_UNIPROT,
+    fetch_protein_infos_batch,
 )
-from tack_dataset.protacdb.cell_utils import (
-    standardize_cell_line,
+from tack_dataset.cell_utils import (
+    standardize_cell_line_protacdb,
     get_cell_species,
-    get_manual_cell_mapping,
+    log_manual_cell_mapping,
 )
 from tack_dataset.protacdb.utils import (
     save_dict,
@@ -68,7 +70,6 @@ def main():
 
     targets_w_no_uniprot_mapping = {}
     target2uniprots = {}
-    e3ligase2uniprot = {}
     uniprot2infos = {}
     species2uniprot = {}
     uniprot2locations = {}
@@ -109,7 +110,8 @@ def main():
     # ## Canonize SMILES
     # ==========================================================================
     protacdb_df = protacdb_df.rename(columns={'E3 ligase': 'E3 Ligase'})
-    protacdb_df['Smiles'] = protacdb_df['Smiles'].map(canonicalize_smiles)
+    protacdb_df['Smiles'] = protacdb_df['Smiles'].apply(canonicalize_smiles)
+    protacdb_df = protacdb_df.dropna(subset=['Smiles']).reset_index(drop=True)
 
     # ==========================================================================
     # ## Define Assay-Related Columns
@@ -590,27 +592,21 @@ def main():
     e3_uniprots = list(set(e3_uniprots))
 
     uniprot2infos = {}
-    for uniprot_id in tqdm(uniprots, desc='Fetching UniProt entries'):
-        json_info = load_dict(os.path.join(uniprot_dir, f'{uniprot_id}.json'))
+    for uniprot_id in tqdm(uniprots + e3_uniprots, desc='Fetching UniProt entries'):
+        json_info = load_dict(uniprot_dir / f'{uniprot_id}.json')
         if json_info:
             uniprot2infos[uniprot_id] = json_info
+            for isoform in json_info.get('isoforms', []):
+                uniprot2infos[isoform['accession']] = isoform
         else:
-            info = extract_protein_info(uniprot_id)
+            info = fetch_protein_info(uniprot_id, skip_isoforms=False)
             if info:
                 uniprot2infos[uniprot_id] = info
                 # Save each entry to a separate JSON file
-                save_dict(info, os.path.join(uniprot_dir, f'{uniprot_id}.json'))
-
-    for e3_uniprot_id in tqdm(e3_uniprots, desc='Fetching E3 ligase UniProt entries'):
-        json_info = load_dict(os.path.join(uniprot_dir, f'{e3_uniprot_id}.json'))
-        if json_info:
-            uniprot2infos[e3_uniprot_id] = json_info
-        else:
-            info = extract_protein_info(e3_uniprot_id)
-            if info:
-                uniprot2infos[e3_uniprot_id] = info
-                # Save each entry to a separate JSON file
-                save_dict(info, os.path.join(uniprot_dir, f'{e3_uniprot_id}.json'))
+                save_dict(info, uniprot_dir / f'{uniprot_id}.json')
+                for isoform in info.get('isoforms', []):
+                    uniprot2infos[isoform['accession']] = isoform
+                    save_dict(isoform, uniprot_dir / f"{isoform['accession']}.json")
 
     # Collect all the full names and short names from the UniProt entries and
     # map them to their Uniprot IDs
@@ -619,7 +615,8 @@ def main():
     for uniprot_id, info in uniprot2infos.items():
         full_names = info.get('full_names', [])
         short_names = info.get('short_names', [])
-        names = full_names + short_names
+        genes = [info['gene_primary']] if 'gene_primary' in info else []
+        names = full_names + short_names + genes
         if names:
             uniprot2names[uniprot_id] = names
             for name in names:
@@ -797,7 +794,7 @@ def main():
         if json_info and not args.force_refetch:
             uniprot2infos[uniprot_id] = json_info
         else:
-            info = extract_protein_info(uniprot_id)
+            info = fetch_protein_info(uniprot_id)
             if info:
                 uniprot2infos[uniprot_id] = info
                 # Save each entry to a separate JSON file
@@ -850,8 +847,18 @@ def main():
         logger.info(f'  - {target}')
 
     assert len(missing_target2uniprots) == 0, "There are still targets with missing Uniprot IDs."
+    
+    # ==========================================================================
+    # Assign 'BRD4 LONG' and 'BRD4 SHORT' to different Uniprot IDs, as isoforms
+    # ==========================================================================
+    brd4_long_uniprot = 'O60885-1'
+    brd4_short_uniprot = 'O60885-2'
+    for df_name, df in df_dict.items():
+        df['Uniprot'] = df.apply(lambda row: brd4_long_uniprot if row['Target'] == 'BRD4 LONG' else (brd4_short_uniprot if row['Target'] == 'BRD4 SHORT' else row['Uniprot']), axis=1)
 
+    # ==========================================================================
     # ### Add a 'POI Sequence' and a 'E3 Ligase Sequence' Columns 
+    # ==========================================================================
     for df_name, df in df_dict.items():
         # Add 'POI Sequence' column using the 'Uniprot' column
         df['POI Sequence'] = df['Uniprot'].apply(lambda row: get_sequence_from_uniprot(row, uniprot2infos))
@@ -895,96 +902,8 @@ def main():
         celltype2dois[cell] = sorted(dois)
     logger.debug(f'Number of unique cell types with DOIs: {len(celltype2dois):,}')
 
-    # --------------------------------------------------------------------------
-    # Based on fuzzy matches, and after checking the referenced DOIs, we
-    # manually standardized the cell names by mapping them to entries in the
-    # Cellosaurus database.
-    # --------------------------------------------------------------------------
-    # NOTE: "Primary" refers to cells taken from patients, so they are not a
-    # single cell line, but rather a mix of cells (think about a tissue)
-    manual_cell_lines = {
-        '22Rv1 prostate cancer': '22Rv1', # 22Rv1 prostate cancer cell line
-        '231MFP': 'MDA-MB-231',
-        'A152T neurons': 'Sporadic FTD iPSC #9', # Mutations in the gene encoding tau (MAPT) in neurons
-        'A549 lung cancer': 'A-549',
-        'BMDM': 'Bone marrow macrophage immortalized BALB/c', # Bone Marrow Derived Macrophages
-        'BaF3 FLT3-ITD': 'Ba/F3 FLT3-ITD [KYinno]',
-        'DA-MB-231': 'MDA-MB-231',
-        'EGFR': 'Bone marrow macrophage immortalized BALB/c', # Modified BMDM cell line with EGFR/TAM overexpression: 10.3389/fimmu.2023.1135373
-        'ER-positive breast cancer cell lines': 'MCF-7', # And T-47D
-        'H1650R': 'H1650', # H1650 with multiple radiation applied, not available in Cellosaurus, reported in: 10.1016/j.bmc.2022.117115
-        'H293T': 'HL-60', # HL-60 leukemia cells, as reported in 10.1021/acs.jmedchem.2c01659
-        'HAP 1': 'HAP1',
-        'HBL-1': 'HBL1',
-        'HEK293-hTau': 'HEK293-H',
-        'HT-1080 fibrosarcoma': 'HT-1080',
-        'Hep3B2 1-7': 'Hep 3B2.1-7',
-        'IL2 PBMC': 'PBMC iPSC #1', # interleukin 2 (IL2) peripheral blood mononuclear cell (PBMC)
-        'IgE MM': 'U266B1', # IgE multiple myeloma cell line
-        'KU812 CML': 'Ku812', # chronic myelogenous leukemia (CML)
-        'L-O2': 'LO2', # Human normal liver cell line
-        'LnCaP95': 'LNCaP95',
-        'MB-MDA-231': 'MDA-MB-231',
-        'MDA-Pca-2b': 'MDA-PCa-2b',
-        'MEK1': 'A-549', # MEK1/2 is the target, according to: 10.1021/acsmedchemlett.2c00446
-        'MM.1 S': 'MM.1S',
-        'MM.1S wild-type (WT)': 'MM.1S',
-        'MPro-eGFP stable': '293T', # 293T cells that stably express M^Pro-eGFP, from: 10.1101/2023.09.29.560163
-        'MV4; 11': 'MV4-11',
-        'MV4;11': 'MV4-11',
-        'Molm-16': 'MOLM-16',
-        'Molm-13': 'MOLM-13',
-        'Mouse 4935': 'FO [Mouse myeloma]', # Found in supplementary information of: 10.1021/acsmedchemlett.0c00046, "Mouse 4935 cells was generated by Dr. Jing Zhang’s lab (University of Wisconsin-Madison). 4935 cell line was established from a VkMYC; NrasQ61R/+ mouse which developed an aggressive multiple myeloma."
-        'OCI-ly10': 'OCI-Ly10',
-        'PBMC': 'PBMC iPSC #1',
-        'hPBMC': 'PBMC iPSC #1', # Human
-        'PBMC cells': 'PBMC iPSC #1',
-        'PC3-S1': 'PC3-STEAP-1',
-        'PDX SJBALL020589': 'ALL-1', # PDX (Patient-derived xenograft), but they specify ALL cell in: 10.1021/acsmedchemlett.1c00650
-        'Primary Cardiomyocytes': 'C2C12', # They also report using HeLa cells in: 10.1038/s41589-019-0379-2
-        'RPMI-8826': 'RPMI-8226', # It's a typo, they use RPMI-8226 in: 10.1021/acs.jmedchem.2c01817
-        'RS4; 11': 'RS4;11',
-        'SRD15': 'SRD-15',
-        'Sk-Mel-28': 'SK-MEL-28',
-        'T-cell': 'Jurkat',
-        'TAM': 'EO771', # The authors in 10.3389/fimmu.2023.1135373 also employ engineered EGFR-TAM chimeric reporter cell lines and primary bone-marrow-derived macrophages for selectivity and mechanistic assays, but EO771 is the only bona-fide established cell line used to assess PROTAC efficacy.
-        'TAM chimeric': 'EO771', # The authors in 10.3389/fimmu.2023.1135373 also employ engineered EGFR-TAM chimeric reporter cell lines and primary bone-marrow-derived macrophages for selectivity and mechanistic assays, but EO771 is the only bona-fide established cell line used to assess PROTAC efficacy.
-        'Taxol': 'A549-Taxol',
-        'VCaP AR+': 'VCaP', # VCaP prostate cancer cell line with AR overexpression
-        'XLA': 'Ba/F3 BTK C481S', # XLA (X-linked agammaglobulinemia) is a condition caused by a mutation in the BTK gene: 10.1021/acs.biochem.8b00391
-        'germ': 'SCIT-C8', # Primary germ cells, also known as primordial germ cells (PGCs), are the precursor cells to sperm and eggs (gametes)
-        'human dermal papilla': 'HaCaT', # They both tested the PROTAC on 'HaCaT' and 'HSA-S4' in: 10.1002/smtd.202201293
-        'platelets': 'MOLT-4',
-        'primary Sertoli': 'human Sertoli 1',
-        'Jeko-1 (7 days)': 'Jeko-1',
-        'Mino (7 days)': 'Mino',
-        'MM.1S (7 days)': 'MM.1S',
-        'melanoma A375': 'A-375', # A375 melanoma cell line
-        'LPS-Induced RAW264.7': 'RAW264.7', # Lipopolysaccharide (LPS)-induced RAW264.7 macrophages
-        'class IIa Jurkat': 'Jurkat',
-        'T-cell leukemia Jurkat': 'Jurkat',
-        'MV4-11 (WDR5-HiBiT)': 'MV4-11',
-        'Kelly cells 16 h treatment': 'Kelly',
-        'EOL-1 cells 4 h treatment': 'EOL-1',
-        'MEFs': 'MEF',
-        'Hep3B2.1-7': 'Hep 3B2.1-7',
-        'KU182': 'Ku812',
-        'HepG-2': 'Hep-G2',
-        'CCK-8': 'CCK-81',
-        'TRIM37-amplified MCF-7 breast cancer': 'MCF-7',
-        'Kasumi': 'Kasumi-1',
-        'TNFalpha': 'THP-1', # Checked the publication: https://pubs.acs.org/doi/10.1021/acs.jmedchem.1c01118
-        'ALL': 'ALL-1', # Replace ALL (a fish cell line) with ALL-1 (a human cell line), see: https://pubs.acs.org/doi/10.1021/acsmedchemlett.3c00082
-        'C481S BTK': 'BTK C481S',
-    }
-
     # If we wanna see them in a more readable format, together with their publications, we can do:
-    tmp = []
-    for df_name, df in df_dict.items():
-        tmp.append(df.apply(lambda row: get_manual_cell_mapping(row, manual_cell_lines), axis=1).dropna())
-
-    tmp = pd.concat(tmp, axis=0).drop_duplicates().reset_index(drop=True)
-    logger.info('Manually curated cell lines:\n' + str(tmp.to_markdown()))
+    # log_manual_cell_mapping(df_dict, logger)
 
     # Define the CellEmbedding class, which downloads and processes the
     # CelloSaurus database to get cell lines and their synonyms.
@@ -995,7 +914,7 @@ def main():
         logger.debug('--' * 40)
         logger.debug(f"Standardizing cell lines in {df_name}...")
         logger.debug('--' * 40)
-        df_dict[df_name] = df.apply(lambda row: standardize_cell_line(row, cell_embedding, manual_cell_lines, logger), axis=1)
+        df_dict[df_name] = df.apply(lambda row: standardize_cell_line_protacdb(row, cell_embedding, logger=logger), axis=1)
         logger.debug(df_dict[df_name].head(3))
 
     # ==========================================================================
@@ -1008,46 +927,8 @@ def main():
             logger.debug(df['Cell Species'].unique())
 
     # ### Modify E3 Ligase Based on Species
-    e3ligase2uniprot = {
-        'Homo sapiens': {
-            'VHL': 'P40337',
-            'CRBN': 'Q96SW2',
-            'DCAF1': 'Q9Y4B6',
-            'DCAF11': 'Q8TEB1',
-            'DCAF15': 'Q66K64',
-            'DCAF16': 'Q9NXF7',
-            'MDM2': 'Q00987',
-            'XIAP': 'P98170',
-            'IAP': 'P98170', # IAP is too generic, so we set it to XIAP instead
-            'cIAP1': 'Q13490', # BIRC2_HUMAN
-            'AhR': 'P35869',
-            'RNF4': 'P78317',
-            'RNF114': 'Q9Y508',
-            'FEM1B': 'Q9UK73',
-            'UBR1': 'Q8IWV7',
-            'UBR box': 'G3V2G3', # We associate the UBR box with the UBR7 gene
-            'KLHL20': 'Q9Y2M5',
-            'KLHDC2': 'Q9Y2U9',
-            'FBXO22': 'Q8NEZ5',
-            'KEAP1': 'Q14145',
-        },
-        'Mus musculus': {
-            'CRBN': 'Q8C7D2',
-            'VHL': 'P40338',
-            'cIAP1': 'Q62210', # BIRC2_MOUSE
-            'MDM2': 'P23804',
-            'FEM1B': 'Q9Z2G0',
-        },
-        'Cricetulus griseus': {
-            'CRBN': 'Q96SW2', # <- It's safer to use the human one # 'G3ICB0', # G3ICB0_CRIGR
-        },
-        'Rattus norvegicus': {
-            'CRBN': 'Q56AP7',
-        },
-    }
-
     uniprots = set()
-    for _, old2new in e3ligase2uniprot.items():
+    for _, old2new in E3_TO_ORGANISM_TO_UNIPROT.items():
         for _, new in old2new.items():
             uniprots.add(new)
 
@@ -1057,7 +938,7 @@ def main():
         if json_info:
             uniprot2infos[uniprot_id] = json_info
         else:
-            info = extract_protein_info(uniprot_id)
+            info = fetch_protein_info(uniprot_id)
             if info:
                 uniprot2infos[uniprot_id] = info
                 # Save each entry to a separate JSON file
@@ -1070,7 +951,7 @@ def main():
             continue
         logger.info(f"Dataframe: {df_name}")
         tqdm.pandas(desc='Updating E3 Ligase Uniprot')
-        df['E3 Ligase Uniprot'] = df.progress_apply(lambda row: update_e3ligase_uniprot(row, e3ligase2uniprot), axis=1)
+        df['E3 Ligase Uniprot'] = df.progress_apply(lambda row: update_e3ligase_uniprot(row, E3_TO_ORGANISM_TO_UNIPROT), axis=1)
 
         tqdm.pandas(desc='Updating E3 Ligase Sequence')
         df['E3 Ligase Sequence'] = df.progress_apply(lambda row: update_e3ligase_sequence(row, uniprot2infos), axis=1)
@@ -1182,7 +1063,7 @@ def main():
         if json_info:
             uniprot2infos[uniprot_id] = json_info
         else:
-            info = extract_protein_info(uniprot_id)
+            info = fetch_protein_info(uniprot_id)
             if info:
                 uniprot2infos[uniprot_id] = info
                 # Save each entry to a separate JSON file

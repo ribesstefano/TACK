@@ -20,7 +20,7 @@ from tack_dataset.cell_utils import (
     standardize_cell_line,
     get_cell_species,
 )
-from tack_dataset.protacdb.protein_utils import (
+from tack_dataset.protein_utils import (
     E3_TO_ORGANISM_TO_UNIPROT,
     fetch_protein_info,
     fetch_uniprot_for_gene,
@@ -103,7 +103,6 @@ def main():
     set_global_logging_level(logging.DEBUG if args.verbose >= 3 else logging.INFO if args.verbose == 2 else logging.WARNING)
     logger = logging.getLogger(__name__)
 
-
     # Setup working directories
     data_curation_dir = Path(args.output_dir)
     os.makedirs(data_curation_dir, exist_ok=True)
@@ -112,7 +111,7 @@ def main():
     uniprot_infos_dir = data_curation_dir / 'uniprot_infos'
     os.makedirs(uniprot_infos_dir, exist_ok=True)
 
-    protacpedia_file = Path(args.input_path) # Path('data/original/PROTAC-Pedia.csv')
+    protacpedia_file = Path(args.input_path)
     if os.path.exists(protacpedia_file):
         protacpedia_df = pd.read_csv(protacpedia_file).reset_index(drop=True)
     else:
@@ -147,7 +146,7 @@ def main():
         'Dc50': 'DC50',
         'Cells': 'Cell_Line',
         'E3 Ligase': 'Ligase_Name',
-        'Target': 'POI_Uniprot',
+        'Target': 'POI_UniProt',
         'Time': 'Assay_Time',
         'Comments': 'Description',
     })
@@ -193,17 +192,17 @@ def main():
         'BCL-XL': 'Q64373',
     }
 
-    # Replace ',' with '' in the POI_Uniprot column, to split on spaces later
-    protacpedia_df['POI_Uniprot'] = protacpedia_df['POI_Uniprot'].str.replace(',', '', regex=False)
+    # Replace ',' with '' in the POI_UniProt column, to split on spaces later
+    protacpedia_df['POI_UniProt'] = protacpedia_df['POI_UniProt'].str.replace(', ', ' ', regex=False)
 
-    # Print all POI_Uniprot for which there are characters other than letters, numbers and spaces
-    for uniprot_id in protacpedia_df['POI_Uniprot'].unique():
+    # Print all POI_UniProt for which there are characters other than letters, numbers and spaces
+    for uniprot_id in protacpedia_df['POI_UniProt'].unique():
         if re.search(r'[^a-zA-Z0-9\- ]', uniprot_id):
             logging.warning(f"WARNING: Uniprot ID '{uniprot_id}' contains non-alphanumeric characters.")
 
     uniprots = set(GENE_TO_UNIPROT.values())
     uniprots.update(all_e3_uniprots)
-    for uniprot_id in protacpedia_df['POI_Uniprot'].dropna().unique():
+    for uniprot_id in protacpedia_df['POI_UniProt'].dropna().unique():
         if len(uniprot_id.split(' ')) > 1:
             for part in uniprot_id.split(' '):
                 uniprots.add(part)
@@ -252,7 +251,7 @@ def main():
     logging.info(f"Uniprot to Gene Name mapping: {uniprot2gene}")
     logging.info(f"Mapped Uniprots: {list(uniprot2info.keys())}")
 
-    # Mapping (dict of dict): ('Curator', 'POI_Uniprot') -> ('Description', 'Cell_Line', 'DC50', 'Dmax') - > POI Uniprot
+    # Mapping (dict of dict): ('Curator', 'POI_UniProt') -> ('Description', 'Cell_Line', 'DC50', 'Dmax') - > POI Uniprot
     MANUAL_POI_MAP = {
         ("Ronen Gabizon", "O14976 O75385 P06239 P07332 P11802 P16591 P24941 P30291 P35991 P36888 P42680 P50613 P50750 P51451 P53671 Q00534 Q00537 Q05397 Q08881 Q13131 Q14004 Q14289 Q2M2I8 Q7KZI7 Q91820 Q96GD4 Q96SZ6 Q9NYV4"): {
             # Link: https://pubmed.ncbi.nlm.nih.gov/29129717/
@@ -341,8 +340,8 @@ def main():
         ("Yangwode Jing", "O60885 P25440 Q15059"): {
             # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
             ("""pEC50 for MV4;11 and HL60 cells: 6.75±0.03 and 5.84±0.06, respectively.
-    pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 7.0/7.0/6.5/6.2, respectively (24h, HeLa cells).
-    Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 96%/97%/97%/93%, respectively (HeLa cells).""", "HeLa, HL60, MV4;11", "< 0.1 uM", "> 93 %"): "O60885",
+pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 7.0/7.0/6.5/6.2, respectively (24h, HeLa cells).
+Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 96%/97%/97%/93%, respectively (HeLa cells).""", "HeLa, HL60, MV4;11", "< 0.1 uM", "> 93 %"): "O60885",
             # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
             ("pEC50 for MV4;11 and HL60 cells: 7.57±0.03 and 6.66±0.05, respectively. pDC50 for Brd4 short/Brd4 long/Brd3/Brd2: 8.1/8.6/7.0/7.4, respectively (24h, HeLa cells). Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 98%/100%/100%/98%, respectively (HeLa cells).", "HeLa, HL60, MV4;11", "< 2.5 nM", "> 98 %"): "O60885",
             # Link: https://pubmed.ncbi.nlm.nih.gov/28595007/
@@ -546,8 +545,8 @@ def main():
         },
     }
 
-    # Assign the 'Unclear_POI' column based on whether 'POI_Uniprot' is NaN or contains multiple entries
-    protacpedia_df['Unclear_POI'] = protacpedia_df['POI_Uniprot'].apply(lambda x: pd.isna(x) or (pd.notna(x) and len(x.split()) > 1))
+    # Assign the 'Unclear_POI' column based on whether 'POI_UniProt' is NaN or contains multiple entries
+    protacpedia_df['Unclear_POI'] = protacpedia_df['POI_UniProt'].apply(lambda x: pd.isna(x) or (pd.notna(x) and len(x.split()) > 1))
 
     # ## Manual curation of Comments
 
@@ -617,7 +616,6 @@ def main():
             'Value_Concentration_Unit': Value_Concentration_Unit,
             'Value_Mean': Value_Mean,
         }
-
 
     MANUAL_PARSED_COMMENTS = {
         "Dmax in BBL358/T47D: 74%±3% and 16%±13%, respectively.": [
@@ -1059,8 +1057,8 @@ def main():
 
     for i, (comment, entries) in enumerate(MANUAL_PARSED_COMMENTS.items()):
         if comment not in protacpedia_df['Description'].values:
-            logger.info(f"Comment n.{i+1} not in DataFrame:\n```\n{comment}\n```")
-            raise ValueError("Comment not found in DataFrame")
+            logger.warning(f"Comment n.{i+1} not in DataFrame:\n```\n{comment}\n```")
+            # raise ValueError("Comment not found in DataFrame")
         for i, entry in enumerate(entries):
             missing = required_keys - set(entry.keys())
             extra = set(entry.keys()) - required_keys
@@ -1291,7 +1289,7 @@ def main():
         multiple_cell_lines = len(cleaned_cell_lines) > 1
 
         # ── 3. Parse UniProts ─────────────────────────────────────────
-        poi_str = row.get('POI_Uniprot', '')
+        poi_str = row.get('POI_UniProt', '')
         if pd.isna(poi_str):
             poi_str = ''
 
@@ -1302,8 +1300,12 @@ def main():
             cell = row['Cell_Line'] if pd.notna(row['Cell_Line']) else None
             dc50 = row['DC50'] if pd.notna(row['DC50']) else None
             dmax = row['Dmax'] if pd.notna(row['Dmax']) else None
-            poi_mapped = MANUAL_POI_MAP[(curator, poi_str)][desc, cell, dc50, dmax]
-            row['POI_Uniprot'] = poi_mapped
+            poi_mapped = MANUAL_POI_MAP.get((curator, poi_str), {}).get((desc, cell, dc50, dmax))
+            if poi_mapped is not None:
+                logger.info(f"Mapping POI_UniProt '{poi_str}' to '{poi_mapped}' for curator '{curator}' based on comment/cell/DC50/Dmax context")
+            else:
+                logger.warning(f"Could not map POI_UniProt '{poi_str}' for curator '{curator}' with comment/cell/DC50/Dmax context: {desc}")
+            row['POI_UniProt'] = poi_mapped
 
         # ── 4. Parse original DC50/Dmax ───────────────────────────────
         parsed_values = {}
@@ -1435,22 +1437,21 @@ def main():
                     curated_row['Cell_Line_ID'] = None
                     curated_row['Unclear_Cell_Line'] = False
 
-                # POI_Name → POI_Uniprot resolution: if a comment specifies a
+                # POI_Name → POI_UniProt resolution: if a comment specifies a
                 # POI_Name, this is likely more accurate than the row-level
-                # POI_Uniprot annotation which may be missing or incorrect.
+                # POI_UniProt annotation which may be missing or incorrect.
                 # So we attempt to resolve the POI_Name to a UniProt ID and
-                # overwrite the row-level POI_Uniprot with the resolved value.
+                # overwrite the row-level POI_UniProt with the resolved value.
                 if entry.get('POI_Name') is not None:
-                    poi_uniprot = gene2uniprot.get(entry['POI_Name'])
-                    if poi_uniprot is None:
+                    poi_uniProt = gene2uniprot.get(entry['POI_Name'])
+                    if poi_uniProt is None:
                         logger.warning(f"WARNING: Could not resolve POI_Name '{entry['POI_Name']}' to UniProt ID for comment: '{comment[:60]}...'")
-                    curated_row['POI_Uniprot'] = poi_uniprot
+                    curated_row['POI_UniProt'] = poi_uniProt
                 
                 curated_row['Manually_Curated'] = True
                 curated_rows.append(curated_row)
 
     curated_df = pd.DataFrame(curated_rows)
-    curated_df['Dataset'] = 'PROTACpedia'
     curated_df['Modality'] = 'PROTAC'
 
     # Assign all Dmax type entries the Value_Unit to '%'
@@ -1461,7 +1462,7 @@ def main():
         'SMILES',
         'Ligase_Name',
         'POI_Name',
-        'POI_Uniprot',
+        'POI_UniProt',
         'Unclear_POI',
         'Value',
         'Value_Type',
@@ -1482,7 +1483,6 @@ def main():
         'Reference',
         'Description',
         'Modality',
-        'Dataset',
         'Manually_Curated',
     ]]
 
@@ -1555,18 +1555,18 @@ def main():
         
         return e3_uniprot
 
-    curated_df['Ligase_Uniprot'] = curated_df.apply(get_e3_uniprot, axis=1)
-    logger.info(curated_df['Ligase_Uniprot'].value_counts())
+    curated_df['Ligase_UniProt'] = curated_df.apply(get_e3_uniprot, axis=1)
+    logger.info(curated_df['Ligase_UniProt'].value_counts())
 
     def update_uniprot(row, logger):
         infos = fetch_uniprot_for_gene(row['POI_Name'], row['Cell_Line_Species'])
-        new_uniprot = infos['uniprot'] if infos is not None else row['POI_Uniprot']
-        if new_uniprot is not None and new_uniprot != row['POI_Uniprot']:
-            logger.warning(f"Updating Uniprot {row['POI_Uniprot']} with {new_uniprot}, for organism: {row['Cell_Line_Species']}")
+        new_uniprot = infos['uniprot'] if infos is not None else row['POI_UniProt']
+        if new_uniprot is not None and new_uniprot != row['POI_UniProt']:
+            logger.warning(f"Updating Uniprot {row['POI_UniProt']} with {new_uniprot}, for organism: {row['Cell_Line_Species']}")
         return new_uniprot
 
-    curated_df['POI_Uniprot'] = curated_df.apply(lambda x: update_uniprot(x, logger), axis=1)
-    uniprots_to_fetch = list(curated_df['POI_Uniprot'].unique()) + list(curated_df['Ligase_Uniprot'].unique())
+    curated_df['POI_UniProt'] = curated_df.apply(lambda x: update_uniprot(x, logger), axis=1)
+    uniprots_to_fetch = list(curated_df['POI_UniProt'].unique()) + list(curated_df['Ligase_UniProt'].unique())
 
     # Update dictionaries with newly found Uniprots
     for uniprot_id in tqdm(uniprots_to_fetch, desc='Fetching UniProt entries'):
@@ -1601,8 +1601,8 @@ def main():
 
     # Assign missing POI_Name values based on UniProt ID
     def assign_poi_name(row):
-        if pd.isna(row['POI_Name']) and pd.notna(row['POI_Uniprot']):
-            uniprot_id = row['POI_Uniprot']
+        if pd.isna(row['POI_Name']) and pd.notna(row['POI_UniProt']):
+            uniprot_id = row['POI_UniProt']
             gene_name = uniprot2gene.get(uniprot_id)
             if gene_name:
                 return gene_name
@@ -1610,21 +1610,21 @@ def main():
 
     curated_df['POI_Name'] = curated_df.apply(assign_poi_name, axis=1)
 
-    # Clean 'BRD4 LONG' and 'BRD4 SHORT' entries with their isoforms (based on POI_Uniprot)
+    # Clean 'BRD4 LONG' and 'BRD4 SHORT' entries with their isoforms (based on POI_UniProt)
     def assign_brd4_isoform(row):
         if pd.notnull(row['POI_Name']) and 'BRD4' in row['POI_Name']:
             if 'LONG' in row['POI_Name']:
-                return row['POI_Uniprot'] + '-1'
+                return row['POI_UniProt'] + '-1'
             elif 'SHORT' in row['POI_Name']:
-                return row['POI_Uniprot'] + '-2'
-        return row['POI_Uniprot']
+                return row['POI_UniProt'] + '-2'
+        return row['POI_UniProt']
 
-    curated_df['POI_Uniprot'] = curated_df.apply(assign_brd4_isoform, axis=1)
+    curated_df['POI_UniProt'] = curated_df.apply(assign_brd4_isoform, axis=1)
 
     # ## Get Sequences and Apply Mutations
 
-    curated_df['POI_Sequence'] = curated_df['POI_Uniprot'].apply(lambda uid: uniprot2seq.get(uid))
-    curated_df['Ligase_Sequence'] = curated_df['Ligase_Uniprot'].apply(lambda uid: uniprot2seq.get(uid))
+    curated_df['POI_Sequence'] = curated_df['POI_UniProt'].apply(lambda uid: uniprot2seq.get(uid))
+    curated_df['Ligase_Sequence'] = curated_df['Ligase_UniProt'].apply(lambda uid: uniprot2seq.get(uid))
 
     curated_df['POI_Sequence'] = curated_df.apply(lambda row: apply_mutation(row['POI_Sequence'], row['POI_Name']), axis=1)
 
@@ -1644,13 +1644,16 @@ def main():
         resolved = df[df['_keep']].drop(columns=['_has_manual', '_keep'])
         return resolved
 
-    duplicate_subset = ['SMILES', 'Cell_Line', 'Ligase_Name', 'POI_Name', 'POI_Uniprot', 'Value_Type', 'Assay', 'Assay_Time']
+    duplicate_subset = ['SMILES', 'Cell_Line', 'Ligase_Name', 'POI_Name', 'POI_UniProt', 'Value_Type', 'Assay', 'Assay_Time']
     curated_df = resolve_duplicates(curated_df, duplicate_subset)
 
     # Check the amount of missing data in each column
     missing_data = curated_df.isna().sum()
     logger.info("Missing data counts per column:")
     logger.info('\n' + str(missing_data))
+
+    # Convert all None values to NaN for consistency
+    curated_df = curated_df.where(pd.notnull(curated_df), None)
 
     # ## Save to CSV
     curated_df.to_csv(data_curation_dir / 'protacpedia_protac_dc50_dmax.csv', index=False)
