@@ -4,9 +4,7 @@ from typing import Dict, Optional, Tuple
 
 import pandas as pd
 
-from tackai.data.embeddings.cell_embeddings import (
-    CellEmbedding,
-)
+from tackai.data.embeddings.cell_embeddings import CellEmbedding
 
 
 # --------------------------------------------------------------------------
@@ -359,19 +357,23 @@ def standardize_cell_line_protacdb(
     return row
 
 
-def get_cell_species(cell_type: str, cell_embedding: CellEmbedding) -> str:
+def get_cell_species(cell_type: str, cell_embedding: CellEmbedding, cell_id: Optional[str] = None) -> str:
     """Get the species of a cell line based on its type using Cellosaurus embeddings.
     
     Args:
         cell_type (str): The cell type for which to determine the species.
         cell_embedding (CellEmbedding): An instance of CellEmbedding containing the cell line data.
+        cell_id (Optional[str]): The Cellosaurus Cell ID corresponding to the cell type, if available. This can be used as an additional lookup key if the cell type is not found directly.
         
     Returns:
         str: The species of the cell line, or NaN if it cannot be determined.
     """
-    if pd.isna(cell_type):
+    if pd.isna(cell_type) and pd.isna(cell_id):
         return pd.NA
+
     data = cell_embedding.cell2data.get(cell_type)
+    if data is None and cell_id is not None:
+        data = cell_embedding.cell_id2data.get(cell_id)
     if data and 'OX' in data:
         organism = data.get('OX')
         if organism is not None:

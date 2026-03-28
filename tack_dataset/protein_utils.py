@@ -249,6 +249,45 @@ def fetch_uniprot_for_gene(gene_symbol: str, organism: str = 'Homo sapiens') -> 
         "protein_name": tab.iloc[0, 2] if tab.shape[1] > 2 else None,
     }
 
+@lru_cache()
+def fetch_uniprot_for_sequence(sequence: str) -> Optional[dict]:
+    """ Fetch Uniprot information based on provided gene name and organism.
+    
+    Args:
+        gene_symbol (str):
+        organism (str):
+
+    Returns:
+
+    """
+
+    url = "https://rest.uniprot.org/uniprotkb/search"
+    query = f"(sequence:{sequence}) AND (reviewed:true)"
+
+    r = _get_with_retry(
+        url,
+        params={
+            "query": query,
+            "format": "tsv",
+            "fields": "accession,gene_primary,protein_name",
+            "size": 5,
+        },
+        headers={"User-Agent": "protac-e3-normalize/1.0"},
+        timeout=60,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"UniProt request failed: {r.status_code}\n{r.text[:500]}")
+
+    tab = pd.read_csv(StringIO(r.text), sep="\t")
+    if tab.empty:
+        return None
+
+    return {
+        "uniprot": tab.iloc[0, 0],
+        "gene_primary": tab.iloc[0, 1] if tab.shape[1] > 1 else None,
+        "protein_name": tab.iloc[0, 2] if tab.shape[1] > 2 else None,
+    }
+
 
 def apply_mutation(
         seq: str,

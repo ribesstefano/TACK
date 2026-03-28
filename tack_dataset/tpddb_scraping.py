@@ -71,7 +71,7 @@ def batch_scrape(
     html_base_dir: Optional[Path] = None,
 ):
     """
-    Download all TPD IDs from PROTAC_main_table.csv.
+    Download all TPD IDs from PROTAC_main_table.txt.
     
     Args:
         limit: Optional limit on number of entries to process
@@ -86,7 +86,7 @@ def batch_scrape(
     logger.info("BATCH EXTRACTION STARTED")
     logger.info("="*80)
     logger.info(f"Mode: Fetch HTML from TPDdb website")
-    logger.info(f"Total TPD IDs in CSV: {len(protac_df)}")
+    # logger.info(f"Total TPD IDs in CSV: {len(protac_df)}")
     if specific_ids:
         logger.info(f"Processing specific IDs: {', '.join(specific_ids)}")
     if limit:
