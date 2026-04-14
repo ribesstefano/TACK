@@ -18,7 +18,7 @@ import xgboost as xgb
 from tqdm import tqdm
 
 from tackai.data.datamodule import load_datamodule
-from tackai.models.tackai_model import TACKModel
+from tackai.models.tack_model import TACKModel
 
 warnings.filterwarnings('ignore')
 
@@ -238,7 +238,8 @@ class EnsemblePredictor:
         """
         self.models = models
         self.datamodules = datamodules
-        self.device = device
+        # Normalize device string: PyTorch uses "cuda", not "gpu"
+        self.device = 'cuda' if device == 'gpu' else device
         
         # Per-model task inferred from filenames / datamodule label names
         self.model_tasks: Dict[str, str] = {}
@@ -409,8 +410,6 @@ class EnsemblePredictor:
         model_dir: Union[str, Path],
         datamodule_dir: Optional[Union[str, Path]] = None,
         weights: Optional[Dict[str, float]] = None,
-        # task: str = 'dmax',
-        # label_name: Optional[str] = None,
         device: str = 'cpu',
         pattern: Optional[str] = None,
     ) -> 'EnsemblePredictor':
@@ -430,10 +429,11 @@ class EnsemblePredictor:
             Initialized EnsemblePredictor
         """
         model_dir = Path(model_dir)
-        
+        device = 'cuda' if device == 'gpu' else device
+
         if not model_dir.exists():
             raise FileNotFoundError(f"Model directory not found: {model_dir}")
-        
+
         models = {}
         datamodules = {}
         
@@ -465,8 +465,7 @@ class EnsemblePredictor:
         
         if not models:
             raise ValueError(f"No models could be loaded from {model_dir}")
-        
-        # return cls(models, datamodules, weights, task, label_name, device)
+
         return cls(models, datamodules, weights, device)
     
     @classmethod
@@ -492,9 +491,10 @@ class EnsemblePredictor:
             Initialized EnsemblePredictor with only the specified models
         """
         import json
-        
+
         weights_file = Path(weights_file)
         model_dir = Path(model_dir)
+        device = 'cuda' if device == 'gpu' else device
         
         if not weights_file.exists():
             raise FileNotFoundError(f"Weights file not found: {weights_file}")
@@ -1008,7 +1008,9 @@ class EnsemblePredictor:
             if model_type == 'xgboost':
                 ret = 'xgb'
             elif model_type == 'lightning':
-                ret = 'pt'
+                # 'pt_batch' returns a single Dict[str, Tensor] with batch dim,
+                # skipping the per-sample dict loop and re-stacking in inference.
+                ret = 'pt_batch'
             else:
                 ret = 'np'
             batch_feat = datamodule.featurize_samples_batch(
@@ -1238,15 +1240,7 @@ class EnsemblePredictor:
         if model_type == 'xgboost':
             preds = self._predict_xgboost_batch(model, feat_list)
         else:
-            # Fallback: per-sample inference for Lightning / unknown models
-            # TODO: Implement proper batch inference for Lightning models
-            per_sample = []
-            for feat in feat_list:
-                if feat is None:
-                    per_sample.append(np.array([np.nan]))
-                else:
-                    per_sample.append(self._predict_single_model(model_name, feat))
-            preds = np.array(per_sample)
+            preds = self._predict_lightning_batch(model, feat_list)
 
         # --- denormalize ---------------------------------------------------
         preds_flat = preds.reshape(-1, 1) if preds.ndim == 1 else preds
@@ -1438,6 +1432,83 @@ class EnsemblePredictor:
 
         # 4. Assemble per-sample ensemble results
         return self._assemble_batch_results(model_batch_preds, n, return_individual)
+
+    def _predict_lightning_batch(
+        self,
+        model: Any,
+        feat_list: Any,
+    ) -> np.ndarray:
+        """Run a single batched forward pass for a Lightning/MLP model.
+
+        Accepts two input formats:
+
+        * **Dict[str, Tensor]** (fast path) — produced by
+          ``featurize_samples_batch(return_tensor='pt_batch')``.  All samples
+          are already stacked; tensors are moved to device and the model is
+          called once.  No per-sample loop, no re-stacking overhead.
+
+        * **List[Optional[Dict]]** (legacy path) — list of per-sample feature
+          dicts.  ``None`` entries produce NaN rows in the output.  Samples
+          are stacked internally before the single forward pass.
+
+        Returns an ndarray of shape ``(n_samples, output_dim)``.
+        """
+        def _extract_output(output, n):
+            if isinstance(output, torch.Tensor):
+                return output.cpu().numpy().reshape(n, -1)
+            if isinstance(output, dict):
+                for key in ['prediction', 'pred', 'output', 'logits']:
+                    if key in output:
+                        return output[key].cpu().numpy().reshape(n, -1)
+                for v in output.values():
+                    if isinstance(v, torch.Tensor):
+                        return v.cpu().numpy().reshape(n, -1)
+            return np.array(output).reshape(n, -1)
+
+        # ------------------------------------------------------------------
+        # Fast path: feat_list is already a batched Dict[str, Tensor]
+        # ------------------------------------------------------------------
+        if isinstance(feat_list, dict):
+            n = next(iter(feat_list.values())).shape[0]
+            model.eval()
+            with torch.no_grad():
+                batch = {k: v.to(self.device) for k, v in feat_list.items()}
+                output = model(batch)
+            return _extract_output(output, n)
+
+        # ------------------------------------------------------------------
+        # Legacy path: list of per-sample feature dicts
+        # ------------------------------------------------------------------
+        n = len(feat_list)
+        valid_indices = [i for i, f in enumerate(feat_list) if f is not None]
+        valid_feats = [feat_list[i] for i in valid_indices]
+
+        if not valid_feats:
+            return np.full((n, 1), np.nan, dtype=np.float64)
+
+        model.eval()
+        with torch.no_grad():
+            batch = {}
+            for k in valid_feats[0].keys():
+                tensors = []
+                for feat in valid_feats:
+                    v = feat[k]
+                    if isinstance(v, np.ndarray):
+                        t = torch.from_numpy(v).float()
+                    elif isinstance(v, torch.Tensor):
+                        t = v.float()
+                    else:
+                        t = torch.tensor(np.array(v), dtype=torch.float32)
+                    tensors.append(t)
+                batch[k] = torch.stack(tensors, dim=0).to(self.device)
+            output = model(batch)
+
+        B = len(valid_feats)
+        preds_valid = _extract_output(output, B)
+        result = np.full((n, preds_valid.shape[1]), np.nan, dtype=np.float64)
+        for out_idx, orig_idx in enumerate(valid_indices):
+            result[orig_idx] = preds_valid[out_idx]
+        return result
 
     def _predict_xgboost_batch(
         self,

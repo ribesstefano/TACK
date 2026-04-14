@@ -198,6 +198,10 @@ def main():
         raise ValueError("Multitask training with BERT model is not supported anymore. One needs to update the handling the label normalization of the 'Value' column.")        
 
     # Clip 'Dmax' values to [0, 100]
+    # NOTE: There is no need to clip before calculating binary activity, since
+    # an entry will be labeled in the same way regardless, as Dmax < 0 is always
+    # below the 80% threshold, and Dmax > 100 is always above it. Clipping is
+    # only needed for regression tasks to avoid outliers dominating the training.
     if 'Dmax' in labels:
         def clip_dmax(example):
             example['Dmax'] = np.clip(example['Dmax'], 0, 100)

@@ -1,5 +1,5 @@
 """ Simple MLP model for regression tasks. """
-from typing import Dict, Literal, Union, List
+from typing import Dict, Literal, Optional, Union, List
 import torch
 import torch.nn as nn
 from lightning_uq_box.uq_methods.deep_evidential_regression import DERLayer
@@ -49,14 +49,27 @@ class MLPModel(nn.Module):
         task_type: Literal["der", "mve", "point", "msle", "bin"] = "der",
         activation: Literal["relu", "gelu", "silu"] = "gelu",
         norm_type: Union[None, Literal["batch", "layer"]] = None,
+        categorical_vocab_sizes: Optional[Dict[str, int]] = None,
+        categorical_embedding_dim: int = 8,
     ):
         super().__init__()
-        
+
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.n_targets = n_targets
         self.head_type = head_type
         self.task_type = task_type
+
+        # PyTorch Embedding tables for categorical features.
+        # categorical_vocab_sizes maps feature key → vocab size (from
+        # datamodule.get_categorical_vocab_sizes()).  When None, no embedding
+        # layers are created and behavior is identical to the original MLP.
+        self.categorical_vocab_sizes = categorical_vocab_sizes or {}
+        self.categorical_embedding_dim = categorical_embedding_dim
+        self.embeddings = nn.ModuleDict({
+            key: nn.Embedding(vocab_size, categorical_embedding_dim)
+            for key, vocab_size in self.categorical_vocab_sizes.items()
+        })
 
         if task_type == "der":
             # DER: 4 values per target (gamma, nu, alpha, beta)
@@ -75,9 +88,13 @@ class MLPModel(nn.Module):
         else:
             hidden_dims = hidden_dim
 
+        # When embedding tables are present, their outputs are concatenated to
+        # the continuous features before the first linear layer.
+        effective_input_dim = input_dim + len(self.categorical_vocab_sizes) * categorical_embedding_dim
+
         # Build MLP backbone
         layers = []
-        current_dim = input_dim
+        current_dim = effective_input_dim
         for hdim in hidden_dims:
             # Add linear layer
             layers.append(nn.Linear(current_dim, hdim))
@@ -144,11 +161,20 @@ class MLPModel(nn.Module):
         If return_embeddings is True:
             Tuple of (predictions, embeddings)
         """        
-        # Concatenate all Feature_* tensors from the batch
-        # Sort keys for consistent ordering across batches
-        feature_keys = sorted([k for k in batch.keys() if k.startswith("Feature_")])
-        features = [batch[k] for k in feature_keys]
-        x = torch.cat(features, dim=-1)
+        # Separate continuous Feature_* keys from categorical ones that go
+        # through embedding tables.  Both sets are sorted for consistent ordering.
+        cat_keys = set(self.categorical_vocab_sizes.keys())
+        continuous_keys = sorted([k for k in batch.keys()
+                                  if k.startswith("Feature_") and k not in cat_keys])
+        categorical_keys = sorted([k for k in batch.keys()
+                                   if k.startswith("Feature_") and k in cat_keys])
+
+        parts = [batch[k] for k in continuous_keys]
+        for k in categorical_keys:
+            idx = batch[k].long().squeeze(-1)   # (batch_size,)
+            parts.append(self.embeddings[k](idx))  # (batch_size, categorical_embedding_dim)
+
+        x = torch.cat(parts, dim=-1)
         
         # Process through MLP
         embeddings = self.mlp(x)  # (batch_size, hidden_dim)

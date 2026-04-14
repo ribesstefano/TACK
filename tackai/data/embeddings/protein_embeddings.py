@@ -163,8 +163,14 @@ class ProteinEmbedding(EmbeddingMixin):
         data = np.load(self.embeddings_file, allow_pickle=True)
         
         # Get sequence identifiers and embeddings
-        seq_ids = data[self.sequence_id_key]
-        embs = data[self.embeddings_key]
+        if self.sequence_id_key in data and self.embeddings_key in data:
+            seq_ids = data[self.sequence_id_key]
+            embs = data[self.embeddings_key]
+        else:
+            # If specific keys are not found, assume all keys except embeddings_key are sequence ids
+            logging.warning(f"Keys '{self.sequence_id_key}' and/or '{self.embeddings_key}' not found in npz file. Assuming dictionary structure with sequence ids as keys and embeddings as values.")
+            seq_ids = list(data.keys())
+            embs = [data[k] for k in seq_ids]
         
         # Process each embedding
         for seq_id, emb in zip(seq_ids, embs):

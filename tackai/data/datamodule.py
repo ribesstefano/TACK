@@ -17,6 +17,7 @@ from scipy.stats import gaussian_kde
 from scipy.special import expit, logit
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.preprocessing import (
+    OneHotEncoder,
     OrdinalEncoder,
     StandardScaler,
     MinMaxScaler,
@@ -114,6 +115,8 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         num_proc: int = 1,
         hf_token: Optional[str] = None,
         verbose: int = 0,
+        sort_features: bool = True,
+        categorical_encoding: Literal['minmax', 'onehot', 'embedding'] = 'minmax',
     ):
         super().__init__()
         # Exclude 'dataset' and 'hf_token' from hyperparameters since they shouldn't be serialized
@@ -151,7 +154,9 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         self.standardize_labels = standardize_labels
         self.impute_labels = impute_labels
         self.use_assay_type_encoding = use_assay_type_encoding
-        
+        self.sort_features = sort_features
+        self.categorical_encoding = categorical_encoding
+
         # Store ID type for embeddings lookup
         self.poi_embeddings_id_type = poi_embeddings_id_type
         self.ligase_embeddings_id_type = ligase_embeddings_id_type
@@ -544,8 +549,8 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         # 1. Raw embeddings — compute once per unique value, using shared_cache
         # ------------------------------------------------------------------
         fp_results: Dict[str, np.ndarray] = {}
-        cell_desc_results: Dict[str, np.ndarray] = {}
-        poi_seq_results: Dict[str, np.ndarray] = {}
+        cell_text_results: Dict[str, np.ndarray] = {}
+        poi_vec_results: Dict[str, np.ndarray] = {}
         poi_precomp_results: Dict[str, np.ndarray] = {}
         ligase_precomp_results: Dict[str, np.ndarray] = {}
 
@@ -565,13 +570,13 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         if self.use_cell_description_embedding and self.cell_description_embedding is not None:
             unique_cells = list({ex[self.cell_line_col] for ex in examples})
             for cell in unique_cells:
-                cache_key = ('cell_desc', cell)
+                cache_key = ('cell_text', cell)
                 if cache_key in shared_cache:
-                    cell_desc_results[cell] = shared_cache[cache_key]
+                    cell_text_results[cell] = shared_cache[cache_key]
                 else:
                     emb = self.cell_description_embedding.transform(cell)
                     shared_cache[cache_key] = emb
-                    cell_desc_results[cell] = emb
+                    cell_text_results[cell] = emb
 
         # POI sequence embedding (amino acid count / tfidf)
         # NOTE: keyed by id(embedder) because TfidfVectorizer vocabulary differs per fold
@@ -579,13 +584,13 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             emb_id = id(self.poi_sequence_embedding)
             unique_seqs = list({ex[self.poi_sequence_col] for ex in examples})
             for seq in unique_seqs:
-                cache_key = ('poi_seq', emb_id, seq)
+                cache_key = ('poi_vec', emb_id, seq)
                 if cache_key in shared_cache:
-                    poi_seq_results[seq] = shared_cache[cache_key]
+                    poi_vec_results[seq] = shared_cache[cache_key]
                 else:
                     emb = self.poi_sequence_embedding.transform(seq)
                     shared_cache[cache_key] = emb
-                    poi_seq_results[seq] = emb
+                    poi_vec_results[seq] = emb
 
         # POI precomputed embedding (raw, before PCA)
         if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
@@ -646,28 +651,90 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         # ------------------------------------------------------------------
         num_results: Optional[np.ndarray] = None
         if self.numeric_pipeline is not None:
-            data_rows = []
-            for ex in examples:
-                row: Dict[str, Any] = {}
-                if self.use_treatment_time:
-                    row[self.treatment_time_col] = ex[self.treatment_time_col]
-                if self.use_descriptors:
-                    # Use shared_cache for raw descriptors (before DM-specific scaling)
+            # Build the DataFrame column-by-column from pre-allocated matrices
+            # instead of building per-sample dicts. For ~1000 descriptors this
+            # avoids millions of tiny numpy-array allocations.
+            num_data: Dict[str, Any] = {}
+            if self.use_treatment_time:
+                num_data[self.treatment_time_col] = [ex[self.treatment_time_col] for ex in examples]
+            if self.use_descriptors:
+                desc_names = self.desc_embedder.get_descriptor_names()
+                desc_matrix = np.empty((n, len(desc_names)), dtype=np.float32)
+                for i, ex in enumerate(examples):
                     smi = ex[self.smiles_col]
-                    cache_key = ('desc_raw', smi)
+                    cache_key = ('desc_raw', id(self.desc_embedder), smi)
                     if cache_key in shared_cache:
                         descs = shared_cache[cache_key]
                     else:
                         descs = self.desc_embedder.transform(smi)
                         shared_cache[cache_key] = descs
-                    for j, name in enumerate(self.desc_embedder.get_descriptor_names()):
-                        row[f'Descriptor_{name}'] = np.array([descs[j]], dtype=np.float32)
-                data_rows.append(row)
-            num_df = pd.DataFrame(data_rows)
+                    desc_matrix[i] = descs
+                for j, name in enumerate(desc_names):
+                    num_data[f'Descriptor_{name}'] = desc_matrix[:, j]
+            num_df = pd.DataFrame(num_data)
             num_results = self.numeric_pipeline.transform(num_df)  # shape (n, n_num_features)
 
+        # Precompute per-column output widths for the category pipeline so
+        # that the sample loop can slice cat_results correctly (one-hot
+        # encoding produces multiple output columns per input column).
+        cat_col_offsets: List[tuple] = []  # [(offset, width), ...]
+        if cat_results is not None:
+            offset = 0
+            for _, inner, cols in self.category_pipeline.transformers_:
+                width = inner.transform(cat_df[cols].iloc[:1]).shape[1]
+                cat_col_offsets.append((offset, width))
+                offset += width
+
         # ------------------------------------------------------------------
-        # 5. Assemble per-sample feature dicts
+        # 5. Assemble results
+        # ------------------------------------------------------------------
+
+        # Fast path for Lightning models: build one batched tensor dict directly
+        # from the already-computed matrices, skipping the per-sample loop and
+        # the re-stacking that _predict_lightning_batch would otherwise do.
+        if return_tensor == 'pt_batch':
+            batch_out: Dict[str, torch.Tensor] = {}
+
+            if self.use_fingerprints and self.fp_embedder is not None:
+                fp_mat = np.stack([fp_results[ex[self.smiles_col]] for ex in examples])
+                batch_out['Feature_Fingerprint'] = torch.from_numpy(fp_mat).float()
+
+            if self.use_cell_description_embedding and self.cell_description_embedding is not None:
+                cell_mat = np.stack([cell_text_results[ex[self.cell_line_col]] for ex in examples])
+                batch_out[f'Feature_{self.cell_line_col}_Description'] = torch.from_numpy(cell_mat).float()
+
+            if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
+                poi_mat = np.stack([poi_vec_results[ex[self.poi_sequence_col]] for ex in examples])
+                batch_out[f'Feature_{self.poi_sequence_col}'] = torch.from_numpy(poi_mat).float()
+
+            if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
+                emb_res = poi_pca_results if (self.use_poi_pca and self.poi_pca is not None and poi_pca_results) else poi_precomp_results
+                poi_mat = np.stack([emb_res[self._get_protein_id(ex, 'poi')] for ex in examples])
+                batch_out['Feature_POI_Precomputed_Embedding'] = torch.from_numpy(poi_mat).float()
+
+            if self.use_ligase_precomputed_embedding and self.ligase_precomputed_embedding is not None:
+                emb_res = ligase_pca_results if (self.use_ligase_pca and self.ligase_pca is not None and ligase_pca_results) else ligase_precomp_results
+                lig_mat = np.stack([emb_res[self._get_protein_id(ex, 'ligase')] for ex in examples])
+                batch_out['Feature_Ligase_Precomputed_Embedding'] = torch.from_numpy(lig_mat).float()
+
+            if cat_results is not None:
+                for j, col in enumerate(self.categorical_cols):
+                    col_offset, col_width = cat_col_offsets[j]
+                    cat_slice = cat_results[:, col_offset:col_offset + col_width].astype(np.float32)
+                    if self.categorical_encoding == 'embedding':
+                        cat_slice = cat_slice + 1
+                    batch_out[f'Feature_{col}'] = torch.from_numpy(cat_slice)
+
+            if num_results is not None:
+                for j, col in enumerate(self.numerical_cols):
+                    batch_out[f'Feature_{col}'] = torch.from_numpy(
+                        num_results[:, j:j+1].astype(np.float32)
+                    )
+
+            return batch_out
+
+        # ------------------------------------------------------------------
+        # Per-sample assembly for 'np', 'pt', and 'xgb' modes
         # ------------------------------------------------------------------
         batch_features: List[Dict[str, Any]] = []
         for i, ex in enumerate(examples):
@@ -677,10 +744,10 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 features['Feature_Fingerprint'] = fp_results[ex[self.smiles_col]]
 
             if self.use_cell_description_embedding and self.cell_description_embedding is not None:
-                features[f'Feature_{self.cell_line_col}_Description'] = cell_desc_results[ex[self.cell_line_col]]
+                features[f'Feature_{self.cell_line_col}_Description'] = cell_text_results[ex[self.cell_line_col]]
 
             if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
-                features[f'Feature_{self.poi_sequence_col}'] = poi_seq_results[ex[self.poi_sequence_col]]
+                features[f'Feature_{self.poi_sequence_col}'] = poi_vec_results[ex[self.poi_sequence_col]]
 
             if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
                 pid = self._get_protein_id(ex, 'poi')
@@ -696,10 +763,15 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 else:
                     features['Feature_Ligase_Precomputed_Embedding'] = ligase_precomp_results[lid]
 
-            # Category pipeline — slice from batch result
+            # Category pipeline — slice from batch result using precomputed
+            # offsets (handles one-hot expansion correctly)
             if cat_results is not None:
                 for j, col in enumerate(self.categorical_cols):
-                    features[f'Feature_{col}'] = cat_results[i, j:j+1]
+                    col_offset, col_width = cat_col_offsets[j]
+                    val = cat_results[i, col_offset:col_offset + col_width]
+                    if self.categorical_encoding == 'embedding':
+                        val = val + 1  # shift: unknown → 0, known → 1..N
+                    features[f'Feature_{col}'] = val
 
             # Numeric pipeline — slice from batch result
             if num_results is not None:
@@ -991,6 +1063,9 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             if 'token_type_ids' in example:
                 self.feature_dims['token_type_ids'] = self.max_length
         
+        if self.sort_features:
+            self.feature_dims = dict(sorted(self.feature_dims.items()))
+
         self.logger.debug(f"Feature dimensions initialized: {self.feature_dims}")
     
     def get_xgboost_feature_names(self) -> List[str]:
@@ -1021,11 +1096,32 @@ class DegradationComplexDataModule(pl.LightningDataModule):
 
     def get_feature_dims(self) -> Dict[str, int]:
         """ Return the dictionary mapping feature names to their dimensions.
-        
+
         Returns:
             Dictionary mapping feature names to integer dimensions.
         """
         return self.feature_dims.copy()
+
+    def get_categorical_vocab_sizes(self) -> Dict[str, int]:
+        """ Return vocab sizes for embedding-encoded categorical features.
+
+        Returns {feature_key: vocab_size} where vocab_size = n_known_categories + 1.
+        Index 0 is reserved for unknown categories (after the +1 shift applied in
+        _run_category_pipeline). Only meaningful when categorical_encoding == 'embedding'.
+
+        Returns:
+            Dictionary mapping feature names to their vocabulary sizes.
+        """
+        if self.categorical_encoding != 'embedding' or self.category_pipeline is None:
+            return {}
+        sizes = {}
+        for _, transformer, cols in self.category_pipeline.transformers_:
+            ordinal = transformer.named_steps.get('ordinal')
+            if ordinal is None or not hasattr(ordinal, 'categories_'):
+                continue
+            for col, cats in zip(cols, ordinal.categories_):
+                sizes[f'Feature_{col}'] = len(cats) + 1  # +1 for unknown at index 0
+        return sizes
 
     def get_total_feature_dim(self, exclude_tokenizer: bool = True) -> int:
         """ Calculate the total dimension of all features.
@@ -1058,18 +1154,36 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             self.categorical_cols.append(self.assay_type_col)
 
         for col in self.categorical_cols:
-            transformers.append((
-                f'{col}_pipeline',
-                Pipeline([
+            if self.categorical_encoding == 'embedding':
+                # For PyTorch embeddings: ordinal only, int64 so indices can go
+                # directly into nn.Embedding without an extra cast.
+                # The +1 shift (unknown → 0, known → 1..N) is applied in
+                # _run_category_pipeline() after transformation.
+                inner = Pipeline([
+                    ('ordinal', OrdinalEncoder(
+                        handle_unknown='use_encoded_value',
+                        unknown_value=-1,
+                        dtype=np.int64
+                    )),
+                ])
+            elif self.categorical_encoding == 'onehot':
+                inner = Pipeline([
+                    ('onehot', OneHotEncoder(
+                        handle_unknown='ignore',
+                        sparse_output=False
+                    )),
+                ])
+            else:
+                # Default 'minmax' mode: ordinal + MinMax scaling to [0, 1]
+                inner = Pipeline([
                     ('ordinal', OrdinalEncoder(
                         handle_unknown='use_encoded_value',
                         unknown_value=-1,
                         dtype=np.int32
                     )),
                     ('minmax', MinMaxScaler())
-                ]),
-                [col]
-            ))
+                ])
+            transformers.append((f'{col}_pipeline', inner, [col]))
         
         self.category_pipeline = None
         if transformers:
@@ -1094,23 +1208,31 @@ class DegradationComplexDataModule(pl.LightningDataModule):
 
     def _run_category_pipeline(self, example: Union[Dict, pd.Series]) -> Dict[str, np.ndarray]:
         """ Run the category pipeline on a single example.
-        
+
         Args:
             example: A dictionary representing a single data point.
-            
+
         Returns:
             A dictionary with processed categorical features.
         """
         if self.category_pipeline is None:
             return {}
 
+        # NOTE: The key is to rely on the columns defined in the
+        # `_create_category_pipeline` method.
         X = pd.DataFrame({col: [example[col]] for col in self.categorical_cols})
         transformed = self.category_pipeline.transform(X)
-        
+
         result = {}
-        for i, col in enumerate(self.categorical_cols):
-            result[f'Feature_{col}'] = transformed[0, i:i+1]
-        
+        offset = 0
+        for col, (_, inner, _) in zip(self.categorical_cols, self.category_pipeline.transformers_):
+            width = inner.transform(X[[col]]).shape[1]
+            val = transformed[0, offset:offset + width]
+            if self.categorical_encoding == 'embedding':
+                val = val + 1  # shift: unknown → 0, known categories → 1..N
+            result[f'Feature_{col}'] = val
+            offset += width
+
         return result
 
     def _create_numeric_pipeline(self):
@@ -1463,6 +1585,8 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         # Exclude tokenizer-related and label columns from XGBoost features
         excluded_keys = set(self.labels) | {'Prompt', 'input_ids', 'attention_mask', 'token_type_ids'}
         features_names = [k for k in first_row.keys() if k not in excluded_keys]
+        if self.sort_features:
+            features_names = sorted(features_names)
         
         # For certain features, like sequence embeddings, expand feature names,
         # e.g., name each n-gram
@@ -1874,19 +1998,34 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             tokenizer = getattr(self, 'tokenizer_name', 'bert')
             parts.append(f'tok_{tokenizer.split("/")[-1].replace("-", "_")}')
         if getattr(self, 'use_poi_name_embedding', False):
-            parts.append('poi_ord')
+            if self.categorical_encoding == 'embedding':
+                parts.append('poi_pt')
+            elif self.categorical_encoding == 'onehot':
+                parts.append('poi_onehot')
+            else:
+                parts.append('poi_ord')
         if getattr(self, 'use_poi_sequence_embedding', False):
-            parts.append('poi_seq')
+            parts.append('poi_vec')
         if getattr(self, 'use_poi_precomputed_embedding', False):
             parts.append('poi_emb')
         if getattr(self, 'use_ligase_precomputed_embedding', False):
             parts.append('lig_emb')
         if getattr(self, 'use_ligase_name_embedding', False):
-            parts.append('lig_ord')
+            if self.categorical_encoding == 'embedding':
+                parts.append('lig_pt')
+            elif self.categorical_encoding == 'onehot':
+                parts.append('lig_onehot')
+            else:
+                parts.append('lig_ord')
         if getattr(self, 'use_cell_name_embedding', False):
-            parts.append('cell_ord')
+            if self.categorical_encoding == 'embedding':
+                parts.append('cell_pt')
+            elif self.categorical_encoding == 'onehot':
+                parts.append('cell_onehot')
+            else:
+                parts.append('cell_ord')
         if getattr(self, 'use_cell_description_embedding', False):
-            parts.append('cell_desc')
+            parts.append('cell_text')
         if getattr(self, 'use_assay_type_encoding', False):
             parts.append('assay')
         if getattr(self, 'use_treatment_time', False):

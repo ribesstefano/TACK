@@ -226,11 +226,11 @@ def tune_xgboost_hyperparameters(
                 'reg_alpha': trial.suggest_float("reg_alpha", 0.001, 10.0, log=True),
                 'reg_lambda': trial.suggest_float("reg_lambda", 0.001, 10.0, log=True),
                 'gamma': trial.suggest_float("gamma", 0.001, 10.0, log=True),
+                'n_jobs': model_config.get('n_jobs', 1),
             },
             'training_config': {
                 'num_boost_round': train_config.get('num_boost_round', 100),
                 'early_stopping_rounds': train_config.get('early_stopping_rounds', 5),
-                'n_jobs': train_config.get('n_jobs', 1),
             }
         }
         # Remove suggested params from base config, then update it with
@@ -492,7 +492,14 @@ def tune_lightning_hyperparameters(
         # Add input_dim for MLP (this is essential and should come from data_module)
         if model_type == 'mlp':
             feature_dim = data_module.get_total_feature_dim()
-            model_config['input_dim'] = feature_dim
+            vocab_sizes = data_module.get_categorical_vocab_sizes()
+            if vocab_sizes:
+                model_config['categorical_embedding_dim'] = trial.suggest_categorical(
+                    'categorical_embedding_dim', [4, 8, 16, 32])
+                model_config['categorical_vocab_sizes'] = vocab_sizes
+                model_config['input_dim'] = feature_dim - len(vocab_sizes)
+            else:
+                model_config['input_dim'] = feature_dim
         
         try:
             # Train model using the existing train_lightning_model function
@@ -654,7 +661,7 @@ def run_cv_experiment(
         labels: List of label names.
         checkpoints_dir: Directory to save model checkpoints.
         results_dir: Directory to save prediction results.
-        tune_hyperparameters: Whether to tune hyperparameters (XGBoost only).
+        tune_hyperparameters: Whether to tune hyperparameters.
         n_tuning_trials: Number of tuning trials.
         tune_first_fold_only: Whether to tune only on the first fold.
         
@@ -853,7 +860,12 @@ def run_cv_experiment(
                 # Set input_dim for MLP
                 if model_type == 'mlp':
                     feature_dim = data_module.get_total_feature_dim()
-                    current_config['model_config']['input_dim'] = feature_dim
+                    vocab_sizes = data_module.get_categorical_vocab_sizes()
+                    if vocab_sizes:
+                        current_config['model_config']['categorical_vocab_sizes'] = vocab_sizes
+                        current_config['model_config']['input_dim'] = feature_dim - len(vocab_sizes)
+                    else:
+                        current_config['model_config']['input_dim'] = feature_dim
 
                 print(f"Training {model_type.upper()} model...")
                 model = train_lightning_model(

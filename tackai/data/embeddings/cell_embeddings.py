@@ -146,6 +146,8 @@ class CellEmbedding(EmbeddingMixin):
                 json.dump(self.cell2cell_id, f, indent=4)
             self.logger.debug(f"Cell line ID mappings saved to {filepath_cell_id}")
 
+        self.cell_id2data = {v: self.cell2data[k] for k, v in self.cell2cell_id.items()}
+
         # Map all synonyms to the main ID
         self.synonym2cell_line = {}
         for cell_id, cell_data in self.cell2data.items():
