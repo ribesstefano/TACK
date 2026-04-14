@@ -1,10 +1,20 @@
 import re
-from typing import List, Union
+from typing import List, Union, Dict
 import pandas as pd
 
 
-def parse_single_value(value_str):
-    """Parse a single numeric value with optional operator, error bar, and unit"""
+def parse_single_value(value_str: str) -> Union[Dict[str, Union[float, str, None]], None]:
+    """ Parse a single numeric value with optional operator, error bar, and unit.
+    
+    Args:
+        value_str (str): The input string to parse, e.g., "0.785±0.03μM", ">10μM", "~58.7%", "1.2e3 nM", "-36%", "88.9*", "0.022 (1%)".
+        
+    Returns:
+        dict: A dictionary with keys 'mean', 'error', 'unit', and 'operator'. 
+              'mean' is the main numeric value (float), 'error' is the error bar if present (float or None), 
+              'unit' is the unit string if present (str or None), and 'operator' is the operator if present (str or None).
+              Returns None if the input string cannot be parsed.
+    """
     
     # Clean the value string first
     value_str = value_str.strip()

@@ -1452,7 +1452,7 @@ Dmax for Brd4 short/Brd4 long/Brd3/Brd2: 96%/97%/97%/93%, respectively (HeLa cel
                 curated_rows.append(curated_row)
 
     curated_df = pd.DataFrame(curated_rows)
-    curated_df['Modality'] = 'PROTAC'
+    curated_df['Modality'] = 'PROteolysis-TArgeting Chimera (PROTAC)'
 
     # Assign all Dmax type entries the Value_Unit to '%'
     curated_df.loc[curated_df['Value_Type'] == 'Dmax', 'Value_Unit'] = '%'

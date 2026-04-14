@@ -15,9 +15,7 @@ from thefuzz import process
 
 from tack_dataset.logging_utils import setup_logging, set_global_logging_level
 from tack_dataset.curation_utils import canonicalize_smiles
-from tackai.data.embeddings.cell_embeddings import (
-    CellEmbedding,
-)
+from tackai.data.embeddings.cell_embeddings import CellEmbedding
 from tack_dataset.protacdb.assay_cleaning import (
     split_clean_str,
     parse_assay_dmax_dc50,
@@ -37,7 +35,6 @@ from tack_dataset.protein_utils import (
     apply_mutation_to_sequence,
     map_poi_uniprot_from_species,
     E3_TO_ORGANISM_TO_UNIPROT,
-    fetch_protein_infos_batch,
 )
 from tack_dataset.cell_utils import (
     standardize_cell_line_protacdb,
@@ -64,7 +61,11 @@ def main():
     args = parser.parse_args()
 
     # Setup logging
-    log_file = setup_logging(args.log_dir, log_base_name='protacdb_curation', verbose=args.verbose)
+    log_file = setup_logging(
+        args.log_dir,
+        log_base_name='protacdb_curation',
+        verbose=args.verbose,
+    )
     set_global_logging_level(logging.DEBUG if args.verbose >= 3 else logging.INFO if args.verbose == 2 else logging.WARNING)
     logger = logging.getLogger(__name__)
 
@@ -72,7 +73,6 @@ def main():
     target2uniprots = {}
     uniprot2infos = {}
     species2uniprot = {}
-    uniprot2locations = {}
 
     # Filter out some warnings...
     RDLogger.DisableLog('rdApp.*')

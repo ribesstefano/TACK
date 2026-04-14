@@ -1,10 +1,4 @@
-# %% [markdown]
-# # Data Splitting and Clustering
 
-# %% [markdown]
-# ## Setup
-
-# %%
 import re
 import os
 import sys
@@ -13,7 +7,6 @@ import warnings
 import random
 from pathlib import Path
 from typing import List, Literal, Tuple, Dict, Optional
-from copy import deepcopy
 
 import optuna
 import numpy as np
@@ -27,9 +20,6 @@ from sklearn.preprocessing import (
     MultiLabelBinarizer, LabelEncoder, OneHotEncoder, OrdinalEncoder
 )
 from sklearn.model_selection import RepeatedKFold
-from sklearn.metrics import (
-    silhouette_score, davies_bouldin_score, calinski_harabasz_score,
-)
 import umap.umap_ as umap
 from rdkit import RDLogger
 from rdkit import Chem
@@ -37,7 +27,7 @@ from rdkit.Chem import AllChem
 from rdkit import DataStructs
 from rdkit.DataStructs import ExplicitBitVect
 from Bio.Align import PairwiseAligner, substitution_matrices
-from Bio.Phylo.TreeConstruction import DistanceMatrix, DistanceTreeConstructor
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 from datasets import Dataset, DatasetDict, load_dataset
@@ -47,26 +37,12 @@ from useful_rdkit_utils.split_utils import (
 )
 
 from tack_dataset.logging_utils import setup_logging
-
-# %% [markdown]
-# Filter out some warnings...
-
-# %%
-def set_global_logging_level(level=logging.ERROR, prefices=[""]):
-    """
-    Override logging levels of different modules based on their name as a prefix.
-    It needs to be invoked after the modules have been loaded so that their loggers have been initialized.
-
-    Args:
-        - level: desired level. e.g. logging.INFO. Optional. Default is logging.ERROR
-        - prefices: list of one or more str prefices to match (e.g. ["transformers", "torch"]). Optional.
-          Default is `[""]` to match all active loggers.
-          The match is a case-sensitive `module_name.startswith(prefix)`
-    """
-    prefix_re = re.compile(fr'^(?:{ "|".join(prefices) })')
-    for name in logging.root.manager.loggerDict:
-        if re.match(prefix_re, name):
-            logging.getLogger(name).setLevel(level)
+from tack_dataset.curation_utils import set_global_logging_level
+from tack_dataset.protein_utils import generate_normalized_alignment_matrix
+from tack_dataset.clustering_utils import (
+    cluster_prot_sequences,
+    evaluate_clusters,
+)
 
 
 # Filter out annoying Pytorch Lightning printouts
@@ -79,14 +55,13 @@ RDLogger.DisableLog('rdApp.*')
 log_file = setup_logging(
     log_dir=Path('logs'),
     log_base_name='data_splitting',
+    # log_file='logs/data_splitting.log',
     verbose=1, # Enable INFO level logging
 )
 logger = logging.getLogger(__name__)
 
-# %% [markdown]
 # Setup working directories:
 
-# %%
 data_dir = Path(os.path.join(os.getcwd(), '.', 'data'))
 data_curation_dir = data_dir / 'curation'
 data_tack_dir = data_dir / 'tack'
@@ -95,521 +70,13 @@ for d in [data_dir, data_curation_dir, data_tack_dir]:
     if not os.path.exists(d):
         os.makedirs(d)
 
-# %% [markdown]
-# ## Clustering Utilities
-# 
-# The followings are metrics to evaluate the quality of the clustering (used in Optuna optimization, for example):
-
-# %%
-def evaluate_clusters(
-        X: np.ndarray,
-        clusters,
-        metric: str = 'euclidean',
-) -> Dict[str, Union[float, int]]:
-    """ Compute clustering metrics and assess cluster size distribution.
-    
-    Args:
-        X (np.ndarray): The input data as a 2D array of shape (n_samples, n_features).
-        clusters: An array-like structure containing cluster labels for each sample in X.
-        metric (str): The distance metric to use for clustering. Default is 'euclidean'. If 'precomputed', X should be a distance matrix of shape (n_samples, n_samples). If 'precomputed', the davis_bouldin and calinski_harabasz scores will not be computed.
-    
-    Returns:
-        Dict[str, Union[float, int]]: A dictionary containing various clustering metrics:
-            - silhouette: Silhouette score of the clustering.
-            - davies_bouldin: Davies-Bouldin index of the clustering.
-            - calinski_harabasz: Calinski-Harabasz index of the clustering.
-            - avg_cluster_size: Average size of the clusters.
-            - avg_cluster_data_ratio: Average size of the clusters relative to the total number of samples.
-            - std_cluster_size: Standard deviation of the cluster sizes.
-            - min_cluster_size: Minimum size of the clusters.
-            - median_cluster_size: Median size of the clusters.
-            - max_cluster_size: Maximum size of the clusters.
-            - cluster_size_skewness: Skewness of the cluster sizes, indicating imbalance.
-            - num_clusters: Number of unique clusters.
-    """
-    
-    unique_clusters = list(set(clusters))
-    
-    if len(unique_clusters) < 2:  # Avoid single-cluster issues
-        return {
-            "silhouette": -1,
-            "davies_bouldin": float("inf"),
-            "calinski_harabasz": -1,
-            "avg_cluster_size": len(X),
-            "avg_cluster_data_ratio": 1,
-            "std_cluster_size": 0,
-            "min_cluster_size": len(X),
-            "median_cluster_size": len(X),
-            "max_cluster_size": len(X),
-            "cluster_size_skewness": 0,
-            "num_clusters": 1,
-        }
-
-    # Compute standard clustering metrics
-    silhouette = silhouette_score(X, clusters, metric=metric)
-    if metric == 'precomputed':
-        # If the metric is precomputed, we cannot compute Davies-Bouldin and
-        # Calinski-Harabasz scores
-        davies_bouldin = float("inf")
-        calinski_harabasz = -1
-    else:
-        davies_bouldin = davies_bouldin_score(X, clusters)
-        calinski_harabasz = calinski_harabasz_score(X, clusters)
-
-    # Compute cluster size statistics
-    cluster_sizes = [len(np.where(clusters == i)[0]) for i in np.unique(clusters)]
-    avg_cluster_size = np.mean(cluster_sizes)
-    avg_cluster_data_ratio = avg_cluster_size / len(X)
-    std_cluster_size = np.std(cluster_sizes)
-    median_cluster_size = np.median(cluster_sizes)
-    min_cluster_size = np.min(cluster_sizes)
-    max_cluster_size = np.max(cluster_sizes)
-    cluster_size_skewness = skew(cluster_sizes, nan_policy="omit")  # Indicates imbalance in cluster sizes
-
-    return {
-        "silhouette": silhouette,
-        "davies_bouldin": davies_bouldin,
-        "calinski_harabasz": calinski_harabasz,
-        "avg_cluster_size": avg_cluster_size,
-        "avg_cluster_data_ratio": avg_cluster_data_ratio,
-        "std_cluster_size": std_cluster_size,
-        "min_cluster_size": min_cluster_size,
-        "median_cluster_size": median_cluster_size,
-        "max_cluster_size": max_cluster_size,
-        "cluster_size_skewness": cluster_size_skewness,
-        "num_clusters": len(unique_clusters),
-    }
-
-# %%
-def sequence_clustering_objective(
-        trial: optuna.Trial,
-        nas_matrix: np.ndarray,
-        is_distance: bool = True,
-) -> float:
-    """ Objective function for Optuna to optimize HDBSCAN clustering parameters based on silhouette score.
-    
-    Args:
-        trial (optuna.Trial): An Optuna trial object for suggesting hyperparameters.
-        nas_matrix (np.ndarray): A 2D numpy array representing the NAS similarity distance matrix (Normalized Alignment Matrix).
-        is_distance (bool): Whether the provided nas_matrix is a distance matrix. If False, it is treated as a similarity matrix. Default is True.
-        
-    Returns:
-        float: The silhouette score of the clustering. Returns -1.0 if clustering is invalid.
-    """
-    # NOTE: The NAS matrix is symmetric and square with shape (n_sequences, n_sequences)
-    n_sequences = nas_matrix.shape[0]
-    
-    dist_matrix = 1.0 - nas_matrix if not is_distance else nas_matrix
-
-    # Setup HDBSCAN parameters to optimize
-    min_cluster_size = trial.suggest_int('min_cluster_size', 2, int(n_sequences * 0.2))
-    min_samples = trial.suggest_int('min_samples', 1, int(n_sequences * 0.2))
-    cluster_selection_epsilon = trial.suggest_float('cluster_selection_epsilon', 0.0, 0.9)
-    alpha = trial.suggest_float('alpha', 1.0, 2.0)
-    leaf_size = trial.suggest_int('leaf_size', 10, 50)
-    cluster_selection_method = trial.suggest_categorical('cluster_selection_method', ['eom', 'leaf'])
-
-    # Perform HDBSCAN clustering
-    labels = HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_epsilon=cluster_selection_epsilon,
-        metric='precomputed',
-        alpha=alpha,
-        leaf_size=leaf_size,
-        cluster_selection_method=cluster_selection_method,
-        allow_single_cluster=False,
-    ).fit_predict(dist_matrix)
-
-    # Only compute silhouette if more than 1 cluster and at least 2 samples per
-    # cluster, otherwise return -1.0
-    if len(set(labels)) < 2 or (labels >= 0).sum() < 2:
-        return -1.0
-
-    return silhouette_score(dist_matrix, labels, metric='precomputed')
-
-
-# # Example of usage
-# sampler = optuna.samplers.TPESampler(seed=42)
-# study = optuna.create_study(direction='maximize', sampler=sampler)
-# study.optimize(
-#     lambda trial: sequence_clustering_objective(trial, nas_matrix=np.random.rand(100, 100)),
-#     n_trials=300,
-# )
-
-# logger.info("Best silhouette score:", study.best_value)
-# logger.info("Best parameters:", study.best_params)
-
-# %% [markdown]
-# ## Protein Clustering Utilities
-
-# %%
-def _sanitize_protein(
-    seq: str,
-    allowed: str,
-    *,
-    strip_gaps: bool = True,
-    strip_whitespace: bool = True,
-    drop_stops: bool = True,
-    map_rare_to_x: bool = True,
-    rare_map: dict = None,
-) -> str:
-    """Sanitize a protein sequence to be compatible with substitution matrix alphabet.
-    
-    This function cleans and standardizes protein sequences by removing unwanted
-    characters, mapping rare amino acids, and ensuring compatibility with
-    substitution matrices used in sequence alignment.
-    
-    Args:
-        seq: Input protein sequence string to sanitize
-        allowed: String containing allowed amino acid characters (e.g., from substitution matrix alphabet)
-        strip_gaps: If True, remove gap characters ('-') from sequence
-        strip_whitespace: If True, remove all whitespace characters
-        drop_stops: If True, remove stop codon symbols ('*')
-        map_rare_to_x: If True, map any character not in allowed alphabet to 'X'
-        rare_map: Optional dictionary for explicit character mapping before fallback-to-X
-                 (e.g., {'U': 'X', 'O': 'X'} for selenocysteine and pyrrolysine)
-    
-    Returns:
-        Sanitized protein sequence string compatible with the substitution matrix
-        
-    Raises:
-        ValueError: If map_rare_to_x=False and sequence contains characters not in allowed alphabet
-        
-    Example:
-        >>> allowed = "ARNDCQEGHILKMFPSTWYVBZX*"
-        >>> _sanitize_protein("MET-LYS U", allowed, rare_map={'U': 'X'})
-        'METKX'
-    """
-    # Handle None input gracefully
-    if seq is None:
-        return ""
-    
-    # Convert to uppercase string for standardization
-    s = str(seq).upper()
-    
-    # Remove whitespace characters (spaces, tabs, newlines)
-    if strip_whitespace:
-        s = re.sub(r"\s+", "", s)
-    
-    # Remove alignment gap characters
-    if strip_gaps:
-        s = s.replace("-", "")
-    
-    # Remove stop codon symbols (conservative approach for scoring)
-    if drop_stops:
-        s = s.replace("*", "")
-    
-    # Apply explicit character mappings for rare amino acids
-    # This allows controlled mapping before the general fallback-to-X
-    if rare_map:
-        for bad, good in rare_map.items():
-            s = s.replace(bad, good)
-    
-    # Handle characters not in the allowed alphabet
-    if map_rare_to_x:
-        # Replace any remaining non-standard characters with 'X' (unknown amino acid)
-        s = "".join(ch if ch in allowed else "X" for ch in s)
-    else:
-        # Strict mode: raise error if any disallowed characters remain
-        bad = {ch for ch in set(s) if ch not in allowed}
-        if bad:
-            raise ValueError(f"Sequence contains unsupported letters: {sorted(bad)}")
-    
-    return s
-
-def generate_normalized_alignment_matrix(
-    sequences: List[str],
-    *,
-    mode: Literal["global", "local"] = "local",
-    gap_open: float = -10.0,
-    gap_extend: float = -0.5,
-    matrix: str = "BLOSUM62",
-    clip: Tuple[float, float] = (0.0, 1.0),
-    return_distance: bool = False,
-    eps: float = 1e-12,
-    sanitize: bool = True,
-) -> np.ndarray:
-    """Generate a Normalized Alignment Score (NAS) matrix for protein sequences.
-
-    This function computes pairwise sequence similarity using normalized alignment scores,
-    where NAS(i,j) = S(i,j) / sqrt(S(i,i) * S(j,j)). This normalization makes the scores
-    comparable across sequences of different lengths and compositions.
-
-    Args:
-        sequences: List of protein sequences to compare
-        mode: Alignment mode - "local" (Smith-Waterman) for finding best matching regions,
-              or "global" (Needleman-Wunsch) for end-to-end alignment
-        gap_open: Penalty for opening a gap in the alignment (negative value)
-        gap_extend: Penalty for extending an existing gap (negative value, less severe than gap_open)
-        matrix: Name of substitution matrix to use (e.g., "BLOSUM62", "PAM250")
-        clip: Tuple of (min, max) values to clip the normalized scores to prevent extreme values
-        return_distance: If True, return distance matrix (1 - NAS) instead of similarity matrix
-        eps: Small epsilon value to prevent division by zero in normalization
-        sanitize: If True, clean sequences using _sanitize_protein function
-
-    Returns:
-        Symmetric matrix of normalized alignment scores (or distances if return_distance=True).
-        Shape: (n_sequences, n_sequences), dtype: float32
-        - Diagonal elements are 1.0 (perfect self-similarity)
-        - Off-diagonal elements range from clip[0] to clip[1]
-
-    Notes:
-        - Uses BioPython's PairwiseAligner for sequence alignment scoring
-        - Self-scores S(i,i) are computed first to enable normalization
-        - Empty sequences receive zero self-score to avoid numerical issues
-        - Normalization formula: NAS(i,j) = S(i,j) / sqrt(S(i,i) * S(j,j) + eps)
-
-    Example:
-        >>> seqs = ["MKVLWAALLVTFLAGCQAKVEQAVETEPEPELRQQTEWQSGQRWELALGRFWDYLRWVQTLSEQVQEELLSSQVTQELRALMDETAQ"]
-        >>> matrix = generate_normalized_alignment_matrix(seqs, mode="global")
-        >>> logger.info(matrix.shape)  # (1, 1)
-        >>> logger.info(matrix[0, 0])  # 1.0 (perfect self-similarity)
-    """
-    n = len(sequences)
-    
-    # Handle edge case: empty input
-    if n == 0:
-        return np.zeros((0, 0), dtype=np.float32)
-
-    # Load substitution matrix and get allowed amino acid alphabet
-    subs = substitution_matrices.load(matrix)
-    allowed = subs.alphabet  # e.g., 'ARNDCQEGHILKMFPSTWYVBZX*' for BLOSUM62
-    
-    # Define mapping for rare/non-standard amino acids before fallback to 'X'
-    # U=Selenocysteine, O=Pyrrolysine, J=Leucine/Isoleucine ambiguity
-    rare_map = {"U": "X", "O": "X", "J": "X"}
-
-    # Sanitize all sequences for consistent processing
-    seqs = []
-    for s in sequences:
-        if sanitize:
-            # Clean sequence: remove gaps, whitespace, stops; map rare AAs to X
-            s = _sanitize_protein(
-                s, allowed,
-                strip_gaps=True, 
-                strip_whitespace=True, 
-                drop_stops=True,
-                map_rare_to_x=True, 
-                rare_map=rare_map
-            )
-        else:
-            # Use sequence as-is, but handle None values
-            s = s or ""
-        seqs.append(s)
-
-    # Configure pairwise sequence aligner
-    aligner = PairwiseAligner()
-    aligner.substitution_matrix = subs
-    aligner.mode = mode  # "local" (Smith–Waterman) or "global" (Needleman–Wunsch)
-    aligner.open_gap_score = gap_open    # Penalty for starting a gap
-    aligner.extend_gap_score = gap_extend # Penalty for extending a gap
-
-    # Step 1: Compute self-alignment scores for normalization
-    # S(i,i) represents the maximum possible score for sequence i
-    self_scores = np.empty(n, dtype=np.float64)
-    for i, s in tqdm(enumerate(seqs), total=n, desc="Computing self-alignment scores"):
-        if s:  # Non-empty sequence
-            # Self-alignment score, clipped to non-negative to handle gap penalties
-            self_scores[i] = max(aligner.score(s, s), 0.0)
-        else:  # Empty sequence
-            self_scores[i] = 0.0
-
-    # Step 2: Compute pairwise Normalized Alignment Scores
-    # Initialize with identity matrix (diagonal = 1.0 for perfect self-similarity)
-    nas = np.eye(n, dtype=np.float64)
-    
-    # Fill upper triangle, then mirror to lower triangle for symmetry
-    for i in tqdm(range(n), total=n, desc="Computing pairwise NAS"):
-        si = seqs[i]
-        for j in range(i + 1, n):
-            sj = seqs[j]
-            
-            # Compute raw alignment score S(i,j)
-            if si and sj:  # Both sequences non-empty
-                sij = aligner.score(si, sj)
-            else:  # At least one sequence is empty
-                sij = 0.0
-            
-            # Normalize: NAS(i,j) = S(i,j) / sqrt(S(i,i) * S(j,j))
-            # Add epsilon to denominator to prevent division by zero
-            denom = (self_scores[i] * self_scores[j]) ** 0.5 + eps
-            val = sij / denom
-            
-            # Apply clipping to prevent extreme values
-            if clip is not None:
-                lo, hi = clip
-                if val < lo: 
-                    val = lo
-                elif val > hi: 
-                    val = hi
-            
-            # Fill both symmetric positions
-            nas[i, j] = nas[j, i] = val
-
-    # Return distance matrix (1 - similarity) or similarity matrix
-    if return_distance:
-        return (1.0 - nas).astype(np.float32)
-    else:
-        return nas.astype(np.float32)
-
-# %% [markdown]
-# Another approach for clustering would be to build a NJ (Neighbor-Joining) tree from the NAS matrix and then use a clustering algorithm on the tree. This would allow for hierarchical clustering based on the evolutionary relationships between sequences.
-# 
-# Since the proteins are assumed to be quite diverse, we will use HDBSCAN on the NAS matrix instead.
-
-# %%
-# --------------------------
-# 2) Build NJ tree from NAS
-# --------------------------
-def nas_to_biopython_distance_matrix(nas: np.ndarray, names: List[str]) -> DistanceMatrix:
-    """Biopython's NJ expects a DistanceMatrix (lower triangular incl. 0 diagonal)."""
-    assert nas.shape[0] == nas.shape[1] == len(names)
-    dist = 1.0 - nas  # convert similarity -> distance in [0,1]
-    # Biopython DistanceMatrix takes only lower triangle (row i has i+1 elements)
-    matrix = [[0.0]]
-    for i in range(1, len(names)):
-        row = [float(dist[i, j]) for j in range(i + 1)]
-        matrix.append(row)
-    return DistanceMatrix(names, matrix)
-
-def neighbor_joining_tree_from_nas(nas: np.ndarray, names: List[str]):
-    """Construct an NJ tree whose patristic distances approximate the input distances."""
-    dm = nas_to_biopython_distance_matrix(nas, names)
-    constructor = DistanceTreeConstructor()
-    tree = constructor.nj(dm)  # Neighbor-Joining per Saitou & Nei (1987)
-    return tree
-
-# --------------------------
-# 3) Convert NJ tree -> flat clusters by cutting long branches
-#    (simple, transparent rule: cut any branch with length > threshold)
-# --------------------------
-def clusters_from_tree_cut(tree, max_branch_len: float, names: Optional[List[str]] = None) -> Dict[int, List[str]]:
-    """
-    Cut every edge longer than `max_branch_len`. Connected components of the remaining
-    graph define clusters; leaves within each component are a cluster.
-    """
-    # Work on a copy
-    t = deepcopy(tree)
-
-    # Break long edges by detaching their child clade
-    for clade in list(t.find_clades(order="preorder")):
-        if clade.branch_length is not None and clade.branch_length > max_branch_len:
-            parent = t.get_path(clade)[-2] if len(t.get_path(clade)) >= 2 else None
-            if parent is not None:
-                # detach: replace parent's clades with all except this child
-                parent.clades = [c for c in parent.clades if c is not clade]
-
-    # After cuts, collect connected leaf sets by traversing from each remaining top-level clade
-    clusters = {}
-    cid = 0
-    for clade in t.root.clades:
-        leaves = [leaf.name for leaf in clade.get_terminals()]
-        if leaves:
-            clusters[cid] = leaves
-            cid += 1
-
-    # Handle the degenerate case where all leaves remain directly attached to root
-    if not clusters:
-        leaves = [leaf.name for leaf in t.get_terminals()]
-        clusters[0] = leaves
-    return clusters
-
-# --------------------------
-# 4) Optional: turn cluster dict -> label vector aligned to `names`
-# --------------------------
-def labels_from_clusters_dict(clusters: Dict[int, List[str]], names: List[str]) -> np.ndarray:
-    name_to_cluster = {name: -1 for name in names}
-    for cid, leaf_names in clusters.items():
-        for nm in leaf_names:
-            if nm in name_to_cluster:
-                name_to_cluster[nm] = cid
-    return np.array([name_to_cluster[nm] for nm in names], dtype=int)
-
-# ------------------------------------------------------------------------------
-# Custom NJ clustering
-# ------------------------------------------------------------------------------
-# # 2) Build Neighbor-Joining tree from NAS
-# tree = neighbor_joining_tree_from_nas(nas_matrix, seq_names)
-# logger.info(f"NJ tree has {len(tree.get_terminals())} leaves and {len(tree.get_nonterminals())} internal nodes.")
-
-# # Visualize (ASCII and/or matplotlib)
-# Phylo.draw_ascii(tree)        # quick console view
-
-# # ax = plt.gca()  # Get current axes for matplotlib
-# # # Change the size of the figure if needed
-# # ax.figure.set_size_inches(8, 12)  # Optional: adjust figure size
-# # # Set xlimits if needed
-# # ax.set_xlim(0, 1.0)  # Optional: adjust x-axis
-# # Phylo.draw(tree, axes=ax)            # matplotlib figure (optional)
-
-# # 3) Cut the NJ tree into flat clusters, then evaluate
-# #    Choose a branch-length threshold; start coarse (e.g., 0.2) and tune.
-# clusters_dict = clusters_from_tree_cut(tree, max_branch_len=0.20)
-# labels = labels_from_clusters_dict(clusters_dict, seq_names)
-# logger.info(f"Found {len(clusters_dict)} clusters with max branch length 0.20")
-
-# # 4) Evaluate with your function: pass a **distance** matrix (1-NAS) and metric='precomputed'
-# dist_matrix = 1.0 - nas_matrix
-# report = evaluate_clusters(dist_matrix, labels, metric='precomputed')
-# for metric, value in report.items():
-#     logger.info(f"{metric}: {value:.4f}" if isinstance(value, float) else f"{metric}: {value}")
-
-# # Inspect clusters
-# for cid, members in clusters_dict.items():
-#     logger.info(f"[Cluster {cid}]  n={len(members)}  -> {members}")
-
-# # ------------------------------------------------------------------------------
-# # SciKit-Bio based clustering
-# # ------------------------------------------------------------------------------
-# from skbio import DistanceMatrix
-# from skbio.tree import nj
-
-# dist = 1.0 - e3_nas_local_matrix  # Convert similarity to distance
-# dm = DistanceMatrix(dist, list(e3_seq2name.values()))
-# tree = nj(dm)
-# logger.info(tree.ascii_art())
-
-# # ------------------------------------------------------------------------------
-# # SciPy based clustering
-# # ------------------------------------------------------------------------------
-# from scipy.spatial.distance import squareform
-# from scipy.cluster.hierarchy import linkage, fcluster
-
-# # 1) Similarity -> distance in [0,1]
-# dist = 1.0 - nas_matrix
-# condensed = squareform(dist, checks=False)  # SciPy needs condensed form
-
-# # 2) Hierarchical clustering (average linkage is a good default for sequence distances)
-# Z = linkage(condensed, method='average')
-
-# # 3) Flat clusters by distance threshold (tune 't' to your scale; e.g., t=0.3)
-# labels = fcluster(Z, t=0.30, criterion='distance')
-
-# # 4) Evaluate with your function, which supports 'precomputed' distances
-# report = evaluate_clusters(dist, labels, metric='precomputed')
-# logger.info(report)
-
-# # 5) Inspect cluster membership by protein names (seq_names in your code)
-# clusters = {}
-# for name, lab in zip(seq_names, labels):
-#     clusters.setdefault(lab, []).append(name)
-
-# for cid, members in sorted(clusters.items()):
-#     logger.info(f"[Cluster {cid}] n={len(members)} -> {members}")
-
-
-# %% [markdown]
 # ## Load Data
 
-# %%
 df = pd.read_csv(os.path.join(data_curation_dir, 'protacdb_tpddb_protacpedia_protac_dc50_dmax_activities.csv'))
 df
 
-# %% [markdown]
 # ## Cluster POI sequences based on NAS matrix
 
-# %%
 poi_sequences = df['POI_Sequence'].unique().tolist()
 seq2name = {seq: df[df['POI_Sequence'] == seq]['POI_Name'].iloc[0] for seq in poi_sequences}
 
@@ -661,7 +128,6 @@ for name, count in df['POI_Name'].value_counts().items():
     if count == 1:
         logger.info(f"• {name}")
 
-# %%
 poi_nas_dist_matrix = generate_normalized_alignment_matrix(
     sequences=poi_sequences,
     mode="global",
@@ -708,61 +174,24 @@ logger.info("Top 10 most different POI sequences based on average distance:")
 for idx in sorted_indices[:10]:
     logger.info(f"POI Name: {seq2name[poi_sequences[idx]]}, Average Distance: {avg_dists[idx]:.4f}, Number of samples in dataset: {df[df['POI_Sequence'] == poi_sequences[idx]].shape[0]}")
 
-# %%
 # Cluster the POI sequences using HDBSCAN with optimized parameters
-sampler = optuna.samplers.TPESampler(seed=42)
-study = optuna.create_study(direction='maximize', sampler=sampler)
-study.optimize(
-    lambda trial: sequence_clustering_objective(
-        trial,
-        nas_matrix=poi_nas_dist_matrix,
-        is_distance=True,
-    ),
-    n_trials=100,
-)
-
-logger.info(f"Best silhouette score: {study.best_value}")
-logger.info(f"Best parameters: {study.best_params}")
-
-# %%
-# Apply HDBSCAN with the best parameters found
-best_params = study.best_params
-labels = HDBSCAN(
-    min_cluster_size=best_params["min_cluster_size"],
-    min_samples=best_params["min_samples"],
-    cluster_selection_epsilon=best_params["cluster_selection_epsilon"],
-    metric="precomputed",
-    alpha=best_params["alpha"],
-    leaf_size=best_params["leaf_size"],
-    cluster_selection_method=best_params["cluster_selection_method"],
-).fit_predict(poi_nas_dist_matrix)
-
-# Assign cluster labels to sequences
-seq2cluster = {}
-for seq, label in zip(poi_sequences, labels):
-    seq2cluster[seq] = label
+seq2cluster = cluster_prot_sequences(poi_sequences)
 
 # Add cluster labels to the original dataframe
 df['POI_Cluster'] = df['POI_Sequence'].map(seq2cluster)
 
-# Evaluate clustering results
-report = evaluate_clusters(poi_nas_dist_matrix, labels, metric="precomputed")
-for metric, value in report.items():
-    logger.info(f"{metric}: {value:.4f}" if isinstance(value, float) else f"{metric}: {value}")
+# # Evaluate clustering results
+# report = evaluate_clusters(poi_nas_dist_matrix, labels, metric="precomputed")
+# for metric, value in report.items():
+#     logger.info(f"{metric}: {value:.4f}" if isinstance(value, float) else f"{metric}: {value}")
 
-# %% [markdown]
 # ## Cluster SMILES based on Tanimoto distance matrix
 # 
 # Use Butina clustering to cluster the SMILES based on the Tanimoto distance matrix.
 
-# %% [markdown]
 # ### Get Fingerprints
 
-# %%
-# Canonicalize SMILES strings
-df['SMILES'] = df['SMILES'].apply(lambda smi: Chem.MolToSmiles(Chem.MolFromSmiles(smi)))
 
-# %%
 radius = 16
 fp_size = 512
 
@@ -777,8 +206,6 @@ fp_generator = AllChem.GetMorganGenerator(
 )
 
 smiles = df['SMILES'].unique().tolist()
-# Canonicalize SMILES
-smiles = [Chem.MolToSmiles(Chem.MolFromSmiles(smi)) for smi in smiles]
 smiles2mol = {smi: Chem.MolFromSmiles(smi) for smi in smiles}
 smiles2fp = {smi: fp_generator.GetFingerprintAsNumPy(mol) for smi, mol in smiles2mol.items()}
 
@@ -796,7 +223,6 @@ overlapping_smiles = list(set(overlapping_smiles))
 logger.info(f"Number of unique SMILES: {len(smiles):,}")
 logger.info(f"Number of SMILES with overlapping fingerprints: {len(overlapping_smiles)} ({len(overlapping_smiles) / len(smiles) * 100:.2f}%)")
 
-# %%
 def np2bitvect(fp_array: np.ndarray) -> ExplicitBitVect:
     """Convert a numpy array fingerprint to RDKit ExplicitBitVect."""
     bitvect = ExplicitBitVect(len(fp_array))
@@ -805,15 +231,14 @@ def np2bitvect(fp_array: np.ndarray) -> ExplicitBitVect:
             bitvect.SetBit(bit_idx)
     return bitvect
 
-fps = [fp_generator.GetFingerprintAsNumPy(Chem.MolFromSmiles(smi)) for smi in smiles]
-bitvects = [np2bitvect(fp) for fp in fps]
-smiles2bitvect = {smi: bv for smi, bv in zip(smiles, bitvects)}
+fps = [fp_generator.GetFingerprint(Chem.MolFromSmiles(smi)) for smi in smiles]
+# bitvects = [np2bitvect(fp) for fp in fps]
+smiles2bitvect = {smi: bv for smi, bv in zip(smiles, fps)}
 
 # Check that the lengths match
-assert len(bitvects) == len(smiles), "Mismatch between number of fingerprints and SMILES"
+# assert len(bitvects) == len(smiles), "Mismatch between number of fingerprints and SMILES"
 assert len(fps) == len(smiles), "Mismatch between number of fingerprints and SMILES"
 
-# %% [markdown]
 # ### Isolate Held-Out SMILES
 
 def get_avg_dist(fp, fp_list):
@@ -826,7 +251,7 @@ held_out_smiles = []
 
 for task in ['Dmax', 'DC50']:
     subset = df[df['Value_Type'] == task].copy()
-    n_held_out = int(0.05 * subset.shape[0])
+    n_held_out = int(0.1 * subset.shape[0])
     
     fps = [smiles2bitvect[smi] for smi in subset['SMILES'].unique().tolist()]
     
@@ -889,13 +314,10 @@ logger.info('')
 logger.info(f"Total number of entries in the dataset for held-out SMILES: {held_out_df.shape[0]}")
 logger.info(held_out_df.groupby('Database').size())
 
-# %% [markdown]
 # ### Butina and Scaffold Cluster the Data
 
-# %%
 smiles_to_cluster = [s for s in smiles if s not in held_out_smiles]
 
-# %%
 scaffold_clusters = get_bemis_murcko_clusters(smiles_to_cluster)
 clusters_metrics = evaluate_clusters(
     X=np.array([smiles2fp[smi] for smi in smiles_to_cluster]),
@@ -905,7 +327,6 @@ clusters_metrics = evaluate_clusters(
 for metric, value in clusters_metrics.items():
     logger.info(f"{metric}: {value:.4f}" if isinstance(value, float) else f"{metric}: {value}")
 
-# %%
 # Store results for different cutoffs
 cutoff_range = np.arange(0.3, 0.71, 0.01)
 results = []
@@ -940,9 +361,8 @@ for cutoff in tqdm(cutoff_range, desc="Getting and evaluating clusters at differ
 # Convert to DataFrame for easier plotting
 results_df = pd.DataFrame(results)
 
-logger.info(results_df)
+logger.info(results_df.round(2))
 
-# %%
 # Print metrics at a specific cutoff, e.g., 0.48
 best_cutoff = 0.5
 logger.info(f"Metrics at cutoff {best_cutoff}:")
@@ -959,11 +379,9 @@ stats = evaluate_clusters(
 for metric, value in stats.items():
     logger.info(f"{metric}: {value:.4f}" if isinstance(value, float) else f"{metric}: {value}")
 
-# %%
 # Visualize held-out SMILES in UMAP embedding
 held_out_indices = [i for i, smi in enumerate(smiles) if smi in held_out_smiles]
 
-# %%
 smiles2scaffold = {s: c for s, c in zip(smiles_to_cluster, scaffold_clusters)}
 smiles2butina = {s: c for s, c in zip(smiles_to_cluster, butina_clusters)}
 
@@ -988,12 +406,10 @@ for smi in unclustered_smiles:
 logger.info(f"Unique Bemis-Murcko clusters found: {df['SMILES_Scaffold_Cluster'].unique()}")
 logger.info(f"Unique Butina clusters found: {df['SMILES_Butina_Cluster'].unique()}")
 
-# %% [markdown]
 # The following is another method to obtain held-out data based on clustering the SMILES.
 # 
 # We decided to instead isolate the held-out data first, based on their Tanimoto distances to the rest of the data, and then cluster the remaining data. Because of this, the following code is no longer used in the final analysis, but is kept here for reference.
 
-# %%
 # from collections import defaultdict
 # from rdkit import DataStructs
 
@@ -1091,10 +507,8 @@ logger.info(f"Unique Butina clusters found: {df['SMILES_Butina_Cluster'].unique(
 #         total_size = tmp.shape[0]
 #         logger.info(f"{config} - {cluster_type}: Held-out size: {held_out_size}, Total size: {total_size} ({held_out_size / total_size * 100:.2f}%)")
 
-# %% [markdown]
 # ### Plot 5x5 CV Folds
 
-# %%
 
 def create_cv_splits(
     ds: Union[Dataset, pd.DataFrame],
@@ -1283,7 +697,6 @@ def plot_folds_distribution(df, cv_splits, title="Fold Distribution", held_out_d
         plt.tight_layout()
         # plt.show()
 
-# %%
 for task in ['Dmax', 'DC50']:
     # Isolate task dataframe and remove held-out samples
     subset_df = df[df['Value_Type'] == task].reset_index(drop=True).copy()
@@ -1325,10 +738,8 @@ for task in ['Dmax', 'DC50']:
             plot_held_out=True if clustering is None else False,
         )
 
-# %% [markdown]
 # ## Push to Hugging Face
 
-# %%
 dmax_df = df[df['Value_Type'] == 'Dmax']
 dc50_df = df[df['Value_Type'] == 'DC50']
 
@@ -1347,19 +758,22 @@ try:
         ('Dmax', dmax_ds),
         ('DC50', dc50_ds),
     ]:
-        # dataset.push_to_hub(
-        #     "ailab-bio/PROTAC-Degradation-Predictor-Dataset",
-        #     config_name=config,
-        #     private=True,
-        # )
+        dataset.push_to_hub(
+            "ailab-bio/TACK",
+            config_name=config,
+            private=True,
+        )
+        logger.info('Dataset pushed to Hugging Face Hub')
         logger.info(dataset)
+        # Log the number of held-out samples in the dataset card
+        num_held_out = dataset.filter(lambda x: x['SMILES_Held_Out'])['SMILES_Held_Out'].count()
+        total_samples = len(dataset)
+        logger.info(f"Number of held-out samples in {config} dataset: {num_held_out} ({num_held_out / total_samples * 100:.2f}%)")
 except Exception as e:
     logger.info(f"Error pushing to Hugging Face Hub: {e}")
 
-# %% [markdown]
 # ## Multitask Assembly and Clustering
 
-# %%
 # Prepare Keys for Merging
 # We create a temporary column to handle NaNs in 'Assay_Time' so that 
 # 'Unspecified' (NaN) matches 'Unspecified' (NaN).
@@ -1376,9 +790,9 @@ keys = ['SMILES', 'POI_Name', 'Cell_Line', 'Ligase_Name', 'Reference', 'Assay_Ti
 
 # Rename Value Columns
 # This prevents collision and clearly labels which value is DC50 vs Dmax
-value_cols = ['Value', 'Value_Type', 'Value_Unit', 'Value_Operator', 'Value_Category', 
-              'Value_Range_Min', 'Value_Range_Max', 'Value_Error', 'Value_Concentration', 
-              'Value_Concentration_Unit', 'Value_Mean', 'TPD_ID']
+value_cols = ['Value', 'Value_Type', 'Value_Unit', 'Value_Operator', 'Value_Category',
+              'Value_Range_Min', 'Value_Range_Max', 'Value_Error', 'Value_Concentration',
+              'Value_Concentration_Unit', 'TPD_ID']
 
 dc50_renamed = dc50_df.rename(columns={c: f"{c}_DC50" for c in value_cols})
 dmax_renamed = dmax_df.rename(columns={c: f"{c}_Dmax" for c in value_cols})
@@ -1387,7 +801,7 @@ dmax_renamed = dmax_df.rename(columns={c: f"{c}_Dmax" for c in value_cols})
 # Inner join ensures we only keep rows that exist in BOTH files with matching keys
 multitask_df = pd.merge(dc50_renamed, dmax_renamed, on=keys, how='inner', suffixes=('', '_y'))
 
-# 5. Clean Up Metadata
+# Clean Up Metadata
 # Consolidate duplicate metadata columns (like POI_Sequence, Description, etc.)
 y_cols = [c for c in multitask_df.columns if c.endswith('_y')]
 
@@ -1401,10 +815,14 @@ for y_col in y_cols:
 multitask_df_clean = multitask_df.drop(columns=y_cols + ['Assay_Time_Filled', 'Assay_Filled'])
 multitask_df = multitask_df_clean.dropna(subset=['Value_DC50', 'Value_Dmax'], how='any')
 
+# Log the number of held-out samples in the multitask dataset
+num_held_out_multitask = multitask_df[multitask_df['SMILES_Held_Out']].shape[0]
+total_multitask_samples = multitask_df.shape[0]
+logger.info(f"Number of held-out samples in multitask dataset: {num_held_out_multitask} ({num_held_out_multitask / total_multitask_samples * 100:.2f}%)")
+
 # Save Output
 multitask_df.to_csv(data_tack_dir / "protacdb_tpddb_protacpedia_protac_multitask_activities_processed.csv", index=False)
 
-# %%
 def convert_to_plog10(value):
     """ Convert a value to p-log10 scale. """
     return -np.log10(value + 1e-12)
@@ -1491,16 +909,15 @@ for clustering in [None, 'SMILES_Scaffold_Cluster', 'SMILES_Butina_Cluster', 'PO
     )
     # plt.show()
 
-# %%
 ds = Dataset.from_pandas(multitask_df, preserve_index=False)
 
 try:
-    pass
-    # ds.push_to_hub(
-    #     "ailab-bio/PROTAC-Degradation-Predictor-Dataset",
-    #     config_name="multitask",
-    #     private=True,
-    # )
+    ds.push_to_hub(
+        "ailab-bio/TACK",
+        # "ailab-bio/PROTAC-Degradation-Predictor-Dataset",
+        config_name="multitask",
+        private=True,
+    )
 except Exception as e:
     logger.info(f"Error pushing multitask dataset to Hugging Face Hub: {e}")
 logger.info(ds)

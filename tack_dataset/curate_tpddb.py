@@ -396,6 +396,17 @@ class TpddbCurator:
                     poi_info = self._find_poi_info(row, tpd_id, activity_df, moa_by_poi, moa_by_name)
                     if not poi_info:
                         continue
+                    
+                    # Clean cell line ID, by taking the first one if ',' is present
+                    if 'Cell_Line_ID' in row and pd.notnull(row['Cell_Line_ID']):
+                        row['Cell_Line_ID'] = str(row['Cell_Line_ID']).split(',')[0].strip()
+                    
+                    # If the cell line ID is not NaN, use the cell embedding to
+                    # stardardize the cell line name
+                    if 'Cell_Line_ID' in row and pd.notnull(row['Cell_Line_ID']):
+                        standardized_name = self.cell_embedding.cell_id2data.get(row['Cell_Line_ID'], {}).get('ID')
+                        if standardized_name:
+                            row['Cell_Line'] = standardized_name
 
                     # Get the species of the cell line using the cell embedding
                     species = get_cell_species(row.get('Cell_Line'), cell_embedding=self.cell_embedding, cell_id=row.get('Cell_Line_ID'))
@@ -574,27 +585,69 @@ class TpddbCurator:
     # Step 7: Deduplicate
     # ------------------------------------------------------------------
 
+    # def deduplicate(self, df: pd.DataFrame) -> pd.DataFrame:
+    #     """
+    #     Remove compound-cell groups that have more than one Dmax value.
+
+    #     These ambiguous groups arise when multiple Dmax measurements at
+    #     different concentrations are not tagged with a concentration.
+    #     """
+    #     key_cols = ['TPD_ID', 'SMILES', 'POI_Name', 'Ligase_Name', 'Cell_Line_ID']
+    #     grouped = df.groupby(key_cols)
+    #     multi_dmax = grouped.filter(lambda x: (x['Value_Type'] == 'Dmax').sum() > 1)
+
+    #     logger.info(f"Entries with multiple Dmax values (to remove): {len(multi_dmax):,}")
+
+    #     df_clean = df.merge(
+    #         multi_dmax[key_cols + ['Value_Type', 'Value']],
+    #         on=key_cols + ['Value_Type', 'Value'],
+    #         how='left',
+    #         indicator=True,
+    #     )
+    #     df_clean = df_clean[df_clean['_merge'] == 'left_only'].drop(columns=['_merge'])
+    #     df_clean = df_clean.reset_index(drop=True)
+
+    #     logger.info(f"After deduplication: {len(df_clean):,} rows")
+    #     return df_clean
+
     def deduplicate(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Remove compound-cell groups that have more than one Dmax value.
-
-        These ambiguous groups arise when multiple Dmax measurements at
-        different concentrations are not tagged with a concentration.
+        Deduplicate compound-cell groups by taking the median of Dmax values.
+        For all other metadata, keep the most frequent non-NaN value.
         """
         key_cols = ['TPD_ID', 'SMILES', 'POI_Name', 'Ligase_Name', 'Cell_Line_ID']
-        grouped = df.groupby(key_cols)
-        multi_dmax = grouped.filter(lambda x: (x['Value_Type'] == 'Dmax').sum() > 1)
+        
+        # Separate Dmax rows from the rest of the dataframe
+        dmax_mask = df['Value_Type'] == 'Dmax'
+        df_dmax = df[dmax_mask]
+        df_other = df[~dmax_mask]
+        
+        # Safeguard if there are no Dmax values at all
+        if df_dmax.empty:
+            return df
+            
+        # Count groups with multiple Dmax values for logging
+        dmax_counts = df_dmax.groupby(key_cols).size()
+        multi_dmax_groups = (dmax_counts > 1).sum()
+        logger.info(f"Groups with multiple Dmax values (to merge via median): {multi_dmax_groups:,}")
 
-        logger.info(f"Entries with multiple Dmax values (to remove): {len(multi_dmax):,}")
+        # Helper function to find the most frequent non-NaN value
+        def most_frequent(x):
+            # value_counts automatically drops NaNs by default
+            counts = x.value_counts()
+            # Return the most frequent value, or pd.NA if the series is entirely empty/NaNs
+            return counts.index[0] if not counts.empty else pd.NA
 
-        df_clean = df.merge(
-            multi_dmax[key_cols + ['Value_Type', 'Value']],
-            on=key_cols + ['Value_Type', 'Value'],
-            how='left',
-            indicator=True,
-        )
-        df_clean = df_clean[df_clean['_merge'] == 'left_only'].drop(columns=['_merge'])
-        df_clean = df_clean.reset_index(drop=True)
+        # Create an aggregation dictionary: 
+        # Calculate 'median' for Value, and use the custom mode function for metadata
+        agg_dict = {col: most_frequent for col in df.columns if col not in key_cols}
+        agg_dict['Value'] = 'median'
+
+        # Group and aggregate Dmax rows
+        df_dmax_clean = df_dmax.groupby(key_cols, as_index=False).agg(agg_dict)
+
+        # Recombine the cleanly aggregated Dmax rows with the non-Dmax rows
+        df_clean = pd.concat([df_other, df_dmax_clean], ignore_index=True)
 
         logger.info(f"After deduplication: {len(df_clean):,} rows")
         return df_clean

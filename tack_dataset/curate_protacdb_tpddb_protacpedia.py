@@ -11,6 +11,15 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import QuantileTransformer, MinMaxScaler
 
+# Check if protac_splitter is installed
+try:
+    from protac_splitter import split_protac
+    PROTAC_SPLITTER_AVAILABLE = True
+except ImportError:
+    PROTAC_SPLITTER_AVAILABLE = False
+
+
+from tackai.data.embeddings.cell_embeddings import CellEmbedding
 from tack_dataset.logging_utils import setup_logging
 from tack_dataset.curation_utils import convert_to_nM
 
@@ -79,100 +88,85 @@ logger.info('PROTACpedia:\n' + str(get_report(protacpedia_df).round(2).to_markdo
 merged_df = pd.concat([protacdb_df, tpddb_df, protacpedia_df], ignore_index=True)
 logger.info('Merged:\n' + str(get_report(merged_df).round(2).to_markdown(index=False)))
 
-# ## Remove Duplicates
+# ## Normalize DC50 units to nM before aggregation
+merged_df.loc[merged_df['Value_Type'] == 'DC50', 'Value'] = (
+    merged_df[merged_df['Value_Type'] == 'DC50']
+    .apply(lambda row: convert_to_nM(row['Value'], row['Value_Unit']), axis=1)
+)
+merged_df.loc[merged_df['Value_Type'] == 'DC50', 'Value_Unit'] = 'nM'
 
-key_cols = ['SMILES', 'POI_Name', 'POI_Sequence', 'Ligase_Name', 'Cell_Line', 'Value_Type', 'Value_Unit', 'Assay_Time', 'Assay']
+if PROTAC_SPLITTER_AVAILABLE:
+    # TODO: Add ternary split of PROTACs into warhead, linker, and E3 ligand
+    pass
 
-# Find and print the duplicated rows based on key columns
-duplicated_rows = merged_df[merged_df.duplicated(subset=key_cols, keep=False)]
-logger.info(f'Number of duplicated rows based on {key_cols}: {len(duplicated_rows)}')
+# ## Aggregate Duplicates
+# Group by identity columns and aggregate: median for numerics, most common for
+# categoricals, join unique values for provenance columns (Reference, Database, etc.)
 
-# Print all the References for the duplicated rows
-for ref in duplicated_rows['Reference'].unique():
-    logger.info(f'• {ref}')
-logger.info('-' * 80)
+key_cols = ['SMILES', 'POI_Name', 'POI_Sequence', 'Ligase_Name',
+            'Cell_Line', 'Value_Type', 'Value_Unit']
 
-# For each of the duplicated rows, group by the key columns and list the different Values
-# grouped = duplicated_rows.groupby(key_cols, dropna=False)
-grouped = merged_df.groupby(key_cols, dropna=False)
-num_conflicts = 0
-i = 0
-for name, group in grouped:
-    values = group['Value'].unique()
-    if len(values) > 1:
-        i += 1
-        logger.info(f'Key N.{i}')
-        for k in key_cols:
-            logger.info(f'{k}: {len(group[k].unique())}x {group[k].unique()}')
-        logger.info(f'Values: {len(values)}x {values}')
-        logger.info(f'Assays: {len(group["Assay"].unique())}x {group["Assay"].unique()}')
-        logger.info(f'Databases: {len(group["Database"].unique())}x {group["Database"].unique()}')
-        logger.info(f'References: {len(group["Reference"].unique())}x {group["Reference"].unique()}')
-        logger.info('-' * 80)
-        num_conflicts += len(values)
 
-logger.info(f'Number of conflicts found: {num_conflicts}')
+def first_non_null(s):
+    non_null = s.dropna()
+    return non_null.iloc[0] if len(non_null) > 0 else np.nan
 
-# Remove duplicated all rows that have a duplicate, use duplicated_df to find them
-merged_df = merged_df[~merged_df.duplicated(subset=key_cols, keep=False)].copy()
-logger.info(f'Original dataset size: {len(merged_df):,}')
-logger.info(f'Cleaned dataset size: {len(merged_df):,}')
 
-# Concatenate all DataFrames and remove duplicates based on key columns with the following priority: TPDdb > PROTAC-DB > PROTAC-Pedia.
-# This ensures that for duplicate entries, the data from the more reliable source is retained.
+def most_common(s):
+    non_null = s.dropna()
+    return non_null.mode().iloc[0] if len(non_null) > 0 else np.nan
 
-logger.info(f'Original dataset size: {len(merged_df):,}')
 
-# Remove duplicates based on key_cols, but keep based on 'Database' priority: TPD-DB > PROTAC-DB > PROTAC-Pedia
-# Sort by Database priority
-database_priority = {'TPD-DB': 0, 'PROTAC-DB': 1, 'PROTAC-Pedia': 2}
-merged_df['Database_Priority'] = merged_df['Database'].map(database_priority)
-merged_df = merged_df.sort_values(by='Database_Priority')
+def join_unique(s):
+    vals = s.dropna().unique()
+    return '; '.join(str(v) for v in vals) if len(vals) > 0 else np.nan
 
-# Remove duplicates based on key_cols, keep the first (highest priority)
-key_cols = ['SMILES', 'POI_Name', 'POI_Sequence', 'Ligase_Name', 'Cell_Line', 'Value_Type']
-merged_df = merged_df[~merged_df.duplicated(subset=key_cols, keep='first')].copy()
 
-# Drop the Database_Priority column
-merged_df = merged_df.drop(columns=['Database_Priority'])
-logger.info(f'Cleaned dataset size: {len(merged_df):,}')
+numeric_cols = ['Value', 'Value_Error', 'Value_Range_Min', 'Value_Range_Max', 'Value_Concentration', 'Assay_Time']
+mode_cols = ['Value_Operator', 'Value_Category', 'Value_Concentration_Unit', 'Modality']
+identity_cols = ['POI_UniProt', 'Ligase_UniProt', 'Ligase_Sequence', 'Cell_Line_ID', 'Cell_Line_Species']
+provenance_cols = ['Reference', 'Description', 'Database', 'Assay']
+if 'TPD_ID' in merged_df.columns:
+    provenance_cols.append('TPD_ID')
+
+agg_dict = {}
+for col in numeric_cols:
+    if col in merged_df.columns:
+        agg_dict[col] = 'median'
+for col in mode_cols:
+    if col in merged_df.columns:
+        agg_dict[col] = most_common
+for col in identity_cols:
+    if col in merged_df.columns:
+        agg_dict[col] = first_non_null
+for col in provenance_cols:
+    if col in merged_df.columns:
+        agg_dict[col] = join_unique
+
+logger.info(f'Dataset size before aggregation: {len(merged_df):,}')
+merged_df = (
+    merged_df
+    .groupby(key_cols, dropna=False)
+    .agg(agg_dict)
+    .reset_index()
+)
+logger.info(f'Dataset size after aggregation: {len(merged_df):,}')
 
 # Remove columns for which all values are NaN
-merged_df = merged_df.dropna(axis=1, how='all').drop_duplicates()
+merged_df = merged_df.dropna(axis=1, how='all')
 
 df = merged_df.copy()
 
-# ## Convert Concentration to Standard Units
+## Add cell descriptions to the DataFrame
 
-tmp = df[df['Value_Type'] == 'DC50']
-tmp['Value_Unit'].value_counts()
-
-df.loc[df['Value_Type'] == 'DC50', 'Value'] = df[df['Value_Type'] == 'DC50'].apply(lambda row: convert_to_nM(row['Value'], row['Value_Unit']), axis=1)
-df.loc[df['Value_Type'] == 'DC50', 'Value_Unit'] = 'nM'
-
-df[df['Value_Type'] == 'DC50']['Value_Unit'].value_counts()
-
-# ## Identify Cell Line Species
-
-# Use the CelloSaurus API to identify species for each cell line has missing species
-
-# Get all cell lines with missing species
-cell_line2species = {}
-missing_species_cell_lines = df[df['Cell_Line_Species'].isna()]['Cell_Line'].unique().tolist()
-
-for cell_line in missing_species_cell_lines:
-    url = f"https://web.expasy.org/cellosaurus/api/cell-line/{cell_line}"
-    response = requests.get(url)
-    if response.status_code == 200:
-        data = response.json()
-        species = data.get('species', 'Unknown')
-        cell_line2species[cell_line] = species
-    else:
-        cell_line2species[cell_line] = 'Unknown'
-    time.sleep(0.1)  # To avoid hitting the API rate limit
-
-# # Map the species back to the DataFrame
-# df.loc[df['Cell_Line'].isin(cell_line2species.keys()), 'Cell_Line_Species'] = df['Cell_Line'].map(cell_line2species)
+cell_embedding = CellEmbedding()
+descriptions = {}
+for cell_line in df['Cell_Line_ID'].dropna().unique():
+    descriptions[cell_line] = cell_embedding.cell2description.get(
+        cell_line,
+        cell_embedding.not_found_description,
+    )
+df['Cell_Line_Description'] = df['Cell_Line_ID'].map(descriptions)
 
 # ## Save to CSV
 

@@ -212,6 +212,7 @@ def _get_with_retry(
 @lru_cache()
 def fetch_uniprot_for_gene(gene_symbol: str, organism: str = 'Homo sapiens') -> Optional[dict]:
     """ Fetch Uniprot information based on provided gene name and organism.
+        Check API query format here: https://www.uniprot.org/help/query-fields
     
     Args:
         gene_symbol (str):
@@ -252,6 +253,7 @@ def fetch_uniprot_for_gene(gene_symbol: str, organism: str = 'Homo sapiens') -> 
 @lru_cache()
 def fetch_uniprot_for_sequence(sequence: str) -> Optional[dict]:
     """ Fetch Uniprot information based on provided gene name and organism.
+        Check API query format here: https://www.uniprot.org/help/query-fields
     
     Args:
         gene_symbol (str):
