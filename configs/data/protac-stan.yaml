@@ -18,8 +18,8 @@ cell_line_col: "Cell_Line_ID"
 # Proteins
 use_poi_precomputed_embedding: true
 use_ligase_precomputed_embedding: true
-poi_embeddings_file: "path/to/ESM-S/embeddings.npz"
-ligase_embeddings_file: "path/to/ESM-S/embeddings.npz"
+poi_embeddings_file: "/cephyr/users/ribes/Alvis/mimer/stefano/TACK/data/tack/embeddings.npz"
+ligase_embeddings_file: "/cephyr/users/ribes/Alvis/mimer/stefano/TACK/data/tack/embeddings.npz"
 poi_embeddings_per_residue: false
 ligase_embeddings_per_residue: false
 use_poi_pca: false
