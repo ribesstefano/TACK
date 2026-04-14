@@ -158,7 +158,7 @@ def save_predictions(targets, probs, preds, meta_df, output_path, fold_id, task)
 
 def main():
     parser = argparse.ArgumentParser(description="Train PROTAC-STAN with cross-validation")
-    parser.add_argument('--task', type=str, choices=['multitask', 'dc50', 'dmax'], required=True)
+    parser.add_argument('--task', type=str, choices=['bin', 'dc50', 'dmax'], required=True)
     parser.add_argument('--data_dir', type=str, default='data/custom')
     parser.add_argument('--config', type=str, default='config.toml')
     parser.add_argument('--output_dir', type=str, default=None)

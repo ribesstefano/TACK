@@ -106,10 +106,60 @@ WANDB_API_KEY=your_wandb_api_key
 
 ## Training Pipeline
 
+All commands below assume you are in the `PROTAC-STAN/` directory.
+
 ### Step 1: Generate ESM-S Protein Embeddings
 
-This step requires GPU access. Run once per dataset:
+This step requires GPU access. Run once per dataset.
 
+The embedding script depends on `torchdrug`, which is only available inside the
+`esm-plus.sif` container.
+
+**With Apptainer (HPC) — recommended:**
+
+Two flags are required:
+- `--writable-tmpfs`: allows the container to write compiled library caches to
+  a temporary in-memory overlay (needed by `lmdb`/`torchdrug`)
+- `-B ~/.cache/huggingface:/root/.cache/huggingface`: makes the host HuggingFace
+  cache available inside the container so the TACK dataset can be downloaded
+
+```bash
+cd PROTAC-STAN
+
+# Load your HuggingFace token from the .env file
+export HF_TOKEN=$(grep HF_TOKEN .env | cut -d'"' -f2)
+
+apptainer exec --nv --writable-tmpfs \
+    -B ~/.cache/huggingface:/root/.cache/huggingface \
+    --env HF_TOKEN="$HF_TOKEN" \
+    esm-plus.sif bash -c "
+    pip install 'lmdb==1.3.0' --force-reinstall -q &&
+    python esm_embed/embed_proteins.py \
+        --model_dir esm_embed/model \
+        --output_dir data/custom
+"
+```
+
+This loads all TACK configs from HuggingFace by default. To use a local CSV
+instead (avoids network access and the HF token requirement):
+
+```bash
+apptainer exec --nv --writable-tmpfs \
+    -B ~/.cache/huggingface:/root/.cache/huggingface \
+    --env HF_TOKEN="$HF_TOKEN" \
+    esm-plus.sif bash -c "
+    pip install 'lmdb==1.3.0' --force-reinstall -q &&
+    python esm_embed/embed_proteins.py \
+        --model_dir esm_embed/model \
+        --output_dir data/custom \
+        --custom_dataset_csv path/to/your/data.csv
+```
+
+The script is incremental: if output files already exist, only proteins with
+missing embeddings are processed. Each run saves both `.pkl` and `.npz`
+versions of the outputs.
+
+**With Conda environment:**
 ```bash
 cd PROTAC-STAN/esm_embed
 python embed_proteins.py --output_dir ../data/custom
@@ -125,12 +175,17 @@ cd PROTAC-STAN
 # Choose your task
 python scripts/prepare_data.py --task dc50
 python scripts/prepare_data.py --task dmax
-python scripts/prepare_data.py --task multitask
+python scripts/prepare_data.py --task bin
 ```
 
 **Custom CSV dataset:**
 ```bash
 python scripts/prepare_data.py --task dc50 --custom_dataset_csv path/to/your/data.csv
+```
+
+**With Apptainer (HPC):**
+```bash
+apptainer exec protac-stan.sif python scripts/prepare_data.py --task dc50
 ```
 
 ### Step 3: Train
@@ -140,17 +195,17 @@ Run 5×5 cross-validation training:
 ```bash
 python scripts/train_cv.py --task dc50
 python scripts/train_cv.py --task dmax
-python scripts/train_cv.py --task multitask
+python scripts/train_cv.py --task bin
 ```
 
 **Disable WandB logging:**
 ```bash
-python scripts/train_cv.py --task multitask --no_wandb
+python scripts/train_cv.py --task bin --no_wandb
 ```
 
 **With Apptainer (HPC):**
 ```bash
-apptainer exec --nv protac-stan.sif python scripts/train_cv.py --task multitask
+apptainer exec protac-stan.sif python scripts/train_cv.py --task bin
 ```
 
 ---

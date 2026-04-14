@@ -1,20 +1,25 @@
-import sys
 import os
+import sys
+from typing import Union, Optional
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import argparse
 import hashlib
 import json
 import shutil
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 from rdkit import Chem
 from rdkit.Chem import Descriptors
-from sklearn.model_selection import KFold
-from tqdm import tqdm
+from sklearn.model_selection import KFold, GroupKFold
+from datasets import load_dataset
+
 from data import PROTACData
 
 DATASET_NAME = "ailab-bio/TACK"
-TASK_TO_HF_CONFIG = {'multitask': 'multitask', 'dc50': 'DC50', 'dmax': 'Dmax'}
+TASK_TO_HF_CONFIG = {'bin': 'multitask', 'dc50': 'DC50', 'dmax': 'Dmax'}
 DC50_THRESH = 100.0
 DMAX_THRESH = 80.0
 
@@ -55,7 +60,7 @@ def compute_label(row, task: str):
         return 1 if dc50_val is not None and dc50_val <= DC50_THRESH else (0 if dc50_val else np.nan)
     elif task == 'dmax':
         return 1 if dmax_val is not None and dmax_val >= DMAX_THRESH else (0 if dmax_val else np.nan)
-    elif task == 'multitask':
+    elif task == 'bin':
         if dc50_val is not None and dc50_val > DC50_THRESH:
             return 0
         if dmax_val is not None and dmax_val < DMAX_THRESH:
@@ -93,27 +98,45 @@ def compute_descriptors(smiles_list: list) -> tuple:
     return descriptors, valid_indices, desc_cols
 
 
-def generate_cv_splits(groups: np.ndarray, n_splits: int = 5, n_repeats: int = 5, seed: int = 42) -> list:
-    unique_groups = np.unique(groups)
-    splits = []
+def create_cv_splits(
+    ds: pd.DataFrame,
+    n_splits: int = 5,
+    n_repeats: int = 5,
+    group_col: Optional[str] = None,
+    base_seed: int = 42,
+):
+    """Create repeated k-fold cross-validation splits.
+    
+    Args:
+        ds: Dataset or DataFrame to split.
+        n_splits: Number of folds.
+        n_repeats: Number of repeats.
+        group_col: Column name for grouping (if None, uses standard K-Fold).
+        base_seed: Base random seed.
+        
+    Yields:
+        Dictionary with repeat, cv_fold, fold, train_idx, test_idx.
+    """
+    if group_col is None:
+        groups = np.zeros(len(ds))
+    else:
+        groups = np.array(ds[group_col])
     
     for repeat in range(n_repeats):
-        rng = np.random.RandomState(seed + repeat)
-        shuffled = unique_groups.copy()
-        rng.shuffle(shuffled)
-        kf = KFold(n_splits=n_splits)
+        seed = base_seed + repeat
+        if group_col is None:
+            kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        else:
+            kf = GroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
         
-        for fold_idx, (train_grp_idx, test_grp_idx) in enumerate(kf.split(shuffled)):
-            train_groups = set(shuffled[train_grp_idx])
-            test_groups = set(shuffled[test_grp_idx])
-            splits.append({
+        for fold, (train_idx, test_idx) in enumerate(kf.split(X=np.zeros(len(groups)), groups=groups)):
+            yield {
                 "repeat": repeat,
-                "fold": fold_idx,
-                "global_fold_id": repeat * n_splits + fold_idx,
-                "train_idx": np.where(np.isin(groups, list(train_groups)))[0].tolist(),
-                "test_idx": np.where(np.isin(groups, list(test_groups)))[0].tolist()
-            })
-    return splits
+                "fold": fold,
+                "global_fold_id": repeat * n_splits + fold,
+                "train_idx": train_idx,
+                "test_idx": test_idx,
+            }
 
 
 def load_data(args) -> pd.DataFrame:
@@ -121,7 +144,6 @@ def load_data(args) -> pd.DataFrame:
         print(f"Loading custom CSV: {args.custom_dataset_csv}")
         return pd.read_csv(args.custom_dataset_csv)
     
-    from datasets import load_dataset
     hf_config = TASK_TO_HF_CONFIG[args.task]
     print(f"Loading from HuggingFace: {DATASET_NAME} ({hf_config})")
     ds = load_dataset(DATASET_NAME, hf_config, split="train", token=True)
@@ -187,14 +209,18 @@ def process_subset(args, held_out: bool):
     
     # Generate CV splits (training only)
     if not held_out:
-        group_col = 'SMILES_Scaffold_Cluster'
-        if group_col in df.columns:
-            groups = df[group_col].fillna(-1).astype(int).astype(str).values
-        else:
-            print(f"Warning: {group_col} not found, using index-based splits")
-            groups = np.arange(len(df)).astype(str)
+        group_col = 'SMILES_Scaffold_Cluster' if 'SMILES_Scaffold_Cluster' in df.columns else None
+        if group_col is None:
+            print(f"Warning: SMILES_Scaffold_Cluster not found, using standard K-Fold")
         
-        splits = generate_cv_splits(groups)
+        # Call your custom function and format for JSON serialization
+        splits = []
+        for split_dict in create_cv_splits(df, group_col=group_col):
+            # json.dump requires standard lists, so we apply .tolist() to the numpy arrays
+            split_dict["train_idx"] = split_dict["train_idx"].tolist()
+            split_dict["test_idx"] = split_dict["test_idx"].tolist()
+            splits.append(split_dict)
+            
         splits_path = f"cv_splits_{args.task}.json"
         with open(splits_path, 'w') as f:
             json.dump(splits, f)
@@ -218,7 +244,7 @@ def process_subset(args, held_out: bool):
 
 def main():
     parser = argparse.ArgumentParser(description="Prepare PROTAC data for training")
-    parser.add_argument('--task', type=str, choices=['multitask', 'dc50', 'dmax'], required=True)
+    parser.add_argument('--task', type=str, choices=['bin', 'dc50', 'dmax'], required=True)
     parser.add_argument('--custom_dataset_csv', type=str, default=None,
                         help='Path to custom CSV (overrides HuggingFace)')
     parser.add_argument('--output_dir', type=str, default='data/custom')
