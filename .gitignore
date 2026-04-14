@@ -173,6 +173,7 @@ notebooks/per-protein*
 checkpoints*/
 predictions*/
 ensemble_results*/
+submission*/
 plots*/
 analysis/
 env*/
