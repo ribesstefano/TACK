@@ -513,7 +513,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
     def featurize_samples_batch(
         self,
         examples: List[Dict],
-        return_tensor: str = 'np',
+        return_tensor: Literal['np', 'pt', 'xgb'] = 'np',
         shared_cache: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Batch-featurize multiple samples efficiently.
@@ -692,7 +692,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         # Fast path for Lightning models: build one batched tensor dict directly
         # from the already-computed matrices, skipping the per-sample loop and
         # the re-stacking that _predict_lightning_batch would otherwise do.
-        if return_tensor == 'pt_batch':
+        if return_tensor == 'pt':
             batch_out: Dict[str, torch.Tensor] = {}
 
             if self.use_fingerprints and self.fp_embedder is not None:

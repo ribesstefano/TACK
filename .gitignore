@@ -170,6 +170,7 @@ lightning_logs/
 notebooks/per-protein*
 *slurm*.out
 .DS_Store
+ensembles*/
 checkpoints*/
 predictions*/
 ensemble_results*/
