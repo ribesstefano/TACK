@@ -52,9 +52,15 @@ def evaluate(model, loader, device, criterion=None):
             outputs = model(protac, e3, poi)
             if criterion:
                 running_loss += criterion(outputs, label).item()
+
+            # Use torch.max to match the authors exactly
+            # NOTE: Their model outputs two values even though it's a binary
+            # classification task... so we match their approach
+            _, preds = torch.max(outputs.data, dim=1)
             
+            # Grab the probability of class 1 for every item in the batch, i.e.,
+            # what's the probability of being class 1 (degrader)?
             probs = torch.softmax(outputs, dim=1)[:, 1]
-            preds = torch.argmax(outputs, dim=1)
             
             all_probs.extend(probs.cpu().numpy())
             all_preds.extend(preds.cpu().numpy())
@@ -66,7 +72,8 @@ def evaluate(model, loader, device, criterion=None):
         'loss': running_loss / len(loader) if criterion else 0.0
     }
     try:
-        metrics['auc'] = roc_auc_score(all_targets, all_probs)
+        # Pass all_preds (hard 0s and 1s) instead of all_probs to roc_auc_score
+        metrics['auc'] = roc_auc_score(all_targets, all_preds)
     except ValueError:
         metrics['auc'] = 0.0
     

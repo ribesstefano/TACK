@@ -3,10 +3,11 @@ Ensemble Predictor for TACK Models
 Handles loading and prediction from multiple model types (XGBoost, Lightning)
 with weighted averaging and uncertainty quantification.
 """
-import os
 import re
+import time
 import pickle
 import warnings
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Literal
 from dataclasses import dataclass, field
@@ -411,6 +412,7 @@ class EnsemblePredictor:
         datamodule_dir: Optional[Union[str, Path]] = None,
         weights: Optional[Dict[str, float]] = None,
         device: str = 'cpu',
+        n_jobs: Optional[int] = None,
         pattern: Optional[str] = None,
     ) -> 'EnsemblePredictor':
         """
@@ -423,6 +425,7 @@ class EnsemblePredictor:
             task: Task type
             label_name: Label column name for denormalization
             device: Device for inference
+            n_jobs: Number of threads for running XGBoost models
             pattern: Optional regex pattern to filter model files
             
         Returns:
@@ -454,7 +457,7 @@ class EnsemblePredictor:
             
             try:
                 model, datamodule = cls._load_model_and_datamodule(
-                    model_file, device, datamodule_dir
+                    model_file, device, datamodule_dir, n_jobs
                 )
                 models[model_name] = model
                 datamodules[model_name] = datamodule
@@ -566,6 +569,7 @@ class EnsemblePredictor:
         model_path: Path,
         device: str,
         datamodule_dir: Optional[Path] = None,
+        n_jobs: Optional[int] = None,
     ) -> Tuple[Any, Any]:
         """Load a model and its corresponding datamodule."""
         suffix = model_path.suffix.lower()
@@ -576,7 +580,7 @@ class EnsemblePredictor:
             )
         elif suffix in ['.json', '.ubj', '.pkl']:
             return EnsemblePredictor._load_xgboost_model(
-                model_path, datamodule_dir
+                model_path, datamodule_dir, n_jobs
             )
         else:
             raise ValueError(f"Unsupported model format: {suffix}")
@@ -686,6 +690,7 @@ class EnsemblePredictor:
     def _load_xgboost_model(
         model_path: Path,
         datamodule_dir: Optional[Path] = None,
+        n_jobs: Optional[int] = None,
     ) -> Tuple[Any, Any]:
         """Load an XGBoost model."""        
         suffix = model_path.suffix.lower()
@@ -693,7 +698,8 @@ class EnsemblePredictor:
         if suffix in ['.json', '.ubj']:
             model = xgb.Booster()
             model.load_model(str(model_path))
-            model.n_jobs = 4
+            model.n_jobs = n_jobs
+            model.nthread = n_jobs
         elif suffix == '.pkl':
             with open(model_path, 'rb') as f:
                 model = pickle.load(f)
@@ -960,6 +966,7 @@ class EnsemblePredictor:
     def featurize_input_batch(
         self,
         samples: List[Dict[str, Any]],
+        return_timings: bool = False,
     ) -> Dict[str, List[Any]]:
         """Batch-featurize multiple samples for all (or one) model(s).
 
@@ -985,6 +992,7 @@ class EnsemblePredictor:
         # Shared cache across all datamodules for this batch
         shared_cache = {}
         featurized = {}
+        timings = defaultdict(list)
 
         for name, datamodule in self.datamodules.items():
             # --- Validate & fill defaults once for this datamodule ----------
@@ -992,34 +1000,48 @@ class EnsemblePredictor:
             # different default columns, but we only validate once per DM
             # for the entire batch (rather than once per sample).
             filled_samples = []
+            avg_fill_time = 0.0
             for i, sample_dict in enumerate(samples):
+                start = time.time()
                 filled, missing_required = self.validate_and_fill_defaults(
                     sample_dict, datamodule, verbose=(i == 0),
                 )
+                stop = time.time()
+                avg_fill_time += stop - start
                 if missing_required:
                     raise ValueError(
                         f"Sample {i} is missing required input(s) for model '{name}': "
                         f"{', '.join(missing_required)}. Cannot featurize batch."
                     )
                 filled_samples.append(filled)
+            avg_fill_time = avg_fill_time / len(samples) if samples else 0.0
+            timings['fill_defaults'].append(avg_fill_time)
 
             # --- Batch featurize using the datamodule -----------------------
             model_type = self.model_types.get(name, 'unknown')
             if model_type == 'xgboost':
                 ret = 'xgb'
             elif model_type == 'lightning':
-                # 'pt_batch' returns a single Dict[str, Tensor] with batch dim,
+                # 'pt' returns a single Dict[str, Tensor] with batch dim,
                 # skipping the per-sample dict loop and re-stacking in inference.
-                ret = 'pt_batch'
+                ret = 'pt'
             else:
                 ret = 'np'
+            
+            start = time.time()
             batch_feat = datamodule.featurize_samples_batch(
                 filled_samples,
                 return_tensor=ret,
                 shared_cache=shared_cache,
             )
+            stop = time.time()
+            timings['featurize_batch'].append(stop - start)
             featurized[name] = batch_feat
 
+        if return_timings:
+            for key in timings.keys():
+                timings[key] = np.mean(timings[key])
+            return featurized, timings
         return featurized
 
     def _predict_single_model(
@@ -1365,6 +1387,7 @@ class EnsemblePredictor:
         return_individual: bool = True,
         tasks: Optional[List[str]] = None,
         verbose: bool = False,
+        return_timings: bool = False,
     ) -> List[Dict[str, EnsemblePrediction]]:
         """Make batch predictions with optimized featurization.
 
@@ -1386,6 +1409,8 @@ class EnsemblePredictor:
             One ``{task: EnsemblePrediction}`` dict per sample.
             ``None`` for samples where all models failed.
         """
+        timings = {}
+        
         n = len(samples)
         if n == 0:
             return []
@@ -1402,15 +1427,23 @@ class EnsemblePredictor:
                 )
 
         # 1. Normalise inputs
+        start = time.time()
         sample_dicts = self._prepare_sample_dicts(samples)
+        stop = time.time()
+        timings['prepare_samples'] = stop - start
 
         # 2. Batch featurize (shared cache across datamodules)
-        batch_features = self.featurize_input_batch(sample_dicts)
+        start = time.time()
+        batch_features, times = self.featurize_input_batch(sample_dicts, return_timings=True)
+        stop = time.time()
+        timings['featurize_batch'] = stop - start
+        timings.update(times)
 
         # 3. Inference + denormalize per model
         allowed_tasks = set(tasks) if tasks else None
         model_batch_preds = {}        
 
+        start = time.time()
         for model_name in tqdm(self.models, desc="Predicting", disable=not verbose):
             if allowed_tasks and self.model_tasks.get(model_name) not in allowed_tasks:
                 continue
@@ -1429,9 +1462,18 @@ class EnsemblePredictor:
                 if 'feature_names mismatch' in msg:
                     msg = "feature_names mismatch (training/inference encoding incompatible)"
                 raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
-
+        stop = time.time()
+        timings['inference'] = (stop - start) / len(self.models)
+        
         # 4. Assemble per-sample ensemble results
-        return self._assemble_batch_results(model_batch_preds, n, return_individual)
+        start = time.time()
+        ret = self._assemble_batch_results(model_batch_preds, n, return_individual)
+        stop = time.time()
+        timings['assemble_results'] = stop - start
+        
+        if return_timings:
+            return ret, timings
+        return ret
 
     def _predict_lightning_batch(
         self,
