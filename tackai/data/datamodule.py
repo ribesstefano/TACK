@@ -545,6 +545,36 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         if n == 0:
             return []
 
+        def _batch_lookup_or_compute(
+            values: List[Any],
+            key_fn,
+            transform_fn,
+            out_map: Dict[Any, np.ndarray],
+        ) -> None:
+            """Resolve embeddings for unique values using shared cache first.
+
+            Missing values are encoded in one batched call to reduce Python
+            overhead from many per-item ``transform`` calls.
+            """
+            if not values:
+                return
+
+            missing = []
+            for val in values:
+                cache_key = key_fn(val)
+                if cache_key in shared_cache:
+                    out_map[val] = shared_cache[cache_key]
+                else:
+                    missing.append(val)
+
+            if missing:
+                encoded = transform_fn(missing)
+                for val in missing:
+                    emb = encoded[val]
+                    cache_key = key_fn(val)
+                    shared_cache[cache_key] = emb
+                    out_map[val] = emb
+
         # ------------------------------------------------------------------
         # 1. Raw embeddings — compute once per unique value, using shared_cache
         # ------------------------------------------------------------------
@@ -553,68 +583,59 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         poi_vec_results: Dict[str, np.ndarray] = {}
         poi_precomp_results: Dict[str, np.ndarray] = {}
         ligase_precomp_results: Dict[str, np.ndarray] = {}
+        smiles_vals = [ex[self.smiles_col] for ex in examples]
 
         # Fingerprints
         if self.use_fingerprints and self.fp_embedder is not None:
-            unique_smiles = list({ex[self.smiles_col] for ex in examples})
-            for smi in unique_smiles:
-                cache_key = ('fp', self.radius, self.fp_size, smi)
-                if cache_key in shared_cache:
-                    fp_results[smi] = shared_cache[cache_key]
-                else:
-                    emb = self.fp_embedder.transform(smi)
-                    shared_cache[cache_key] = emb
-                    fp_results[smi] = emb
+            unique_smiles = list(dict.fromkeys(smiles_vals))
+            _batch_lookup_or_compute(
+                unique_smiles,
+                key_fn=lambda smi: ('fp', self.radius, self.fp_size, smi),
+                transform_fn=self.fp_embedder.transform,
+                out_map=fp_results,
+            )
 
         # Cell description embedding
         if self.use_cell_description_embedding and self.cell_description_embedding is not None:
-            unique_cells = list({ex[self.cell_line_col] for ex in examples})
-            for cell in unique_cells:
-                cache_key = ('cell_text', cell)
-                if cache_key in shared_cache:
-                    cell_text_results[cell] = shared_cache[cache_key]
-                else:
-                    emb = self.cell_description_embedding.transform(cell)
-                    shared_cache[cache_key] = emb
-                    cell_text_results[cell] = emb
+            unique_cells = list(dict.fromkeys(ex[self.cell_line_col] for ex in examples))
+            _batch_lookup_or_compute(
+                unique_cells,
+                key_fn=lambda cell: ('cell_text', cell),
+                transform_fn=self.cell_description_embedding.transform,
+                out_map=cell_text_results,
+            )
 
         # POI sequence embedding (amino acid count / tfidf)
         # NOTE: keyed by id(embedder) because TfidfVectorizer vocabulary differs per fold
         if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
             emb_id = id(self.poi_sequence_embedding)
-            unique_seqs = list({ex[self.poi_sequence_col] for ex in examples})
-            for seq in unique_seqs:
-                cache_key = ('poi_vec', emb_id, seq)
-                if cache_key in shared_cache:
-                    poi_vec_results[seq] = shared_cache[cache_key]
-                else:
-                    emb = self.poi_sequence_embedding.transform(seq)
-                    shared_cache[cache_key] = emb
-                    poi_vec_results[seq] = emb
+            unique_seqs = list(dict.fromkeys(ex[self.poi_sequence_col] for ex in examples))
+            _batch_lookup_or_compute(
+                unique_seqs,
+                key_fn=lambda seq: ('poi_vec', emb_id, seq),
+                transform_fn=self.poi_sequence_embedding.transform,
+                out_map=poi_vec_results,
+            )
 
         # POI precomputed embedding (raw, before PCA)
         if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
-            unique_poi_ids = list({self._get_protein_id(ex, 'poi') for ex in examples})
-            for pid in unique_poi_ids:
-                cache_key = ('poi_precomp', pid)
-                if cache_key in shared_cache:
-                    poi_precomp_results[pid] = shared_cache[cache_key]
-                else:
-                    emb = self.poi_precomputed_embedding.transform(pid)
-                    shared_cache[cache_key] = emb
-                    poi_precomp_results[pid] = emb
+            unique_poi_ids = list(dict.fromkeys(self._get_protein_id(ex, 'poi') for ex in examples))
+            _batch_lookup_or_compute(
+                unique_poi_ids,
+                key_fn=lambda pid: ('poi_precomp', pid),
+                transform_fn=self.poi_precomputed_embedding.transform,
+                out_map=poi_precomp_results,
+            )
 
         # Ligase precomputed embedding (raw, before PCA)
         if self.use_ligase_precomputed_embedding and self.ligase_precomputed_embedding is not None:
-            unique_lig_ids = list({self._get_protein_id(ex, 'ligase') for ex in examples})
-            for lid in unique_lig_ids:
-                cache_key = ('lig_precomp', lid)
-                if cache_key in shared_cache:
-                    ligase_precomp_results[lid] = shared_cache[cache_key]
-                else:
-                    emb = self.ligase_precomputed_embedding.transform(lid)
-                    shared_cache[cache_key] = emb
-                    ligase_precomp_results[lid] = emb
+            unique_lig_ids = list(dict.fromkeys(self._get_protein_id(ex, 'ligase') for ex in examples))
+            _batch_lookup_or_compute(
+                unique_lig_ids,
+                key_fn=lambda lid: ('lig_precomp', lid),
+                transform_fn=self.ligase_precomputed_embedding.transform,
+                out_map=ligase_precomp_results,
+            )
 
         # ------------------------------------------------------------------
         # 2. Batch PCA — transform all unique embeddings at once
@@ -651,39 +672,108 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         # ------------------------------------------------------------------
         num_results: Optional[np.ndarray] = None
         if self.numeric_pipeline is not None:
-            # Build the DataFrame column-by-column from pre-allocated matrices
-            # instead of building per-sample dicts. For ~1000 descriptors this
-            # avoids millions of tiny numpy-array allocations.
             num_data: Dict[str, Any] = {}
+            desc_names: List[str] = []
+            desc_matrix: Optional[np.ndarray] = None
+
             if self.use_treatment_time:
                 num_data[self.treatment_time_col] = [ex[self.treatment_time_col] for ex in examples]
+
             if self.use_descriptors:
                 desc_names = self.desc_embedder.get_descriptor_names()
+                # Descriptor values are deterministic from (descriptor set,
+                # SMILES), so this cache can safely be shared across folds.
+                desc_signature = tuple(desc_names)
                 desc_matrix = np.empty((n, len(desc_names)), dtype=np.float32)
-                for i, ex in enumerate(examples):
-                    smi = ex[self.smiles_col]
-                    cache_key = ('desc_raw', id(self.desc_embedder), smi)
-                    if cache_key in shared_cache:
-                        descs = shared_cache[cache_key]
-                    else:
-                        descs = self.desc_embedder.transform(smi)
-                        shared_cache[cache_key] = descs
-                    desc_matrix[i] = descs
+                unique_smiles = list(dict.fromkeys(smiles_vals))
+                missing_smiles = [
+                    smi for smi in unique_smiles
+                    if ('desc_raw', desc_signature, smi) not in shared_cache
+                ]
+                if missing_smiles:
+                    new_desc = self.desc_embedder.transform(missing_smiles)
+                    for smi in missing_smiles:
+                        shared_cache[('desc_raw', desc_signature, smi)] = new_desc[smi]
+
+                for i, smi in enumerate(smiles_vals):
+                    desc_matrix[i] = shared_cache[('desc_raw', desc_signature, smi)]
+
                 for j, name in enumerate(desc_names):
                     num_data[f'Descriptor_{name}'] = desc_matrix[:, j]
-            num_df = pd.DataFrame(num_data)
-            num_results = self.numeric_pipeline.transform(num_df)  # shape (n, n_num_features)
+
+            # Fast path: transform treatment-time and descriptor columns
+            # directly with cached sklearn parameters, avoiding expensive
+            # ColumnTransformer overhead with many 1-column transformers.
+            used_fast_path = False
+            if self.use_descriptors and desc_matrix is not None and hasattr(self.numeric_pipeline, 'transformers_'):
+                try:
+                    desc_col_to_idx = {
+                        f'Descriptor_{name}': idx for idx, name in enumerate(desc_names)
+                    }
+                    desc_means = np.zeros(len(desc_names), dtype=np.float64)
+                    desc_scales = np.ones(len(desc_names), dtype=np.float64)
+                    found_desc_scalers = 0
+                    treatment_block = None
+
+                    for trans_name, transformer, cols in self.numeric_pipeline.transformers_:
+                        if trans_name == 'remainder' or not cols:
+                            continue
+
+                        col = cols[0]
+                        if col == self.treatment_time_col:
+                            tt_values = np.asarray(num_data[self.treatment_time_col], dtype=np.float64).reshape(-1, 1)
+                            treatment_block = transformer.transform(tt_values).astype(np.float32, copy=False)
+                            continue
+
+                        desc_idx = desc_col_to_idx.get(col)
+                        if desc_idx is None or not isinstance(transformer, StandardScaler):
+                            raise TypeError("Unexpected numeric transformer layout")
+
+                        mean = float(np.ravel(transformer.mean_)[0]) if hasattr(transformer, 'mean_') else 0.0
+                        scale = float(np.ravel(transformer.scale_)[0]) if hasattr(transformer, 'scale_') else 1.0
+                        if scale == 0.0:
+                            scale = 1.0
+
+                        desc_means[desc_idx] = mean
+                        desc_scales[desc_idx] = scale
+                        found_desc_scalers += 1
+
+                    if found_desc_scalers == len(desc_names):
+                        desc_scaled = (desc_matrix.astype(np.float64) - desc_means) / desc_scales
+                        desc_scaled = desc_scaled.astype(np.float32, copy=False)
+
+                        blocks = []
+                        if self.use_treatment_time:
+                            if treatment_block is None:
+                                raise RuntimeError("Missing treatment-time transformer in numeric pipeline")
+                            blocks.append(treatment_block)
+                        blocks.append(desc_scaled)
+
+                        num_results = np.hstack(blocks) if len(blocks) > 1 else blocks[0]
+                        used_fast_path = True
+                except Exception:
+                    used_fast_path = False
+
+            if not used_fast_path:
+                # Fallback to sklearn implementation for full compatibility.
+                num_df = pd.DataFrame(num_data)
+                num_results = self.numeric_pipeline.transform(num_df)  # shape (n, n_num_features)
 
         # Precompute per-column output widths for the category pipeline so
         # that the sample loop can slice cat_results correctly (one-hot
         # encoding produces multiple output columns per input column).
         cat_col_offsets: List[tuple] = []  # [(offset, width), ...]
         if cat_results is not None:
-            offset = 0
-            for _, inner, cols in self.category_pipeline.transformers_:
-                width = inner.transform(cat_df[cols].iloc[:1]).shape[1]
-                cat_col_offsets.append((offset, width))
-                offset += width
+            cached_offsets = getattr(self, '_batch_cat_col_offsets', None)
+            if cached_offsets is not None and len(cached_offsets) == len(self.categorical_cols):
+                cat_col_offsets = cached_offsets
+            else:
+                offset = 0
+                for _, inner, cols in self.category_pipeline.transformers_:
+                    width = inner.transform(cat_df[cols].iloc[:1]).shape[1]
+                    cat_col_offsets.append((offset, width))
+                    offset += width
+                self._batch_cat_col_offsets = cat_col_offsets
 
         # ------------------------------------------------------------------
         # 5. Assemble results
@@ -737,6 +827,11 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         # Per-sample assembly for 'np', 'pt', and 'xgb' modes
         # ------------------------------------------------------------------
         batch_features: List[Dict[str, Any]] = []
+        
+        xgb_feature_names = None
+        if return_tensor == 'xgb' and self.feature_dims:
+            xgb_feature_names = self.get_xgboost_feature_names()
+
         for i, ex in enumerate(examples):
             features: Dict[str, Any] = {}
 
@@ -820,7 +915,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                         for j in range(features[key].flatten().shape[0])
                     ]
                 else:
-                    feature_names = self.get_xgboost_feature_names()
+                    feature_names = xgb_feature_names
                 features = (
                     np.concatenate(feature_list).astype(np.float32),
                     feature_names,
