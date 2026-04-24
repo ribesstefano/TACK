@@ -1,20 +1,26 @@
+import time
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
+from rdkit import Chem
+from datasets import load_dataset
 
 from tackai import EnsemblePredictor, SampleInput
 
+
 def test_ensemble_predictor():
     
-    predictor = EnsemblePredictor.from_directory(
-        "ensembles/dc50_ensemble/checkpoints",
-        weights="ensembles/dc50_ensemble/ensemble_weights_dc50_caruana_ensemble.json",
-        device="gpu"
-    )
-    # predictor = EnsemblePredictor.from_directory("ensembles/dc50_ensemble_mlp/checkpoints", device="gpu")
-    # predictor = EnsemblePredictor.from_directory("ensembles/tackai_ensemble_test_single")
+    predictor = EnsemblePredictor.from_directory("ensembles/dc50_ensemble/")
 
-    test_df = pd.read_csv("data/tack/protacdb_tpddb_protacpedia_protac_dc50_activities_processed.csv")
+    test_df = load_dataset(
+        "ailab-bio/TACK",
+        "DC50",
+        split="train",
+    ).to_pandas()
+
+    # test_df = pd.read_csv("data/tack/protacdb_tpddb_protacpedia_protac_dc50_activities_processed.csv")
     test_df[['Value_Type', 'Value']].dropna(subset=['Value']).sample(1, random_state=42)
 
     test_df['Cell_Line_ID'] = test_df['Cell_Line_ID'].fillna('Unknown cell line.')
@@ -22,7 +28,7 @@ def test_ensemble_predictor():
 
     test_df = test_df.iloc[:1000]  # <-- Limit to first 500 rows for testing
 
-    batch_size = 256
+    batch_size = 32
     metrics_df = []
 
     for batch_idx in tqdm(range(0, len(test_df), batch_size), desc="Processing batches"):
@@ -95,6 +101,8 @@ def test_ensemble_predictor():
     r2_dummy = 1 - ((metrics_df['True_pDC50'] - metrics_df['Mean_Predicted_pDC50']) ** 2).sum() / ((metrics_df['True_pDC50'] - metrics_df['True_pDC50'].mean()) ** 2).sum()
     print(f"Mean Absolute Error (MAE) of dummy mean predictor in pDC50 space: {mae_dummy:.4f}")
     print(f"R² of dummy mean predictor in pDC50 space: {r2_dummy:.4f}")
+    
+    assert r2 > 0 and r2 > r2_dummy, f"The ensemble model shall score a R2 higher than a dummy model, got instead: R2 ensemble = {r2} vs. R2 dummy = {r2_dummy}"
 
 
 if __name__ == "__main__":
