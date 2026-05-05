@@ -13,19 +13,9 @@ The curation pipeline processes raw data through several stages:
 
 ## Prerequisites
 
-Please install the required Python packages in the `requirements.txt` file in the root directory:
+Please install the package as described in the main [README](README.md) file.
 
-```bash
-pip install -r requirements.txt
-```
-
-Please make sure that the PYTHONPATH environment variable includes the root directory of the project to allow imports from `tack_dataset`:
-
-```bash
-export PYTHONPATH=$(pwd):$PYTHONPATH
-```
-
-**NOTE**: All commands should be run from the root directory of the project.
+**NOTE**: All commands in this guide should be run from the root directory of the project.
 
 ## Data Sources
 

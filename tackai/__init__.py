@@ -5,7 +5,7 @@ from tackai.models.mlp_model import MLPModel
 from tackai.models.text_emb_model import BERTModel
 from tackai.models.multi_emb_model import MultiEmbeddingsRegressionModel
 from tackai.models.tack_model import TACKModel
-from tackai.ensemble_predictor import EnsemblePredictor, SampleInput
+from tackai.ensemble_predictor import EnsemblePredictor, SampleInput, PreprocessedContext
 from tackai.config import (
     load_config_from_yaml,
     save_config_to_yaml,

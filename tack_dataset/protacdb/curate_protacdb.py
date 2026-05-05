@@ -25,7 +25,7 @@ from tack_dataset.protacdb.assay_cleaning import (
     extract_protac2target_ic50,
     extract_degradation_information,
 )
-from tack_dataset.protacdb.protein_utils import (
+from tack_dataset.protein_utils import (
     map_poi_sequence_from_uniprot,
     fetch_protein_info,
     clean_target,

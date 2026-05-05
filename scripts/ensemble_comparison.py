@@ -908,8 +908,8 @@ def log_results(
             baselines['best_single'],
             baselines['average_all'],
             baselines['best_architecture'],
-            method_scores.get('method2', np.nan),
-            method_scores.get('method4', np.nan)
+            method_scores.get('caruana_all_models', np.nan),
+            method_scores.get('caruana_architecture', np.nan)
         ]
     }
     
@@ -1055,7 +1055,7 @@ def main():
     parser.add_argument('--prediction_dir', type=str, default='predictions/',
                         help='Directory containing prediction CSV files.')
     parser.add_argument('--task', type=str, default='Dmax',
-                        help='Task identifier: Dmax, DC50, or bin')
+                        help='Task identifier: Dmax, DC50, or Bin')
     parser.add_argument('--output_dir', type=str, default='ensemble_results/',
                         help='Directory to save output plots and results.')
     parser.add_argument('--hillclimb_perc', type=float, default=0.2,
@@ -1104,7 +1104,7 @@ def main():
     weights2 = None
     try:
         weights2, score2 = run_caruana_method(sel_data, eval_data, task)
-        method_scores['method2'] = score2
+        method_scores['caruana_all_models'] = score2
         
         # Save ensemble weights
         save_ensemble_weights(
@@ -1137,7 +1137,7 @@ def main():
     arch_weights_expanded = None
     try:
         weights4, score4 = run_architecture_caruana_method(sel_data, eval_data, architectures, task)
-        method_scores['method4'] = score4
+        method_scores['caruana_architecture'] = score4
         
         # For Architecture-level ensemble selection, weights are at architecture level - need to expand
         arch_weights_expanded = {}
@@ -1225,7 +1225,7 @@ def main():
         
         # Compute additional metrics for best method
         best_method = min(method_scores, key=method_scores.get)
-        if best_method == 'method2':
+        if best_method == 'caruana_all_models':
             weights = weights2
         else:
             weights = arch_weights_expanded

@@ -3,6 +3,7 @@ Utility functions for handling saving and loading dictionaries in JSON,
 pickle, or NPZ format.
 """
 import os
+import tempfile
 import logging
 import functools
 import pickle
@@ -30,7 +31,6 @@ def get_cache_dir() -> str:
         os.makedirs(cache_dir, exist_ok=True)
     except PermissionError as e:
         # Fallback to a temporary directory
-        import tempfile
         cache_dir = os.path.join(tempfile.gettempdir(), 'tackai')
         os.makedirs(cache_dir, exist_ok=True)
         logging.warning(f"Permission denied creating cache directory. Using temporary directory: {cache_dir}")

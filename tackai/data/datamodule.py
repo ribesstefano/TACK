@@ -6,6 +6,15 @@ from pathlib import Path
 from typing import List, Optional, Union, Any, Dict, Literal, Tuple
 
 import torch
+import sklearn.compose._column_transformer as _sklearn_ct
+if not hasattr(_sklearn_ct, '_RemainderColsList'):
+    # Compatibility shim: _RemainderColsList was removed after sklearn 1.6.x
+    # but may appear in pickled ColumnTransformer objects from older checkpoints.
+    class _RemainderColsList(list):
+        def __init__(self, columns, future_dtype=None):
+            super().__init__(columns)
+            self.future_dtype = future_dtype
+    _sklearn_ct._RemainderColsList = _RemainderColsList
 import pandas as pd
 from tqdm import tqdm
 import numpy as np

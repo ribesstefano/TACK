@@ -3,6 +3,7 @@ Ensemble Predictor for TACK Models
 Handles loading and prediction from multiple model types (XGBoost, Lightning)
 with weighted averaging and uncertainty quantification.
 """
+import os
 import re
 import time
 import pickle
@@ -177,6 +178,43 @@ class SampleInput:
         }
 
 
+# Feature-key prefixes treated as SMILES-dependent in the context /
+# SMILES split used by preprocess_context + predict_smiles_batch.
+SMILES_FEATURE_PREFIXES: Tuple[str, ...] = (
+    'Feature_Fingerprint',
+    'Feature_Descriptor_',
+)
+
+
+@dataclass
+class PreprocessedContext:
+    """Per-model encoded context for fast repeated SMILES screening.
+
+    Produced by :meth:`EnsemblePredictor.preprocess_context`; consumed by
+    :meth:`EnsemblePredictor.predict_smiles_batch`.
+
+    Memory footprint is O(M * D_context) — one 1-D vector per context
+    feature per model, plus one ``(1, total_dim)`` float32 template per
+    XGBoost model. No replication to batch size up front.
+    """
+    # Per-model, per-feature-key → 1-D ndarray (context features only)
+    context_features: Dict[str, Dict[str, np.ndarray]]
+    # Per-model XGBoost row layout: [(key, offset, width), ...]
+    xgb_layouts: Dict[str, List[Tuple[str, int, int]]]
+    # Per-model total XGBoost row width
+    xgb_total_dims: Dict[str, int]
+    # Per-model prefilled XGBoost row template (shape (1, total_dim),
+    # float32). SMILES slices are zero; context slices are filled in.
+    xgb_row_template: Dict[str, np.ndarray]
+    # Per-model cached expected feature_names for DMatrix alignment
+    xgb_feature_names: Dict[str, List[str]]
+    # Tag identifying the predictor that produced this context — guards
+    # against accidentally mixing contexts across predictors.
+    predictor_id: int = 0
+    # The filled context dict (for debugging / inspection)
+    source_context: Dict[str, Any] = field(default_factory=dict)
+
+
 # Default values for optional inputs based on common training data.
 # NOTE: SMILES, POI (name/sequence), and E3 ligase (name/sequence) are
 # considered *required* — no defaults are supplied for them.
@@ -222,25 +260,45 @@ class EnsemblePredictor:
         models: Dict[str, Any],
         datamodules: Dict[str, Any],
         weights: Optional[Dict[str, float]] = None,
-        # task: str = 'dmax',
-        # label_name: Optional[str] = None,
         device: str = 'cpu',
+        n_jobs: Optional[int] = None,
     ) -> None:
         """
         Initialize the ensemble predictor.
-        
+
         Args:
             models: Dictionary mapping model names to model objects
             datamodules: Dictionary mapping model names to their datamodules
             weights: Optional weights for each model (uniform if None)
-            task: Task type ('dmax', 'dc50', 'bin')
-            label_name: Name of the label column for denormalization
             device: Device to use for inference ('cpu' or 'cuda')
+            n_jobs: Number of threads for XGBoost inference (None = all cores)
         """
         self.models = models
         self.datamodules = datamodules
         # Normalize device string: PyTorch uses "cuda", not "gpu"
         self.device = 'cuda' if device == 'gpu' else device
+        self.n_jobs = n_jobs
+
+        # XGBoost uses OpenMP; if OMP_NUM_THREADS was set (e.g. to 1 by SLURM
+        # or a parent shell) it will clamp thread count regardless of
+        # `set_param('nthread', N)`. Align it with n_jobs here so set_param
+        # can take effect at predict time.
+        if n_jobs is not None and n_jobs > 1:
+            omp = os.environ.get('OMP_NUM_THREADS')
+            if omp is None or int(omp) < n_jobs:
+                os.environ['OMP_NUM_THREADS'] = str(n_jobs)
+                if omp is not None:
+                    warnings.warn(
+                        f"OMP_NUM_THREADS was {omp}, overriding to {n_jobs} "
+                        "so XGBoost can use the requested threads. Set this "
+                        "in the environment before launching Python to avoid "
+                        "OpenMP being pre-initialized with fewer threads.",
+                        UserWarning, stacklevel=2,
+                    )
+            try:
+                xgb.set_config(nthread=n_jobs)
+            except (TypeError, AttributeError):
+                pass
         
         # Per-model task inferred from filenames / datamodule label names
         self.model_tasks: Dict[str, str] = {}
@@ -469,7 +527,7 @@ class EnsemblePredictor:
         if not models:
             raise ValueError(f"No models could be loaded from {model_dir}")
 
-        return cls(models, datamodules, weights, device)
+        return cls(models, datamodules, weights, device, n_jobs=n_jobs)
     
     @classmethod
     def from_weights_file(
@@ -580,7 +638,7 @@ class EnsemblePredictor:
             )
         elif suffix in ['.json', '.ubj', '.pkl']:
             return EnsemblePredictor._load_xgboost_model(
-                model_path, datamodule_dir, n_jobs
+                model_path, datamodule_dir, n_jobs, device
             )
         else:
             raise ValueError(f"Unsupported model format: {suffix}")
@@ -691,6 +749,7 @@ class EnsemblePredictor:
         model_path: Path,
         datamodule_dir: Optional[Path] = None,
         n_jobs: Optional[int] = None,
+        device: Literal['cpu', 'cuda'] = 'cpu',
     ) -> Tuple[Any, Any]:
         """Load an XGBoost model."""        
         suffix = model_path.suffix.lower()
@@ -698,14 +757,28 @@ class EnsemblePredictor:
         if suffix in ['.json', '.ubj']:
             model = xgb.Booster()
             model.load_model(str(model_path))
-            model.n_jobs = n_jobs
-            model.nthread = n_jobs
+            if n_jobs is not None:
+                model.set_param('nthread', n_jobs)
+            if device != 'cpu':
+                model.set_param('device', device)
         elif suffix == '.pkl':
             with open(model_path, 'rb') as f:
                 model = pickle.load(f)
-        else:
-            raise ValueError(f"Unsupported XGBoost format: {suffix}")
-        
+            if isinstance(model, xgb.Booster):
+                if n_jobs is not None:
+                    model.set_param('nthread', n_jobs)
+                if device != 'cpu':
+                    model.set_param('device', device)
+            elif hasattr(model, 'set_params'):
+                # sklearn wrapper (XGBClassifier / XGBRegressor)
+                kwargs = {}
+                if n_jobs is not None:
+                    kwargs['n_jobs'] = n_jobs
+                if device != 'cpu':
+                    kwargs['device'] = device
+                if kwargs:
+                    model.set_params(**kwargs)
+
         # Extract data configuration from model path name
         # Format: model=xgboost_dmax_protac-data=XXX-group=YYY-fold=ZZZ.json
         model_name = model_path.stem
@@ -1112,6 +1185,11 @@ class EnsemblePredictor:
         else:
             raise ValueError(f"Unsupported feature type for XGBoost: {type(features)}")
         
+        if isinstance(model, xgb.Booster):
+            if self.n_jobs is not None:
+                model.set_param('nthread', self.n_jobs)
+            if self.device != 'cpu':
+                model.set_param('device', self.device)
         pred = model.predict(dmatrix)
         return np.atleast_1d(pred)
     
@@ -1463,7 +1541,8 @@ class EnsemblePredictor:
                     msg = "feature_names mismatch (training/inference encoding incompatible)"
                 raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
         stop = time.time()
-        timings['inference'] = (stop - start) / len(self.models)
+        timings['inference'] = stop - start
+        timings['inference_per_model'] = (stop - start) / len(self.models)
         
         # 4. Assemble per-sample ensemble results
         start = time.time()
@@ -1474,6 +1553,245 @@ class EnsemblePredictor:
         if return_timings:
             return ret, timings
         return ret
+
+    # ------------------------------------------------------------------
+    # Context / SMILES split API — fast path for screening many SMILES
+    # against a fixed context.
+    # ------------------------------------------------------------------
+
+    def preprocess_context(
+        self,
+        context: Union[SampleInput, Dict[str, Any]],
+        verbose: bool = False,
+    ) -> PreprocessedContext:
+        """Encode the non-SMILES (context) features once for every model.
+
+        Call once per context (POI / ligase / cell line / assay /
+        treatment_time). Pass the returned :class:`PreprocessedContext`
+        to :meth:`predict_smiles_batch` alongside a list of SMILES to
+        score.
+
+        Tokenizer-based models are rejected: the prompt contains the
+        SMILES, so the context cannot be encoded independently.
+
+        Args:
+            context: ``SampleInput`` or dict with the context columns.
+                ``SMILES`` is not required (and is ignored if present).
+            verbose: If True, forward the verbose flag to default-filling.
+
+        Returns:
+            :class:`PreprocessedContext` ready for
+            :meth:`predict_smiles_batch`.
+        """
+        # Convert SampleInput → dict using the first datamodule's columns.
+        if isinstance(context, SampleInput):
+            context_dict = self._prepare_sample_dicts([context])[0]
+        else:
+            context_dict = dict(context)  # shallow copy
+
+        context_features: Dict[str, Dict[str, np.ndarray]] = {}
+        xgb_layouts: Dict[str, List[Tuple[str, int, int]]] = {}
+        xgb_total_dims: Dict[str, int] = {}
+        xgb_row_template: Dict[str, np.ndarray] = {}
+        xgb_feature_names: Dict[str, List[str]] = {}
+        source_context: Dict[str, Any] = {}
+
+        for model_name, datamodule in self.datamodules.items():
+            if getattr(datamodule, 'use_tokenizer', False):
+                raise ValueError(
+                    f"Model '{model_name}' uses a tokenizer; tokenizer-based "
+                    "models are not supported by preprocess_context / "
+                    "predict_smiles_batch because the prompt contains the "
+                    "SMILES. Use predict_batch instead."
+                )
+
+            # Always pass verbose=False: validate_and_fill_defaults would
+            # otherwise warn that SMILES is missing, which is the whole
+            # point of the context-only preprocessing pass.
+            filled, missing_required = self.validate_and_fill_defaults(
+                context_dict, datamodule, verbose=False,
+            )
+            missing_required = [
+                c for c in missing_required if c != datamodule.smiles_col
+            ]
+            if missing_required:
+                raise ValueError(
+                    f"Model '{model_name}' is missing required context "
+                    f"field(s): {', '.join(missing_required)}."
+                )
+            if verbose:
+                print(f"  Preprocessed context for model '{model_name}'")
+
+            ctx_feats = datamodule.transform_context_features(filled)
+            context_features[model_name] = ctx_feats
+
+            if self.model_types[model_name] == 'xgboost':
+                layout = datamodule.get_feature_layout()
+                total_dim = sum(width for _, _, width in layout)
+                template = np.zeros((1, total_dim), dtype=np.float32)
+
+                for key, offset, width in layout:
+                    if key.startswith(SMILES_FEATURE_PREFIXES):
+                        continue
+                    if key not in ctx_feats:
+                        raise ValueError(
+                            f"Model '{model_name}' expects context feature "
+                            f"'{key}' in its XGBoost layout, but the "
+                            "datamodule did not produce it. Check feature "
+                            "toggles / fitted pipelines."
+                        )
+                    val = np.asarray(ctx_feats[key], dtype=np.float32).flatten()
+                    if val.shape[0] != width:
+                        raise ValueError(
+                            f"Context feature '{key}' for model '{model_name}' "
+                            f"has width {val.shape[0]} but layout expects "
+                            f"{width}."
+                        )
+                    template[0, offset:offset + width] = val
+
+                xgb_layouts[model_name] = layout
+                xgb_total_dims[model_name] = total_dim
+                xgb_row_template[model_name] = template
+                xgb_feature_names[model_name] = datamodule.get_xgboost_feature_names()
+
+            # Keep the first datamodule's filled view for debugging.
+            if not source_context:
+                source_context = {k: v for k, v in filled.items()}
+
+        return PreprocessedContext(
+            context_features=context_features,
+            xgb_layouts=xgb_layouts,
+            xgb_total_dims=xgb_total_dims,
+            xgb_row_template=xgb_row_template,
+            xgb_feature_names=xgb_feature_names,
+            predictor_id=id(self),
+            source_context=source_context,
+        )
+
+    def predict_smiles_batch(
+        self,
+        smiles_list: List[str],
+        context: PreprocessedContext,
+        return_individual: bool = True,
+        tasks: Optional[List[str]] = None,
+        verbose: bool = False,
+        return_timings: bool = False,
+    ) -> List[Dict[str, EnsemblePrediction]]:
+        """Predict for many SMILES against a preprocessed context.
+
+        Behaves like :meth:`predict_batch` but skips re-encoding the
+        context for every sample. For each model, only the SMILES-
+        dependent features (Morgan fingerprint, RDKit descriptors) are
+        computed per call; the context tensors/rows are broadcast /
+        tiled from the preprocessed vectors.
+
+        Args:
+            smiles_list: List of SMILES strings to score.
+            context: Output of :meth:`preprocess_context` for this
+                predictor.
+            return_individual: Include per-model predictions.
+            tasks: Optional subset of tasks to predict.
+            verbose: Show a progress bar over models.
+            return_timings: Return ``(results, timings)``.
+
+        Returns:
+            One ``{task: EnsemblePrediction}`` dict per SMILES.
+        """
+        if context.predictor_id != id(self):
+            raise ValueError(
+                "PreprocessedContext was not produced by this predictor; "
+                "call preprocess_context on the same EnsemblePredictor "
+                "instance you use to score."
+            )
+
+        n = len(smiles_list)
+        if n == 0:
+            return []
+
+        allowed_tasks = set(tasks) if tasks else None
+        if allowed_tasks:
+            model_tasks_set = set(self.model_tasks.values())
+            if not allowed_tasks.intersection(model_tasks_set):
+                raise ValueError(
+                    f"No models available for requested tasks: {allowed_tasks}. "
+                    f"Available tasks: {model_tasks_set}."
+                )
+
+        timings: Dict[str, float] = {}
+        model_batch_preds: Dict[str, np.ndarray] = {}
+
+        total_smiles = 0.0
+        total_assemble = 0.0
+        total_infer = 0.0
+
+        for model_name in tqdm(self.models, desc="Predicting", disable=not verbose):
+            if allowed_tasks and self.model_tasks.get(model_name) not in allowed_tasks:
+                continue
+
+            datamodule = self.datamodules[model_name]
+            model_type = self.model_types[model_name]
+            ctx_feats = context.context_features[model_name]
+
+            start = time.time()
+            smiles_feats = datamodule.transform_smiles_features(smiles_list)
+            total_smiles += time.time() - start
+
+            start = time.time()
+            if model_type == 'xgboost':
+                layout = context.xgb_layouts[model_name]
+                total_dim = context.xgb_total_dims[model_name]
+                template = context.xgb_row_template[model_name]
+                # One allocation; broadcast tiling of the prefilled
+                # context row, then overwrite the SMILES slices.
+                matrix = np.broadcast_to(template, (n, total_dim)).copy()
+                for key, offset, width in layout:
+                    if key in smiles_feats:
+                        matrix[:, offset:offset + width] = smiles_feats[key]
+                feat_arg = (matrix, context.xgb_feature_names[model_name])
+            elif model_type == 'lightning':
+                batch: Dict[str, torch.Tensor] = {}
+                for key, arr in ctx_feats.items():
+                    tensor = torch.from_numpy(
+                        np.ascontiguousarray(arr, dtype=np.float32)
+                    ).unsqueeze(0).expand(n, -1)
+                    batch[key] = tensor
+                for key, arr in smiles_feats.items():
+                    batch[key] = torch.from_numpy(
+                        np.ascontiguousarray(arr, dtype=np.float32)
+                    )
+                feat_arg = batch
+            else:
+                raise ValueError(
+                    f"Unsupported model type '{model_type}' for {model_name}"
+                )
+            total_assemble += time.time() - start
+
+            start = time.time()
+            try:
+                model_batch_preds[model_name] = self._infer_and_denormalize(
+                    model_name, feat_arg,
+                )
+            except Exception as e:
+                msg = str(e)
+                if 'feature_names mismatch' in msg:
+                    msg = ("feature_names mismatch (training/inference "
+                           "encoding incompatible)")
+                raise ValueError(
+                    f"Prediction failed for model '{model_name}': {msg}"
+                ) from e
+            total_infer += time.time() - start
+
+        timings['smiles_featurize'] = total_smiles
+        timings['assemble'] = total_assemble
+        timings['inference'] = total_infer
+
+        start = time.time()
+        results = self._assemble_batch_results(model_batch_preds, n, return_individual)
+        timings['assemble_results'] = time.time() - start
+
+        if return_timings:
+            return results, timings
+        return results
 
     def _predict_lightning_batch(
         self,
@@ -1555,14 +1873,41 @@ class EnsemblePredictor:
     def _predict_xgboost_batch(
         self,
         model: Any,
-        feat_list: List[Any],
+        feat_list: Any,
     ) -> np.ndarray:
         """Run XGBoost prediction on a batch of pre-featurized samples.
 
         Stacks individual ``(array, feature_names)`` tuples into a single
         DataFrame, aligns columns to the model's expected feature order
         (if available), and calls ``model.predict`` once.
+
+        Fast path (used by :meth:`predict_smiles_batch`): ``feat_list``
+        may already be a single ``(ndarray_of_shape_(N, D), feature_names)``
+        tuple. In that case the per-sample stacking loop is skipped.
         """
+        # Fast path: pre-assembled (matrix, names) — skip the per-sample loop.
+        if (
+            isinstance(feat_list, tuple) and len(feat_list) == 2
+            and isinstance(feat_list[0], np.ndarray) and feat_list[0].ndim == 2
+            and isinstance(feat_list[1], (list, tuple))
+        ):
+            X, feature_names = feat_list
+            df = pd.DataFrame(X, columns=list(feature_names))
+            model_feature_names = getattr(model, 'feature_names', None)
+            if (
+                model_feature_names is not None
+                and set(feature_names) == set(model_feature_names)
+                and len(feature_names) == X.shape[1]
+            ):
+                df = df[model_feature_names]
+            dmatrix = xgb.DMatrix(df)
+            if isinstance(model, xgb.Booster):
+                if self.n_jobs is not None:
+                    model.set_param('nthread', self.n_jobs)
+                if self.device != 'cpu':
+                    model.set_param('device', self.device)
+            return model.predict(dmatrix)
+
         arrays = []
         feature_names = None
         for feat in feat_list:
@@ -1598,6 +1943,11 @@ class EnsemblePredictor:
         else:
             dmatrix = xgb.DMatrix(X)
 
+        if isinstance(model, xgb.Booster):
+            if self.n_jobs is not None:
+                model.set_param('nthread', self.n_jobs)
+            if self.device != 'cpu':
+                model.set_param('device', self.device)
         return model.predict(dmatrix)
     
     def predict_dataframe(
