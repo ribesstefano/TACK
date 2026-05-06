@@ -12,6 +12,7 @@ from collections import defaultdict
 
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 import matplotlib
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -63,6 +64,8 @@ class EnsembleSelector:
             return mean_squared_error(y_true, y_pred)
         elif self.metric == 'r2':
             return -r2_score(y_true, y_pred)  # Negative for minimization
+        elif self.metric == 'roc_auc':
+            return -roc_auc_score(y_true, y_pred)  # Negative for minimization
         elif self.metric == 'log_loss':
             y_pred_clipped = np.clip(y_pred, 1e-7, 1 - 1e-7)
             return log_loss(y_true, y_pred_clipped)
@@ -71,7 +74,7 @@ class EnsembleSelector:
             return np.mean((y_true - y_pred_clipped) ** 2)
         else:
             raise ValueError(f"Unknown metric: {self.metric}. "
-                           f"Supported: 'rmse', 'mse', 'r2', 'log_loss', 'brier'.")
+                           f"Supported: 'rmse', 'mse', 'r2', 'roc_auc', 'log_loss', 'brier'.")
 
     def greedy_selection(
         self,
@@ -243,22 +246,6 @@ class EnsembleSelector:
         total = sum(best_overall_ensemble.values())
         return {k: v / total for k, v in best_overall_ensemble.items()} if total > 0 else {}
 
-    def predict(self, predictions_dict: Dict[str, np.ndarray], weights: Dict[str, float]) -> np.ndarray:
-        """
-        Make prediction using ensemble weights.
-
-        Args:
-            predictions_dict (Dict[str, np.ndarray]): Dictionary mapping model names to their prediction arrays.
-            weights (Dict[str, float]): Dictionary mapping model names to their ensemble weights.
-
-        Returns:
-            np.ndarray: Weighted ensemble prediction.
-        """
-        # pred = np.zeros_like(next(iter(predictions_dict.values())), dtype=float)
-        pred = np.zeros_like(list(predictions_dict.values())[0], dtype=float)
-        for model_name, weight in weights.items():
-            pred += predictions_dict[model_name] * weight
-        return pred
 
 # =============================================================================
 # ENSEMBLE WEIGHTS I/O
@@ -318,24 +305,6 @@ def save_ensemble_weights(
     
     return str(filepath)
 
-
-def load_ensemble_weights(weights_path: str) -> Tuple[Dict[str, float], Dict]:
-    """
-    Load ensemble weights from a JSON file.
-    
-    Args:
-        weights_path: Path to the weights JSON file
-        
-    Returns:
-        Tuple of (weights dict, metadata dict)
-    """
-    with open(weights_path, 'r') as f:
-        doc = json.load(f)
-    
-    weights = doc.get("weights", {})
-    metadata = {k: v for k, v in doc.items() if k != "weights"}
-    
-    return weights, metadata
 
 matplotlib.use('Agg')
 sns.set_style('whitegrid')
@@ -430,24 +399,25 @@ def compute_ensemble_uncertainty(
         Dictionary with uncertainty metrics per sample
     """
     all_preds = np.array(list(predictions_dict.values()))  # Shape: (n_models, n_samples)
-    n_models, n_samples = all_preds.shape
-    
     uncertainty = {}
     
-    # 1. Prediction variance (disagreement between models)
+    # Prediction variance (disagreement between models)
     uncertainty['variance'] = np.var(all_preds, axis=0)
     uncertainty['std'] = np.std(all_preds, axis=0)
     
-    # 2. Interquartile range (robust measure)
+    # Interquartile range (robust measure)
     q75 = np.percentile(all_preds, 75, axis=0)
     q25 = np.percentile(all_preds, 25, axis=0)
     uncertainty['iqr'] = q75 - q25
     
-    # 3. Range (max - min prediction)
+    # Range (max - min prediction)
     uncertainty['range'] = np.max(all_preds, axis=0) - np.min(all_preds, axis=0)
     
     if task == 'bin':
-        # 4. Entropy of average prediction (for classification)
+        # TODO: Not 100% sure the following is correct, but it's not reported
+        # in the paper anyway...
+
+        # Entropy of average prediction (for classification)
         avg_pred = np.mean(all_preds, axis=0)
         avg_pred_clipped = np.clip(avg_pred, 1e-7, 1 - 1e-7)
         uncertainty['predictive_entropy'] = -(
@@ -455,7 +425,7 @@ def compute_ensemble_uncertainty(
             (1 - avg_pred_clipped) * np.log(1 - avg_pred_clipped)
         )
         
-        # 5. Mutual information (epistemic uncertainty)
+        # Mutual information (epistemic uncertainty)
         # MI = H[y|x] - E[H[y|x, w]] where w are model weights
         individual_entropies = -(
             np.clip(all_preds, 1e-7, 1-1e-7) * np.log(np.clip(all_preds, 1e-7, 1-1e-7)) +
@@ -520,7 +490,6 @@ def compute_calibration_metrics(
         errors = np.abs(y_true - y_pred)
         
         # Spearman correlation between uncertainty and error
-        from scipy.stats import spearmanr
         corr, pval = spearmanr(uncertainty, errors)
         metrics['uncertainty_error_correlation'] = corr
         metrics['correlation_pvalue'] = pval
@@ -721,52 +690,68 @@ def compute_baselines(
     
     results = {}
     metric_name = 'Log Loss' if task == 'bin' else 'RMSE'
-    
+
     # Baseline 1: Best single model
     best_score = float('inf')
     best_model = None
-    
+    best_preds = None
+
     for model_key, preds in eval_predictions.items():
         score = compute_metric(eval_targets, preds, task)
         if score < best_score:
             best_score = score
             best_model = model_key
-    
+            best_preds = preds
+
     results['best_single'] = best_score
     print(f"\n1. Best Single Model: {best_model}")
     print(f"   {metric_name}: {best_score:.4f}")
-    
+
     # Baseline 2: Average ALL models
     all_preds = np.array(list(eval_predictions.values()))
     avg_pred = np.mean(all_preds, axis=0)
     avg_score = compute_metric(eval_targets, avg_pred, task)
-    
+
     results['average_all'] = avg_score
     print(f"\n2. Average All {len(eval_predictions)} Models:")
     print(f"   {metric_name}: {avg_score:.4f}")
     print(f"   vs Best: {((avg_score - best_score) / best_score * 100):+.2f}%")
-    
+
     # Baseline 3: Best architecture (average of its folds)
     arch_scores = {}
+    arch_preds_map = {}
     for arch in architectures:
         arch_preds = []
         for model_key, preds in eval_predictions.items():
             if model_key.startswith(arch):
                 arch_preds.append(preds)
-        
+
         if arch_preds:
             arch_avg = np.mean(arch_preds, axis=0)
             arch_score = compute_metric(eval_targets, arch_avg, task)
             arch_scores[arch] = arch_score
-    
+            arch_preds_map[arch] = arch_avg
+
     best_arch = min(arch_scores, key=arch_scores.get)
     best_arch_score = arch_scores[best_arch]
-    
+    best_arch_preds = arch_preds_map[best_arch]
+
     results['best_architecture'] = best_arch_score
     results['best_architecture_name'] = best_arch
     print(f"\n3. Best Architecture: {best_arch}")
     print(f"   {metric_name}: {best_arch_score:.4f}")
-    
+
+    if task == 'bin' and len(np.unique(eval_targets)) > 1:
+        results['roc_auc_best_single'] = roc_auc_score(
+            eval_targets, np.clip(best_preds, 1e-7, 1 - 1e-7)
+        )
+        results['roc_auc_average_all'] = roc_auc_score(
+            eval_targets, np.clip(avg_pred, 1e-7, 1 - 1e-7)
+        )
+        results['roc_auc_best_architecture'] = roc_auc_score(
+            eval_targets, np.clip(best_arch_preds, 1e-7, 1 - 1e-7)
+        )
+
     return results
 
 
@@ -884,6 +869,7 @@ def log_results(
     task: str,
     output_dir: str = 'plots/',
     uncertainty_results: Optional[List[Dict]] = None,
+    roc_auc_scores: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
     """Log and visualize results."""
     print("\n" + "=" * 80)
@@ -899,10 +885,10 @@ def log_results(
     results = {
         'Method': [
             'Baseline: Best Single Model',
-            f'Baseline: Average All Models',
+            'Baseline: Average All Models',
             'Baseline: Best Architecture',
-            'Caruana Ensemble Selection',
-            'Architecture-Level Ensemble Selection'
+            'Caruana - Pool: All Models',
+            'Caruana - Pool: Architectures'
         ],
         f'Evaluation Set {metric_name}': [
             baselines['best_single'],
@@ -919,7 +905,30 @@ def log_results(
     df['vs Best Single (%)'] = ((df[f'Evaluation Set {metric_name}'] - best) / best * 100)
     
     print("\n" + df.to_string(index=False))
-    
+
+    if task == 'bin' and roc_auc_scores is not None:
+        roc_auc_rows = [
+            baselines.get('roc_auc_best_single', np.nan),
+            baselines.get('roc_auc_average_all', np.nan),
+            baselines.get('roc_auc_best_architecture', np.nan),
+            roc_auc_scores.get('caruana_all_models', np.nan),
+            roc_auc_scores.get('caruana_architecture', np.nan),
+        ]
+        roc_df = pd.DataFrame({
+            'Method': results['Method'],
+            'Evaluation Set ROC-AUC': roc_auc_rows,
+        })
+        roc_df['vs Best Single (pp)'] = (
+            roc_df['Evaluation Set ROC-AUC'] - roc_auc_rows[0]
+        ) * 100
+        print("\n" + "=" * 80)
+        print("ROC-AUC (higher is better)")
+        print("=" * 80)
+        print("\n" + roc_df.to_string(index=False))
+        roc_df.to_csv(
+            output_dir / f'ensemble_comparison_roc_auc_{task}.csv', index=False
+        )
+
     # Save
     df.to_csv(output_dir / f'ensemble_comparison_results_{task}.csv', index=False)
     
@@ -1098,20 +1107,22 @@ def main():
     
     # Run methods and collect uncertainty
     method_scores = {}
+    roc_auc_scores: Dict[str, float] = {}
     uncertainty_results = []
     
     # Caruana selection
     weights2 = None
     try:
+        method_name = "caruana_all_models"
         weights2, score2 = run_caruana_method(sel_data, eval_data, task)
-        method_scores['caruana_all_models'] = score2
+        method_scores[method_name] = score2
         
         # Save ensemble weights
         save_ensemble_weights(
             weights=weights2,
             output_path=args.output_dir,
             task=task,
-            method_name="caruana_ensemble",
+            method_name=method_name,
             metric_value=score2,
             metadata={
                 "selection_set_size": len(sel_data['targets']),
@@ -1121,10 +1132,19 @@ def main():
             }
         )
         
+        if task == 'bin' and len(np.unique(eval_data['targets'])) > 1:
+            ensemble_pred2 = np.zeros_like(eval_data['targets'], dtype=float)
+            for model_key, weight in weights2.items():
+                if model_key in eval_data['predictions']:
+                    ensemble_pred2 += eval_data['predictions'][model_key] * weight
+            roc_auc_scores['caruana_all_models'] = roc_auc_score(
+                eval_data['targets'], np.clip(ensemble_pred2, 1e-7, 1 - 1e-7)
+            )
+
         # Uncertainty analysis
         unc_metrics, _ = analyze_uncertainty_quality(
             eval_data['predictions'], eval_data['targets'],
-            weights2, 'Caruana Ensemble Selection', task
+            weights2, 'Caruana - Pool: All Models', task
         )
         uncertainty_results.append(unc_metrics)
     except Exception as e:
@@ -1136,8 +1156,9 @@ def main():
     weights4 = None
     arch_weights_expanded = None
     try:
+        method_name = "caruana_architecture"
         weights4, score4 = run_architecture_caruana_method(sel_data, eval_data, architectures, task)
-        method_scores['caruana_architecture'] = score4
+        method_scores[method_name] = score4
         
         # For Architecture-level ensemble selection, weights are at architecture level - need to expand
         arch_weights_expanded = {}
@@ -1151,7 +1172,7 @@ def main():
             weights=weights4,
             output_path=args.output_dir,
             task=task,
-            method_name="architecture_level",
+            method_name=method_name,
             metric_value=score4,
             metadata={
                 "selection_set_size": len(sel_data['targets']),
@@ -1166,7 +1187,7 @@ def main():
             weights=arch_weights_expanded,
             output_path=args.output_dir,
             task=task,
-            method_name="architecture_level_expanded",
+            method_name=f"{method_name}_expanded",
             metric_value=score4,
             metadata={
                 "selection_set_size": len(sel_data['targets']),
@@ -1175,13 +1196,22 @@ def main():
             }
         )
         
+        if task == 'bin' and len(np.unique(eval_data['targets'])) > 1:
+            ensemble_pred4 = np.zeros_like(eval_data['targets'], dtype=float)
+            for model_key, weight in arch_weights_expanded.items():
+                if model_key in eval_data['predictions']:
+                    ensemble_pred4 += eval_data['predictions'][model_key] * weight
+            roc_auc_scores['caruana_architecture'] = roc_auc_score(
+                eval_data['targets'], np.clip(ensemble_pred4, 1e-7, 1 - 1e-7)
+            )
+
         unc_metrics, _ = analyze_uncertainty_quality(
             eval_data['predictions'], eval_data['targets'],
-            arch_weights_expanded, 'Architecture-Level Ensemble', task
+            arch_weights_expanded, 'Caruana - Pool: Architectures', task
         )
         uncertainty_results.append(unc_metrics)
     except Exception as e:
-        print(f"Architecture-level ensemble selection failed: {e}")
+        print(f"Caruana with ensemble of architectures failed: {e}")
         import traceback
         traceback.print_exc()
     
@@ -1213,8 +1243,9 @@ def main():
     
     # Create comparison
     results_df = log_results(
-        baselines, method_scores, task, 
-        Path(args.output_dir), uncertainty_results
+        baselines, method_scores, task,
+        Path(args.output_dir), uncertainty_results,
+        roc_auc_scores=roc_auc_scores if task == 'bin' else None,
     )
     
     # Print additional metrics for binary classification
