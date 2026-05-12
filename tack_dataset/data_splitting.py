@@ -249,9 +249,11 @@ smiles_wo_operator = df[df['Value_Operator'].isna()]['SMILES'].dropna().unique()
 
 held_out_smiles = []
 
+HELD_OUT_PERC = 0.1
+
 for task in ['Dmax', 'DC50']:
     subset = df[df['Value_Type'] == task].copy()
-    n_held_out = int(0.1 * subset.shape[0])
+    n_held_out = int(HELD_OUT_PERC * subset.shape[0])
     
     fps = [smiles2bitvect[smi] for smi in subset['SMILES'].unique().tolist()]
     

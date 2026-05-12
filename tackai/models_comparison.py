@@ -259,6 +259,7 @@ def make_boxplots_parametric(df, metric_ls, precision_threshold=0.5):
         ax.tick_params(axis='x', rotation=0)
     # plt.tight_layout()
 
+
 def make_boxplots_nonparametric(df, metric_ls, precision_threshold=0.5):
     sns.set_context('notebook')
     sns.set(rc={'figure.figsize': (4, 3)}, font_scale=1.5)
@@ -352,28 +353,52 @@ def make_normality_diagnostic(df, metric_ls, precision_threshold=0.5):
     
     fig, axes = plt.subplots(2, n_metrics, figsize=(20, 10))
     
+    # metric2name = {
+    #     'mae': 'MAE',
+    #     'mse': 'MSE',
+    #     'r2': 'R2',
+    #     'rho': "Spearman's Rho",
+    #     'roc_auc': 'ROC-AUC',
+    #     'pr_auc': 'PR-AUC',
+    #     'mcc': 'Matthews Correlation\nCoefficient (MCC)',
+    #     'recall': f'Recall at Precision ≥ {precision_threshold}',
+    #     'prec': 'Precision',
+    #     'tnr': f'True Negative Rate\n(at Precision ≥ {precision_threshold})',
+    # }
     metric2name = {
         'mae': 'MAE',
         'mse': 'MSE',
-        'r2': 'R2',
-        'rho': "Spearman's Rho",
+        'rmse':'RMSE',
+        'r2': 'R²',
+        'rho': "Spearman's ρ",
         'roc_auc': 'ROC-AUC',
         'pr_auc': 'PR-AUC',
-        'mcc': 'Matthews Correlation\nCoefficient (MCC)',
-        'recall': f'Recall at Precision ≥ {precision_threshold}',
+        'tnr':'TNR',
+        'mcc': 'MCC',
         'prec': 'Precision',
-        'tnr': f'True Negative Rate\n(at Precision ≥ {precision_threshold})',
+        'recall': f'Recall (Prec. ≥ {precision_threshold})',
+        'tnr': f'TNR (Prec. ≥ {precision_threshold})',
+    }
+    
+    colors = {
+        'blue': '#4B9ECE',
+        'orange': '#FFAA6E',
+        'light_blue': '#50B1D8',
+        'dark_orange': '#FF8428',
+        'green': '#9DCE9C',
+        'purple': '#C8ABDA',
     }
     
     for i, metric in enumerate(metrics):
         ax = axes[0, i]
-        sns.histplot(df_norm[df_norm['metric'] == metric]['value'], kde=True, ax=ax)
-        ax.set_title(f'{metric2name[metric]}', fontsize=16)
+        sns.histplot(df_norm[df_norm['metric'] == metric]['value'], kde=True, ax=ax, color=colors['blue'])
+        ax.set_title(f'{metric2name[metric]}', fontsize=16, fontweight='bold')
         # Change x-axis label
         ax.set_xlabel('Value')
         # If it's not the first plot, remove y-axis label
         if i != 0:
             ax.set_ylabel('')
+        ax.grid(alpha=0.5)
     
     for i, metric in enumerate(metrics):
         ax = axes[1, i]
@@ -383,6 +408,7 @@ def make_normality_diagnostic(df, metric_ls, precision_threshold=0.5):
         # If it's not the first plot, remove y-axis label
         if i != 0:
             ax.set_ylabel('')
+        ax.grid(alpha=0.5)
     
     plt.tight_layout()
 
@@ -427,7 +453,7 @@ def mcs_plot(pc, effect_size, means, labels=True, cmap=None, cbar_ax_bbox=None,
     significance[(pc < 0.05) & (pc >= 0.01)] = '*'
     significance[(pc >= 0.05)] = ''
 
-    np.fill_diagonal(significance.values, '')
+    # np.fill_diagonal(significance.values, '')
 
     # Create a DataFrame for the annotations
     if show_diff:
@@ -457,7 +483,7 @@ def mcs_plot(pc, effect_size, means, labels=True, cmap=None, cbar_ax_bbox=None,
 def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
                        figsize=(20, 10), direction_dict={}, effect_dict={}, show_diff=True,
                        cell_text_size=16, axis_text_size=12, title_text_size=16, sort_axes=False,
-                       precision_threshold=0.5):
+                       precision_threshold=0.5, metrics_per_row=3):
     """
     Create a grid of multiple comparison of means plots using Tukey HSD test results.
 
@@ -477,9 +503,24 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
 
     Returns:
     None
-    """
-    nrow = math.ceil(len(stats) / 3)
-    fig, ax = plt.subplots(nrow, 3, figsize=figsize)
+    """    
+    metric2name = {
+        'mae': 'MAE',
+        'mse': 'MSE',
+        'rmse':'RMSE',
+        'r2': 'R²',
+        'rho': "Spearman's ρ",
+        'roc_auc': 'ROC-AUC',
+        'pr_auc': 'PR-AUC',
+        'tnr':'TNR',
+        'mcc': 'MCC',
+        'prec': 'Precision',
+        'recall': f'Recall (Prec. ≥ {precision_threshold})',
+        'tnr': f'TNR (Prec. ≥ {precision_threshold})',
+    }
+    
+    nrow = math.ceil(len(stats) / metrics_per_row)
+    fig, ax = plt.subplots(nrow, metrics_per_row, figsize=figsize)
 
     # Set defaults
     for key in ['r2', 'rho', 'prec', 'recall', 'mae', 'mse', 'roc_auc']:
@@ -494,8 +535,8 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
     for i, stat in enumerate(stats):
         stat = stat.lower()
 
-        row = i // 3
-        col = i % 3
+        row = i // int(metrics_per_row)
+        col = i % int(metrics_per_row)
 
         if stat not in direction_dict:
             raise ValueError(f"Stat '{stat}' is missing in direction_dict. Please set its value.")
@@ -513,13 +554,13 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
                        show_diff=show_diff, ax=ax[row, col], cbar=True,
                        cell_text_size=cell_text_size, axis_text_size=axis_text_size,
                        reverse_cmap=reverse_cmap, vlim=effect_dict[stat])
-        hax.set_title(stat.upper(), fontsize=title_text_size)
+        hax.set_title(metric2name[stat], fontsize=title_text_size, fontweight='bold')
 
     # If there are less plots than cells in the grid, hide the remaining cells
-    if (len(stats) % 3) != 0:
-        for i in range(len(stats), nrow * 3):
-            row = i // 3
-            col = i % 3
+    if (len(stats) % metrics_per_row) != 0:
+        for i in range(len(stats), nrow * metrics_per_row):
+            row = i // metrics_per_row
+            col = i % metrics_per_row
             ax[row, col].set_visible(False)
 
     plt.tight_layout()
