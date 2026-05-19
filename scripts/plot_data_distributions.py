@@ -418,8 +418,9 @@ def create_figure2_distributions(data: dict) -> plt.Figure:
     plt.close(fig)
     return fig
 
-def print_statistics(df: pd.DataFrame) -> None:
-    """Print basic statistics about the dataset."""
+def print_statistics(data: dict) -> None:
+    """Print basic statistics about the dataset."""    
+    df = data['default']
     print("=" * 20)
     print("Dataset Statistics:")
     print("=" * 20)
@@ -442,6 +443,12 @@ def print_statistics(df: pd.DataFrame) -> None:
     num_dmax = len(df[df['Value_Type'] == 'Dmax'])
     print(f"DC50 records: {num_dc50:,}")
     print(f"Dmax records: {num_dmax:,}")
+    
+    df = data['multitask']
+    active = df[(df['Value_DC50'] < DC50_THRESH) & (df['Value_Dmax'] > DMAX_THRESH)]
+    print(f"Number of data points with both DC50 and Dmax: {len(df[(df['Value_DC50'].notna()) & (df['Value_Dmax'].notna())]):,} (perc: {(len(df[(df['Value_DC50'].notna()) & (df['Value_Dmax'].notna())]) / len(data['default']) * 100):.1f}%)")
+    print(f"Active PROTACs (DC50 < {DC50_THRESH} nM AND Dmax > {DMAX_THRESH} %): {len(active):,} (perc: {(len(active) / len(df) * 100):.1f}%)")
+    print(f"Number of unique active PROTACs: {active['SMILES'].nunique():,}")
 
 # ============================================================================
 # MAIN
@@ -455,7 +462,7 @@ def main() -> None:
 
     data = load_tack_data()
     
-    print_statistics(data['default'])
+    print_statistics(data)
     create_figure1_distributions(data)
     create_figure2_distributions(data)
 

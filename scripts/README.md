@@ -1,31 +1,18 @@
 # 🤖 Model Training and Ensemble Selection Scripts
 
-This directory contains scripts for training PROTAC degradation prediction models and constructing optimal ensembles with uncertainty quantification.
+This directory contains scripts for training PROTAC degradation prediction models on TACK and constructing optimal ensembles with uncertainty quantification.
 
 ## 📋 Overview
 
 The training pipeline implements:
-- **Nested 5×5 Cross-Validation**: Rigorous statistical evaluation with group-based splitting
+- **Repeated 5×5 Cross-Validation**: Rigorous statistical evaluation with group-based splitting
 - **Multiple Model Architectures**: MLP and XGBoost models
 - **Hyperparameter Optimization**: Optuna-based tuning for XGBoost and MLP models
 - **Ensemble Selection**: Caruana's greedy forward selection with uncertainty quantification
 
 ## 🔧 Prerequisites
 
-Please install the required Python packages in the `requirements.txt` file in the root directory via `pip install -r requirements.txt`; here summarized:
-
-```bash
-# Install core dependencies
-pip install torch pytorch-lightning transformers datasets
-pip install xgboost optuna scikit-learn pandas numpy
-pip install rdkit matplotlib seaborn
-```
-
-Please make sure that the PYTHONPATH environment variable includes the root directory of the project to allow imports from `tackai`:
-
-```bash
-export PYTHONPATH=$(pwd):$PYTHONPATH
-```
+Please install the required Python packages as described in the [README](README.md).
 
 ## 🎯 Training Models
 
@@ -102,12 +89,14 @@ python scripts/train_models.py \
 Construct optimal ensembles from trained models:
 
 ```bash
-python scripts/ensemble_comparison.py \
+python scripts/ensemble_selection.py \
     --task dmax \
     --prediction_dir ./predictions \
     --output_dir ./ensemble_results \
     --hillclimb_perc 0.2
 ```
+
+Available tasks: `dmax`, `dc50`, `bin`.
 
 ### 🎲 How It Works
 

@@ -61,13 +61,13 @@ def compute_label(row, task: str):
     elif task == 'dmax':
         return 1 if dmax_val is not None and dmax_val >= DMAX_THRESH else (0 if dmax_val else np.nan)
     elif task == 'bin':
-        if dc50_val is not None and dc50_val > DC50_THRESH:
+        if dc50_val is None or dmax_val is None:
+            return np.nan
+        if dc50_val > DC50_THRESH:
             return 0
-        if dmax_val is not None and dmax_val < DMAX_THRESH:
+        if dmax_val < DMAX_THRESH:
             return 0
-        if dc50_val is not None and dc50_val <= DC50_THRESH:
-            return 1
-        if dmax_val is not None and dmax_val >= DMAX_THRESH:
+        if dc50_val <= DC50_THRESH and dmax_val >= DMAX_THRESH:
             return 1
         return np.nan
     return np.nan

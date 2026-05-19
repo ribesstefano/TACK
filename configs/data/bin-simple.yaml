@@ -1,0 +1,11 @@
+cell_line_col: Cell_Line_ID
+impute_labels: false
+normalize_labels: false
+standardize_labels: false
+use_assay_type_encoding: true
+use_cell_name_embedding: true
+use_descriptors: true
+use_ligase_name_embedding: true
+use_poi_name_embedding: true
+use_relevant_descriptors: false
+use_treatment_time: true

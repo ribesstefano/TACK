@@ -19,7 +19,7 @@ use_ligase_pca: true
 # Otherwise, when using N% variance, we might end up with different dimensions
 # for each sample to process.
 poi_pca_n_components: 44
-ligase_pca_n_components: 7
+ligase_pca_n_components: 6
 # Assay
 use_assay_type_encoding: true
 use_treatment_time: true

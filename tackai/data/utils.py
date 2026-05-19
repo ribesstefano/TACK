@@ -14,8 +14,12 @@ import gdown
 import h5py
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file
 
 from tackai.config import config
+
 
 def get_cache_dir() -> str:
     """Get the cache directory path and ensure it exists.

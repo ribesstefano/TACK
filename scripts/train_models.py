@@ -16,10 +16,14 @@ import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 from datasets import load_dataset, Dataset
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file
 
 from tackai.config import load_config_from_yaml  # noqa: E402
 from tackai.training import run_cv_experiment
 from tackai import DegradationComplexDataModule
+
 
 def get_bin_label(
         row: Union[pd.Series, Dict[str, Any]],
@@ -39,19 +43,20 @@ def get_bin_label(
     dc50 = row.get('DC50', np.nan)
     dmax = row.get('Dmax', np.nan)
 
-    # 1. Definite INACTIVE (0)
+    # Return inactive (0) if either DC50 is above threshold or Dmax is below threshold
     if pd.notna(dc50) and float(dc50) >= dc50_threshold:
         return 0
     if pd.notna(dmax) and float(dmax) < dmax_threshold:
         return 0
 
-    # 2. Definite ACTIVE (1)
-    if pd.notna(dc50) and float(dc50) < dc50_threshold:
-        return 1
-    if pd.notna(dmax) and float(dmax) >= dmax_threshold:
-        return 1
+    # If either DC50 or Dmax is missing, we cannot determine activity, return np.nan
+    if pd.isna(dc50) or pd.isna(dmax):
+        return np.nan
 
-    return np.nan
+    # Return active (1) if DC50 is below threshold and Dmax is above or equal to threshold
+    if float(dc50) < dc50_threshold and float(dmax) >= dmax_threshold:
+        return 1
+    return 0
 
 def map_bin_labels(example: Dict[str, Any]) -> Dict[str, Any]:
     """ Map binary activity labels to the example based on Dmax and DC50 values. """

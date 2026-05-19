@@ -18,11 +18,11 @@ use_ligase_pca: true
 # Otherwise, when using N% variance, we might end up with different dimensions
 # for each sample to process.
 poi_pca_n_components: 44
-ligase_pca_n_components: 6
+ligase_pca_n_components: 7
 # Assay
 use_assay_type_encoding: true
 use_treatment_time: true
 # Labels
-normalize_labels: true
+normalize_labels: false
 standardize_labels: false
-impute_labels: true
+impute_labels: false

@@ -6,9 +6,7 @@
   <img src="misc/tack.drawio.png" alt="Overview of the TACK dataset and training pipeline" width="80%">
 </p>
 
-TACK combines data from multiple sources (TPD-DB, PROTAC-DB, and PROTAC-Pedia) to create the largest publicly available dataset for training and evaluating machine learning models that predict PROTAC-induced protein degradation activities.
-
----
+TACK combines data from multiple sources (TPDdb, PROTAC-DB, and PROTACpedia) to create the largest publicly available dataset for training and evaluating machine learning models that predict PROTAC-induced protein degradation activities.
 
 ## 📚 Overview
 
@@ -18,8 +16,9 @@ This repository provides:
 - **Training Framework**: Model training with nested 5×5 cross-validation
 - **Ensemble Selection**: Caruana's greedy forward selection with uncertainty quantification
 - **Benchmark Suite**: Standardized evaluation protocols and baselines
+- **Python API for Ensemble Models**: Pre-trained ensembles for predicting Dmax, DC50, and binary degradation activity
 
-Please refer to the [`tack_dataset/README.md`](tack_dataset/README.md) for detailed instructions on dataset curation and to [`scripts/README.md`](scripts/README.md) for model training and ensemble selection.
+Please refer to the [`tack_dataset/README.md`](tack_dataset/README.md) for detailed instructions on dataset curation, to [`scripts/README.md`](scripts/README.md) for model training and ensemble selection, and to [`notebooks/ensemble_predictor_tutorial.ipynb`](notebooks/ensemble_predictor_tutorial.ipynb) for interactive tutorials on using the pre-trained ensemble predictor.
 
 ### Key Features
 
@@ -30,15 +29,13 @@ Please refer to the [`tack_dataset/README.md`](tack_dataset/README.md) for detai
 - ✅ **Multiple model architectures**: MLP, XGBoost
 - ✅ **Hyperparameter optimization** using Optuna
 
----
-
 ## 🚀 Quick Start
 
 ### Installation
 
 TACK uses [`uv`](https://docs.astral.sh/uv/) for environment and dependency management.
 
-**1. Install uv** (skip if already available, e.g. via an HPC module):
+**1. Install uv** (skip if already available, e.g., via an HPC module):
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -81,6 +78,12 @@ uv pip install torch --extra-index-url https://download.pytorch.org/whl/cu121
 python -m ipykernel install --user --name tack --display-name "TACK"
 ```
 
+**6. Set up cache and model files for inference with pre-trained ensembles:**
+
+Please refer to the [README section on "Pre-trained Models & Cache Files"](README.md#pre-trained-models--cache-files) for detailed instructions on downloading and configuring the necessary files for inference.
+
+For running inference with the pre-trained ensemble, please refer to the [ensemble predictor tutorial notebook](notebooks/ensemble_predictor_tutorial.ipynb) for step-by-step instructions on how to use the `EnsemblePredictor` class with the downloaded models and cache files.
+
 ### Download the Dataset
 
 The TACK dataset will soon be available on Hugging Face:
@@ -91,32 +94,11 @@ from datasets import load_dataset
 # Load specific configurations
 dmax_ds = load_dataset("ailab-bio/TACK", "Dmax", split="train")
 dc50_ds = load_dataset("ailab-bio/TACK", "DC50", split="train")
-multitask_ds = load_dataset("ailab-bio/TACK", "multitask", split="train")
+bin_ds = load_dataset("ailab-bio/TACK", "multitask", split="train")
 ```
 
 > [!NOTE]
 > For reproducibility, training can also be performed using local CSV files via `--custom_dataset_csv`.
-
-### Train a Model
-
-```bash
-python scripts/train_models.py \
-    --model_type xgboost \
-    --task dmax \
-    --group scaffold \
-    --batch_size 64
-```
-
-### Construct Ensemble
-
-```bash
-python scripts/ensemble_comparison.py \
-    --task dmax \
-    --prediction_dir ./predictions \
-    --output_dir ./ensemble_results
-```
-
----
 
 ## 🗄️ Pre-trained Models & Cache Files
 
@@ -125,13 +107,10 @@ are **not** included in this repository due to their size:
 
 | Archive | Contents | Purpose |
 |---|---|---|
-| `tack-cache.zip` | `uniprot2embedding.h5`, `cell2embedding.pkl`, `cell_embeddings_*.npz`, `morgan_fp_*.npz`, `rdkit_descriptors*.npz`, `cell2data.json`, `cell2description.json`, `cell2cell_id.json` | Pre-computed embeddings and molecular descriptors read at inference time |
-| `tack-models.zip` | `ensembles/<task>/ensemble_weights_*.json`, `*_hparams.yaml`, `*_state.pt`, model checkpoints (`.ckpt` / XGBoost `.json`) | Trained ensemble weights and fitted data-processing state |
+| `cache.zip` | `cell2cell_id.json`, `cell2description.json`, `cell2data.json`, `cell_embeddings_model=sentence-transformer_pooling=sum.npz`, `morgan_fp_radius16_size512.npz`, `rdkit_descriptors.npz` | Pre-computed embeddings and molecular descriptors read at inference time |
+| `ensembles.zip` | `ensembles/<task>_<type>/ensemble_weights_*.json`, `*_hparams.yaml`, `*_state.pt`, model checkpoints (`.ckpt` / XGBoost `.json`) | Trained ensemble weights and fitted data-processing state |
 
-Both archives are available on Zenodo: **[https://doi.org/10.5281/zenodo.XXXXXXX](https://doi.org/10.5281/zenodo.XXXXXXX)**
-
-> [!NOTE]
-> `XXXXXXX` will be replaced with a Zenodo record ID once the work is published.
+Both archives are available on Zenodo: **[https://doi.org/10.5281/zenodo.15691822](https://doi.org/10.5281/zenodo.15691822)**
 
 ### Setup
 
@@ -141,16 +120,18 @@ Both archives are available on Zenodo: **[https://doi.org/10.5281/zenodo.XXXXXXX
 # choose any writable location; this example uses ~/tack-artifacts
 mkdir -p ~/tack-artifacts/cache ~/tack-artifacts/ensembles
 
-unzip tack-cache.zip  -d ~/tack-artifacts/cache
-unzip tack-models.zip -d ~/tack-artifacts/ensembles
+unzip cache.zip  -d ~/tack-artifacts/cache
+unzip ensembles.zip -d ~/tack-artifacts/ensembles
 ```
 
 **2. Point `TACKAI_CACHE` at the cache directory:**
 
-Add the following to your `.env` file (or shell profile):
+Copy the example file `.env.example` to `.env` and edit the `TACKAI_CACHE` variable to point to the location of the unpacked cache files:
 
 ```bash
-export TACKAI_CACHE=~/tack-artifacts/cache
+cp .env.example .env
+# Then edit .env and set:
+TACKAI_CACHE=~/tack-artifacts/cache/tack/
 ```
 
 `tackai` reads this variable at startup via `get_cache_dir()`.  If it is not
@@ -180,8 +161,6 @@ model archive needs to be regenerated.
 
 For re-running data curation, please refer to the instruction in this [README](tack_dataset/README.md) file.
 
----
-
 ## 📂 Repository Structure
 
 ```
@@ -199,20 +178,37 @@ TACK/
 └── README.md
 ```
 
----
+## 📈 Reproducing the Results
 
-## 🧬 PROTAC-STAN Evaluation
+### Train a Model
+
+```bash
+python scripts/train_models.py \
+    --model_type xgboost \
+    --task dmax \
+    --group scaffold \
+    --batch_size 64
+```
+
+### Construct and Evaluate Ensemble
+
+```bash
+python scripts/ensemble_comparison.py \
+    --task dmax \
+    --prediction_dir ./predictions \
+    --output_dir ./ensemble_results
+```
+
+### 🧬 PROTAC-STAN Evaluation
 
 See the [PROTAC-STAN evaluation instructions](protac_stan/README.md) for reproducing results on TACK with 5×5 cross-validation.
-
----
 
 ## 📄 License
 
 The TACK dataset and code are released under the MIT License. See `LICENSE` for details.
 
----
-
 ## 🤝 Acknowledgements
 
-We thank the contributors of TPD-DB, PROTAC-DB, and PROTAC-Pedia for making this resource possible.
+The authors acknowledge funding provided by the Chalmers Gender Initiative for Excellence (Genie), and by the Wallenberg AI, Autonomous Systems, and Software Program (WASP), supported by the Knut and Alice Wallenberg Foundation.
+The authors thank Yossra Gharbi, Alexander Persson, and Felix Erngård for helpful discussions.
+The computations and data storage were enabled by resources provided by Chalmers e-Commons and by the National Academic Infrastructure for Supercomputing in Sweden (NAISS), partially funded by the Swedish Research Council through grant agreement no. 2022-06725.
