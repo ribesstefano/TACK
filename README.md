@@ -207,6 +207,24 @@ See the [PROTAC-STAN evaluation instructions](protac_stan/README.md) for reprodu
 
 The TACK dataset and code are released under the MIT License. See `LICENSE` for details.
 
+<!-- Add citation -->
+
+## 📑 Citation
+
+If you use TACK in your research, please cite the following paper:
+
+```bibtex
+@misc{ribes2026tackstatisticalevaluationdegradation,
+      title={{TACK: A statistical evaluation of degradation activity on a novel TArgeting Chimeras Knowledge dataset}}, 
+      author={Stefano Ribes and Nils Dunlop and Rocío Mercado},
+      year={2026},
+      eprint={2605.19579},
+      archivePrefix={arXiv},
+      primaryClass={q-bio.QM},
+      url={https://arxiv.org/abs/2605.19579}, 
+}
+```
+
 ## 🤝 Acknowledgements
 
 The authors acknowledge funding provided by the Chalmers Gender Initiative for Excellence (Genie), and by the Wallenberg AI, Autonomous Systems, and Software Program (WASP), supported by the Knut and Alice Wallenberg Foundation.
