@@ -8,7 +8,7 @@
 
 TACK combines data from multiple sources (TPDdb, PROTAC-DB, and PROTACpedia) to create the largest publicly available dataset for training and evaluating machine learning models that predict PROTAC-induced protein degradation activities.
 
-[![Dataset on HF](https://huggingface.co/datasets/huggingface/badges/resolve/main/dataset-on-hf-md-dark.svg)](https://huggingface.co/datasets/ailab-bio/TACK)
+[![Dataset](https://img.shields.io/badge/🤗%20HuggingFace-Dataset-yellow)]([https://huggingface.co/datasets/LeMaterial/LeMat-Synth](https://huggingface.co/datasets/ailab-bio/TACK))
 [![Models](https://img.shields.io/badge/Models-Zenodo-green)](https://zenodo.org/uploads/15691822)
 [![Paper](https://img.shields.io/badge/Paper-KDD%202026-blue)](https://arxiv.org/abs/2605.19579)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
