@@ -5,6 +5,7 @@ with weighted averaging and uncertainty quantification.
 """
 import os
 import re
+import json
 import time
 import pickle
 import warnings
@@ -472,6 +473,7 @@ class EnsemblePredictor:
         device: str = 'cpu',
         n_jobs: Optional[int] = None,
         pattern: Optional[str] = None,
+        weights_file: Optional[Union[str, Path]] = None,
     ) -> 'EnsemblePredictor':
         """
         Load models from a directory.
@@ -480,11 +482,11 @@ class EnsemblePredictor:
             model_dir: Directory containing model files
             datamodule_dir: Directory containing datamodule state dicts (optional)
             weights: Optional weights for each model
-            task: Task type
-            label_name: Label column name for denormalization
             device: Device for inference
             n_jobs: Number of threads for running XGBoost models
             pattern: Optional regex pattern to filter model files
+            weights_file: Optional ensemble weights JSON; when given, only the
+                models listed in it are loaded and its weights are used
             
         Returns:
             Initialized EnsemblePredictor
@@ -494,6 +496,27 @@ class EnsemblePredictor:
 
         if not model_dir.exists():
             raise FileNotFoundError(f"Model directory not found: {model_dir}")
+
+        # Optionally restrict loading to the models named in a weights JSON
+        wanted_stems = None
+        if weights_file is not None:
+            if weights is not None:
+                raise ValueError("Pass either `weights` or `weights_file`, not both.")
+            weights_file = Path(weights_file)
+            if not weights_file.exists():
+                raise FileNotFoundError(f"Weights file not found: {weights_file}")
+            with open(weights_file) as f:
+                weights_doc = json.load(f)
+            weights = weights_doc.get("weights", {})
+            if not weights:
+                raise ValueError(f"No weights found in {weights_file}")
+            wanted_stems = set(weights)
+            print(
+                f"Restricting to weights file {weights_file.name} "
+                f"(task={weights_doc.get('task', 'unknown')}, "
+                f"method={weights_doc.get('method', 'unknown')}, "
+                f"{len(weights)} models)"
+            )
 
         models = {}
         datamodules = {}
@@ -507,6 +530,10 @@ class EnsemblePredictor:
         if pattern:
             regex = re.compile(pattern)
             model_files = [f for f in model_files if regex.search(str(f))]
+
+        # Filter to the models named in the weights file, if given
+        if wanted_stems is not None:
+            model_files = [f for f in model_files if f.stem in wanted_stems]
         
         print(f"Found {len(model_files)} model files in {model_dir}")
         
@@ -527,100 +554,11 @@ class EnsemblePredictor:
         if not models:
             raise ValueError(f"No models could be loaded from {model_dir}")
 
-        return cls(models, datamodules, weights, device, n_jobs=n_jobs)
-    
-    @classmethod
-    def from_weights_file(
-        cls,
-        weights_file: Union[str, Path],
-        model_dir: Union[str, Path],
-        datamodule_dir: Optional[Union[str, Path]] = None,
-        device: str = 'cpu',
-    ) -> 'EnsemblePredictor':
-        """
-        Load an ensemble predictor from a weights JSON file.
-        
-        Only loads the models specified in the weights file.
-        
-        Args:
-            weights_file: Path to the JSON weights file
-            model_dir: Directory containing model checkpoints
-            datamodule_dir: Directory containing datamodule state dicts
-            device: Device for inference
-            
-        Returns:
-            Initialized EnsemblePredictor with only the specified models
-        """
-        import json
+        # Keep weights only for models that actually loaded
+        if weights is not None:
+            weights = {name: w for name, w in weights.items() if name in models}
 
-        weights_file = Path(weights_file)
-        model_dir = Path(model_dir)
-        device = 'cuda' if device == 'gpu' else device
-        
-        if not weights_file.exists():
-            raise FileNotFoundError(f"Weights file not found: {weights_file}")
-        if not model_dir.exists():
-            raise FileNotFoundError(f"Model directory not found: {model_dir}")
-        
-        # Load weights file
-        with open(weights_file, 'r') as f:
-            weights_doc = json.load(f)
-        
-        weights = weights_doc.get("weights", {})
-        task = weights_doc.get("task", "dmax")
-        method = weights_doc.get("method", "unknown")
-        
-        print(f"Loading ensemble from weights file: {weights_file.name}")
-        print(f"  Task: {task}")
-        print(f"  Method: {method}")
-        print(f"  Models to load: {len(weights)}")
-        
-        if not weights:
-            raise ValueError("No weights found in weights file")
-        
-        # Find all model files in directory
-        model_files = []
-        for ext in ['*.ckpt', '*.json', '*.ubj', '*.pkl']:
-            model_files.extend(model_dir.glob(f'**/{ext}'))
-        
-        # Build a lookup of model_name -> model_file
-        model_lookup = {f.stem: f for f in model_files}
-        
-        models = {}
-        datamodules = {}
-        loaded_weights = {}
-        
-        for model_name, weight in weights.items():
-            if model_name not in model_lookup:
-                print(f"  ⚠️ Model not found: {model_name}")
-                continue
-            
-            model_file = model_lookup[model_name]
-            
-            try:
-                model, datamodule = cls._load_model_and_datamodule(
-                    model_file, task, device, datamodule_dir or model_dir
-                )
-                models[model_name] = model
-                datamodules[model_name] = datamodule
-                loaded_weights[model_name] = weight
-                print(f"  ✅ Loaded: {model_name[:60]}... (weight={weight:.4f})")
-            except Exception as e:
-                print(f"  ❌ Failed to load {model_name}: {e}")
-                continue
-        
-        if not models:
-            raise ValueError(f"No models could be loaded from weights file")
-        
-        print(f"\nSuccessfully loaded {len(models)} / {len(weights)} models")
-        
-        return cls(
-            models=models,
-            datamodules=datamodules,
-            weights=loaded_weights,
-            task=task,
-            device=device,
-        )
+        return cls(models, datamodules, weights, device, n_jobs=n_jobs)
     
     @staticmethod
     def _load_model_and_datamodule(

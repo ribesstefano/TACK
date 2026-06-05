@@ -1,0 +1,16 @@
+# Molecule
+use_descriptors: true
+use_relevant_descriptors: false
+# Proteins
+use_poi_name_embedding: true
+use_ligase_name_embedding: true
+# Cell Line
+use_cell_name_embedding: true
+cell_line_col: "Cell_Line_ID"
+# Assay
+use_assay_type_encoding: true
+use_treatment_time: true
+# Labels
+normalize_labels: false
+standardize_labels: false
+impute_labels: false

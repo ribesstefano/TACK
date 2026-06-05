@@ -1,7 +1,6 @@
+model_type: xgboost
 model_config:
-    objective: "reg:mve"
-    disable_default_eval_metric: 1
-    num_class: 2
+    objective: 'reg:squarederror'
     base_score: 0.0        # Since we scaled to mean=0, start at 0
     tree_method: "hist"
     learning_rate: 0.01    # Drastically lower learning rate
@@ -19,5 +18,5 @@ model_config:
     n_jobs: 8
     seed: 42
 training_config:
-    num_boost_round: 1000
+    num_boost_round: 2000
     early_stopping_rounds: 30

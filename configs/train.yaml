@@ -1,0 +1,43 @@
+# Main Hydra config for training PROTAC degradation prediction models.
+#
+# Compose a run by selecting a data feature-set and a model from the config
+# groups below, and override any field on the command line, e.g.:
+#
+#   python scripts/train_models.py model=mlp data=fp task=dmax group=scaffold
+#   python scripts/train_models.py -m model=xgboost,mlp data=fp,simple task=dmax,dc50
+#
+# Inspect the merged config without training:  ... --cfg job
+defaults:
+  - data: fp        # any file stem under configs/data/
+  - model: xgboost  # any file stem under configs/model/
+  - _self_
+
+# Task to train on: dmax | dc50 | bin | dmax_bin | dc50_bin | multitask
+task: dmax
+# Data splitting strategy: random | scaffold | butina
+group: scaffold
+
+seed: 42
+batch_size: 64
+num_proc: 1
+
+checkpoint_dir: ./checkpoints
+predictions_dir: ./predictions
+
+# Hyperparameter tuning (Optuna)
+tune_hyperparameters: true
+# Number of tuning trials; null -> 20 (xgboost) / 100 (mlp, bert)
+n_tuning_trials: null
+
+# Optional CSV overriding the default TACK dataset (same columns required)
+custom_dataset_csv: null
+
+hydra:
+  job:
+    # Keep the working directory at the launch location so relative paths
+    # (checkpoint_dir, predictions_dir) resolve as before.
+    chdir: false
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}

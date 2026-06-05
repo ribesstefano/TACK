@@ -1,6 +1,6 @@
+model_type: xgboost
 model_config:
-    objective: "reg:quantileerror"
-    base_score: 0.0        # Since we scaled to mean=0, start at 0
+    objective: "binary:logistic"
     tree_method: "hist"
     learning_rate: 0.01    # Drastically lower learning rate
     n_estimators: 2000     # Needs more rounds because LR is low
