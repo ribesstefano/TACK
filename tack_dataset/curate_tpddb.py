@@ -656,6 +656,32 @@ class TpddbCurator:
     # Entry point
     # ------------------------------------------------------------------
 
+    def extract_smiles_only(self, include_mol_glues: bool = False) -> pd.DataFrame:
+        """Extract all unique canonicalized SMILES from general_info CSVs and save."""
+        tpd_ids = self.load_tpd_ids()
+        if include_mol_glues:
+            protac_ids = list(set(tpd_ids.get('PROTAC', []) + tpd_ids.get('MG', [])))
+            logger.info(f"Extracting SMILES for {len(protac_ids):,} PROTAC+MG IDs...")
+        else:
+            protac_ids = tpd_ids.get('PROTAC', [])
+            logger.info(f"Extracting SMILES for {len(protac_ids):,} PROTAC IDs...")
+
+        info_dir = self.parsed_dir / 'general_info'
+        smiles_set: set = set()
+        for tpd_id in tqdm(protac_ids, desc="Extracting SMILES"):
+            csv_path = info_dir / f"{tpd_id}_general_info.csv"
+            info_df = open_csv(csv_path)
+            if not info_df.empty and 'SMILES' in info_df.columns:
+                smi = canonicalize_smiles(info_df['SMILES'].iloc[0])
+                if smi:
+                    smiles_set.add(smi)
+
+        smiles_df = pd.DataFrame({'SMILES': sorted(smiles_set), 'Database': 'TPDdb'})
+        output_path = self.output_dir / 'tpddb_smiles.csv'
+        smiles_df.to_csv(output_path, index=False)
+        logger.info(f"Saved {len(smiles_df):,} unique SMILES to {output_path}")
+        return smiles_df
+
     def curate(self) -> pd.DataFrame:
         """Run the full curation pipeline and save the output CSV."""
         logger.info("Starting TPD-DB curation pipeline...")
@@ -766,6 +792,10 @@ def parse_args():
                         help='Directory for log files')
     parser.add_argument('--plot',        action='store_true',
                         help='Generate distribution plots after curation')
+    parser.add_argument('--smiles_only', action='store_true',
+                        help='Only extract and save unique canonicalized SMILES; skip all assay parsing.')
+    parser.add_argument('--include_mol_glues', action='store_true',
+                        help='Only extract and save unique canonicalized molecular glue SMILES; skip all assay parsing.')
     return parser.parse_args()
 
 
@@ -777,6 +807,11 @@ def main():
         output_file=args.output_file,
     )
     curator = TpddbCurator(config)
+
+    if args.smiles_only:
+        curator.extract_smiles_only(args.include_mol_glues)
+        return
+
     df = curator.curate()
 
     if args.plot:

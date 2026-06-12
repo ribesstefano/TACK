@@ -57,6 +57,7 @@ def main():
     parser.add_argument('--force_refetch', action='store_true', help='Force refetching of UniProt entries even if cached files exist.')
     parser.add_argument('--log_dir', type=str, default=Path('logs'), help='Directory to save log files.')
     parser.add_argument('--verbose', '-v', action='count', default=0, help='Increase output verbosity (e.g. -v for INFO, -vv for DEBUG, -vvv for more detailed DEBUG).')
+    parser.add_argument('--smiles_only', action='store_true', help='Only extract and save unique canonicalized SMILES; skip all assay parsing.')
 
     args = parser.parse_args()
 
@@ -112,6 +113,14 @@ def main():
     protacdb_df = protacdb_df.rename(columns={'E3 ligase': 'E3 Ligase'})
     protacdb_df['Smiles'] = protacdb_df['Smiles'].apply(canonicalize_smiles)
     protacdb_df = protacdb_df.dropna(subset=['Smiles']).reset_index(drop=True)
+
+    if args.smiles_only:
+        smiles_df = protacdb_df[['Smiles']].drop_duplicates().rename(columns={'Smiles': 'SMILES'})
+        smiles_df['Database'] = 'PROTAC-DB'
+        csv_path = data_curation_dir / 'protacdb_smiles.csv'
+        smiles_df[['SMILES', 'Database']].to_csv(csv_path, index=False)
+        logger.info(f'Saved {len(smiles_df):,} unique SMILES to {csv_path}')
+        return
 
     # ==========================================================================
     # ## Define Assay-Related Columns

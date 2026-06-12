@@ -95,6 +95,7 @@ def main():
     parser.add_argument('--force_refetch', action='store_true', help='Force refetching of UniProt entries even if cached files exist.')
     parser.add_argument('--log_dir', type=str, default=Path('logs'), help='Directory to save log files.')
     parser.add_argument('--verbose', '-v', action='count', default=0, help='Increase output verbosity (e.g. -v for INFO, -vv for DEBUG, -vvv for more detailed DEBUG).')
+    parser.add_argument('--smiles_only', action='store_true', help='Only extract and save unique canonicalized SMILES; skip all assay parsing.')
 
     args = parser.parse_args()
 
@@ -116,6 +117,16 @@ def main():
         protacpedia_df = pd.read_csv(protacpedia_file).reset_index(drop=True)
     else:
         raise FileNotFoundError(f"PROTAC-Pedia file not found at: {protacpedia_file}")
+
+    if args.smiles_only:
+        smiles_df = protacpedia_df[['PROTAC SMILES']].copy()
+        smiles_df['SMILES'] = smiles_df['PROTAC SMILES'].apply(canonicalize_smiles)
+        smiles_df = smiles_df.dropna(subset=['SMILES'])[['SMILES']].drop_duplicates()
+        smiles_df['Database'] = 'PROTACpedia'
+        csv_path = data_curation_dir / 'protacpedia_smiles.csv'
+        smiles_df[['SMILES', 'Database']].to_csv(csv_path, index=False)
+        logging.info(f'Saved {len(smiles_df):,} unique SMILES to {csv_path}')
+        return
 
     logging.info(f"Number of rows in PROTAC-Pedia before curation: {len(protacpedia_df)}")
     cols = ['Comments', 'Dc50', 'Dmax']

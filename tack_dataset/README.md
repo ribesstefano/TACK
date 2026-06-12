@@ -1,11 +1,11 @@
 # TACK Dataset Curation Pipeline
 
-This directory contains scripts for curating PROTAC degradation data from multiple sources: TPD-DB, PROTAC-DB, and PROTACpedia.
+This directory contains scripts for curating PROTAC degradation data from multiple sources: TPDdb, PROTAC-DB, and PROTACpedia.
 
 ## Overview
 
 The curation pipeline processes raw data through several stages:
-1. **Scraping**: Download and extract data from TPD-DB
+1. **Scraping**: Download and extract data from TPDdb
 2. **Parsing**: Clean and structure the scraped data
 3. **Individual Curation**: Process each database separately
 4. **Merging**: Combine all sources with deduplication and conflict resolution
@@ -19,7 +19,7 @@ Please install the package as described in the main [README](README.md) file.
 
 ## Data Sources
 
-- **TPD-DB**: Targeted Protein Degradation Database from https://tpddb.idrblab.net
+- **TPDdb**: Targeted Protein Degradation Database from https://tpddb.idrblab.net
 - **PROTAC-DB**: Downloaded from http://cadd.zju.edu.cn/protacdb/
 - **PROTACpedia**: Manually curated literature data from https://protacpedia.weizmann.ac.il/ptcb/main
 
@@ -30,9 +30,9 @@ Please ensure you have the raw data files downloaded and placed in the `data/ori
 
 ## Pipeline Steps
 
-### 1. 🌐 Scrape TPD-DB Data
+### 1. 🌐 Scrape TPDdb Data
 
-Download PROTAC and molecular glue data from TPD-DB and save the text file into `data/original/`. Then run the scraping script to download the corresponding HTML pages:
+Download PROTAC and molecular glue data from TPDdb and save the text file into `data/original/`. Then run the scraping script to download the corresponding HTML pages:
 
 ```bash
 python tack_dataset/tpddb_scraping.py \
@@ -41,14 +41,14 @@ python tack_dataset/tpddb_scraping.py \
 ```
 
 **Options:**
-- `--protac-txt`: Path to TPD-DB PROTAC main table (required)
-- `--glue-txt`: Path to TPD-DB molecular glue table (optional)
+- `--protac-txt`: Path to TPDdb PROTAC main table (required)
+- `--glue-txt`: Path to TPDdb molecular glue table (optional)
 - `--limit`: Number of entries to process (useful for testing)
 - `-v`: Verbose logging
 
 **Output:** Raw HTML files in `data/original/html/`
 
-### 2. 📄 Parse TPD-DB Data
+### 2. 📄 Parse TPDdb Data
 
 Extract structured data from HTML files:
 
@@ -58,7 +58,34 @@ python tack_dataset/tpddb_parsing.py -v
 
 **Output:** Parsed CSV files in `data/parsed/`
 
-### 3. 🧹 Clean TPD-DB Data
+#### Parallel Parsing with SLURM
+
+Parsing can be parallelized using the provided `tack_dataset/tpddb_parsing_slurm.py` script for SLURM clusters. Example usage:
+
+```bash
+python tack_dataset/tpddb_parsing_slurm.py \
+    --account my-account-42 \
+    --partition my-server \
+    --venv .venv \
+    --mail-user my-email@org.com \
+    --mail-type END \
+    --jobs 50 \
+    --skip-existing
+```
+
+More information on the available arguments:
+
+| Arg | Purpose |
+|---|---|
+| --jobs N | Number of parallel tasks (default 50 → 429 IDs each) |
+| --account, --partition | Cluster-specific settings |
+| --venv PATH | Path to virtualenv (omit if using modules/conda) |
+| --time | Wall time per task |
+| --extra-directive | Catch-all for any other #SBATCH options |
+| --input, --sep, --id-col | Works with any delimited TPD table |
+| --dry-run | Preview the script without submitting |
+
+### 3. 🧹 Clean TPDdb Data
 
 Apply quality cleaning and standardization:
 
@@ -119,7 +146,7 @@ python tack_dataset/curate_protacdb_tpddb_protacpedia.py
 ```
 
 **Merging strategy:**
-- Priority order: TPD-DB > PROTAC-DB > PROTACpedia
+- Priority order: TPDdb > PROTAC-DB > PROTACpedia
 - Remove duplicates based on key columns: SMILES, POI, ligase, cell line, assay type
 - Handle conflicting values by preferring higher-priority source
 - Convert units to standard (nM for DC50, % for Dmax)
@@ -147,22 +174,25 @@ python tack_dataset/data_splitting.py
 Run all steps in sequence:
 
 ```bash
-# 1. Scrape TPD-DB
+# 1. Scrape TPDdb
 python tack_dataset/tpddb_scraping.py \
     --protac-txt data/original/PROTAC_main_table.txt \
     -v
 
-# 2. Parse TPD-DB
+# 2. Parse TPDdb HTML files before TPDdb curation
 python tack_dataset/tpddb_parsing.py -v
 
-# 3. Clean TPD-DB
-python tack_dataset/tpddb_cleaning.py
+# NOTE: Steps 1 and 2 can take some time due to the number of entries, please be
+# patient before proceeding to the next steps :)
 
-# 4. Curate PROTACpedia
-python tack_dataset/curate_protacpedia.py
-
-# 5. Curate PROTAC-DB
+# 3. Curate PROTAC-DB
 python tack_dataset/curate_protacdb.py
+
+# 4. Curate TPDdb
+python tack_dataset/curate_tpddb.py
+
+# 5. Curate PROTACpedia
+python tack_dataset/curate_protacpedia.py
 
 # 6. Merge all sources
 python tack_dataset/curate_protacdb_tpddb_protacpedia.py
@@ -170,6 +200,20 @@ python tack_dataset/curate_protacdb_tpddb_protacpedia.py
 # 7. Create splits
 python tack_dataset/data_splitting.py
 ```
+
+## SMILES Extraction Only
+
+If you only want to extract and aggregate unique SMILES from all sources without the full curation process, you can run the following commands:
+
+```bash
+python tack_dataset/curate_protacdb --smiles_only
+python tack_dataset/curate_protacpedia --smiles_only
+python tack_dataset/curate_tpddb --smiles_only
+python tack_dataset/aggregate_smiles
+```
+
+> [!NOTE]
+> The `--smiles_only` option for `curate_tpddb.py` requires that you have already run the scraping and parsing steps for TPDdb to generate the necessary intermediate files. Please ensure you have completed those steps before using this option.
 
 ## Logging
 

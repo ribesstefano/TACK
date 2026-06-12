@@ -119,7 +119,7 @@ def most_common(s):
 
 def join_unique(s):
     vals = s.dropna().unique()
-    return '; '.join(str(v) for v in vals) if len(vals) > 0 else np.nan
+    return ('; '.join(sorted([str(v) for v in vals]))).strip() if len(vals) > 0 else np.nan
 
 
 numeric_cols = ['Value', 'Value_Error', 'Value_Range_Min', 'Value_Range_Max', 'Value_Concentration', 'Assay_Time']
