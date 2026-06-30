@@ -10,3 +10,6 @@ use_ligase_name_embedding: true
 use_poi_name_embedding: true
 use_relevant_descriptors: false
 use_treatment_time: true
+fp_size: 512
+radius: 16
+categorical_encoding: minmax

@@ -28,3 +28,12 @@ use_poi_pca: false
 use_poi_precomputed_embedding: true
 use_relevant_descriptors: false
 use_treatment_time: false
+fp_size: 512
+radius: 16
+categorical_encoding: minmax
+poi_embeddings_format: npz
+poi_residue_pooling: sum
+poi_embeddings_id_type: sequence
+ligase_embeddings_format: npz
+ligase_residue_pooling: sum
+ligase_embeddings_id_type: sequence

@@ -18,3 +18,9 @@ use_poi_precomputed_embedding: true
 use_relevant_descriptors: false
 use_treatment_time: true
 categorical_encoding: onehot
+poi_embeddings_format: npz
+poi_residue_pooling: sum
+poi_embeddings_id_type: sequence
+ligase_embeddings_format: npz
+ligase_residue_pooling: sum
+ligase_embeddings_id_type: sequence

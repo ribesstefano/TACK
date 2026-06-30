@@ -187,13 +187,149 @@ TACK/
 
 ### Train a Model
 
+Training is configured with [Hydra](https://hydra.cc). A run is composed from
+`configs/train.yaml` by selecting a feature set (`data=`, any file stem under
+`configs/data/`) and a model (`model=`, any file stem under `configs/model/`),
+then overriding any field on the command line:
+
 ```bash
-python scripts/train_models.py \
-    --model_type xgboost \
-    --task dmax \
-    --group scaffold \
-    --batch_size 64
+# Single run (Hydra compose API)
+tack train model=xgboost data=fp task=dmax group=scaffold
 ```
+
+To change the configuration, override leaves inline (e.g.
+`model.model_config.learning_rate=0.005 batch_size=128 tune_hyperparameters=false`)
+or edit `configs/train.yaml` and the group files under `configs/data/` and
+`configs/model/` directly. The model type is read from each model config's
+`model_type` field, so it no longer needs to be passed separately.
+
+Every run writes a **manifest** under `<checkpoint_dir>/manifests/<run_id>.json`
+recording the exact config, feature set, and per-fold artifacts — see
+[Experiment Structure](#experiment-structure) below.
+
+#### Sweeping Over Configurations (Hydra Multirun)
+
+For sweeps, use `tack sweep` (the `tack-sweep` console script), which drives
+Hydra's launcher with `-m`/`--multirun` and comma-separated value lists. Each
+combination runs as its own experiment and writes its own manifest:
+
+```bash
+# Cartesian product: 2 models × 2 feature sets × 2 tasks = 8 runs
+tack sweep -m model=xgboost,mlp data=fp,simple task=dmax,dc50 group=scaffold
+
+# Sweep a DataModule leaf (e.g. fingerprint size)
+tack sweep -m model=xgboost data=fp task=dmax data.fp_size=512,1024
+
+# Inspect the merged config without training
+tack sweep --cfg job
+```
+
+#### Overriding DataModule Parameters via the Command Line
+
+All fields defined in a `configs/data/*.yaml` file can be overridden directly on
+the command line using the `data.` prefix (single value per key for `tack train`;
+comma lists for `tack sweep`).
+
+```bash
+# Change fingerprint size and radius for a single run
+tack train model=xgboost data=fp task=dmax data.fp_size=1024 data.radius=2
+
+# Switch from minmax to one-hot encoding of categorical features
+tack train model=xgboost data=fp task=dmax data.categorical_encoding=onehot
+
+# Disable label normalisation on-the-fly (useful for debugging raw outputs)
+tack train model=xgboost data=fp task=dmax data.normalize_labels=false
+
+# Use a local CSV instead of the Hugging Face dataset
+tack train model=xgboost data=fp task=dmax custom_dataset_csv=./my_data.csv
+
+# Use a precomputed protein embedding file and enable PCA reduction
+tack train model=xgboost data=cell_text_esms task=dmax \
+    data.poi_embeddings_file=/path/to/embeddings.npz \
+    data.poi_embeddings_per_residue=false \
+    data.poi_pca_n_components=32
+
+# Sweep a leaf across values with the multirun launcher
+tack sweep -m model=xgboost data=fp task=dmax data.categorical_encoding=minmax,onehot,embedding
+```
+
+The full list of overridable `data.*` keys matches the parameters of
+`DegradationComplexDataModule.__init__` and is explicitly listed in each YAML
+file under `configs/data/`.
+
+### Experiment Structure
+
+Training is harmonized around a per-run **manifest**, the single structured
+source of truth for an experiment (one `(model, data, task, group)` combination).
+This replaces reverse-parsing information out of filenames.
+
+```text
+<checkpoint_dir>/
+├── manifests/
+│   └── <run_id>.json          # structured record (see below)
+├── model=<name>-group=<g>-fold=<k>.{json,ckpt}    # per-fold checkpoints
+└── datamodule-data=<...>-fold=<k>_{hparams.yaml,state.pt}   # fitted state
+<predictions_dir>/
+└── preds-model=<...>-task=<t>-group=<g>-fold=<k>-split=<val|test>.csv
+```
+
+The `run_id` is a deterministic slug `model__data__task__group`
+(e.g. `xgboost__fp__dmax__scaffold`). Each manifest records:
+
+- the canonical Hydra `model=`/`data=` stems and the **resolved** config /
+  optimized hyperparameters;
+- a human-readable `label` (e.g. `XGB-DMAX Cell-Text E3-OneHot Mol-Desc Time`);
+- the **feature spec** — each processed feature tagged `stateless` vs `fitted`
+  (see below);
+- per fold: the checkpoint, datamodule-state, and prediction-file paths;
+- provenance (timestamp, `tackai` version, git SHA).
+
+#### Stateless vs fitted features
+
+Each processed feature is declared (in `tackai.data.datamodule.FEATURE_REGISTRY`,
+surfaced per-config via `DegradationComplexDataModule.get_feature_spec()`) as
+either **stateless** — deterministic per input and cached once in `TACKAI_CACHE`,
+so it is computed a single time and reused across every fold and ensemble member —
+or **fitted** — produced by an estimator fit on the training fold and therefore
+recomputed per fold.
+
+| Feature | Flag | Kind |
+|---|---|---|
+| Morgan fingerprints | `use_fingerprints` | stateless (cached) |
+| RDKit descriptors | `use_descriptors` | stateless (cached)¹ |
+| POI / E3 precomputed ESM embeddings | `use_poi_precomputed_embedding`, `use_ligase_precomputed_embedding` | stateless (cached) |
+| Cell-line description embeddings | `use_cell_description_embedding` | stateless (cached) |
+| POI / E3 / cell-line name encoders | `use_*_name_embedding` | fitted (per fold) |
+| POI sequence count vector | `use_poi_sequence_embedding` | fitted (per fold) |
+| Assay type / treatment time | `use_assay_type_encoding`, `use_treatment_time` | fitted (per fold) |
+| PCA on ESM embeddings | `use_poi_pca`, `use_ligase_pca` | fitted (per fold) |
+
+¹ Raw descriptor values are cached and reused; they then pass through the
+(cheap) fitted numeric scaler.
+
+### Evaluate Models
+
+`tack evaluate` runs the whole statistical comparison in one go: it discovers
+runs (preferring manifests, falling back to the canonical filename parser),
+loads every fold's predictions into one tidy table, ranks methods per task with
+the [`autorank`](https://github.com/sherbold/autorank) package (automatic
+parametric/non-parametric choice, multiple-comparison correction, and a
+critical-difference diagram), and writes a Markdown report plus figures.
+
+```bash
+tack evaluate \
+    --predictions-dir ./predictions \
+    --checkpoints-dir ./checkpoints \
+    --task dmax --set val \
+    --output-dir ./eval_results
+```
+
+Outputs in `--output-dir`: `report.md` (best + statistically-equivalent methods
+per task, ranking table, figures), `runs.csv`, `ranking.csv`, `metrics.csv`, and
+a `figures/` directory (CD diagrams, metric boxplots, ROC/PR curves). The
+labeling/loading/ranking helpers are importable for notebooks via
+`from tackai.evaluation import load_predictions, find_equivalent_best_set, build_full_report`.
+Requires the analysis extras (`uv pip install -e ".[dev]"`).
 
 ### Construct and Evaluate Ensemble
 
@@ -203,6 +339,51 @@ python scripts/ensemble_comparison.py \
     --prediction_dir ./predictions \
     --output_dir ./ensemble_results
 ```
+
+### Predict with the `tack` CLI
+
+Run weighted ensemble inference on a CSV of PROTACs. The input CSV **must**
+contain a `SMILES` column; optional context columns are used when present.
+
+```bash
+tack predict \
+    --checkpoints-dir ensembles/dmax \
+    --weights ensemble_weights_dmax_caruana_ensemble.json \
+    --input-csv compounds.csv \
+    --output-csv predictions.csv
+```
+
+**`tack train` overrides** (Hydra `key=value`; defaults from `configs/train.yaml`):
+
+| Override | Description | Default |
+|---|---|---|
+| `model` | Model config stem under `configs/model/` | `xgboost` |
+| `data` | Feature-set config stem under `configs/data/` | `fp` |
+| `task` | `dmax` / `dc50` / `bin` / `dmax_bin` / `dc50_bin` / `multitask` | `dmax` |
+| `group` | Split strategy: `random` / `scaffold` / `butina` | `scaffold` |
+| `batch_size`, `seed`, `num_proc` | Run settings | `64`, `42`, `1` |
+| `tune_hyperparameters`, `n_tuning_trials` | Optuna tuning | `true`, `null` (→ 20 xgb / 100 nn) |
+| `checkpoint_dir`, `predictions_dir` | Output directories | `./checkpoints`, `./predictions` |
+| `custom_dataset_csv` | CSV overriding the TACK dataset | `null` |
+
+**`tack predict` arguments:**
+
+| Argument | Description | Default |
+|---|---|---|
+| `--checkpoints-dir` | Directory with model checkpoints + datamodule states (**required**) | — |
+| `--input-csv` | Input CSV with a `SMILES` column (**required**) | — |
+| `--output-csv` | Where to write predictions (**required**) | — |
+| `--weights` | Ensemble weights JSON; restricts inference to the listed models | all models |
+| `--device` | `cuda` / `cpu` | auto |
+| `--n-jobs` | Threads for XGBoost inference | all cores |
+| `--smiles-col` | SMILES column name | `SMILES` |
+| `--poi-col`, `--poi-sequence-col`, `--ligase-col`, `--cell-line-col`, `--treatment-time-col` | Context column overrides | auto-detected |
+
+Recognized optional input columns (auto-detected when not given): `POI_Name`,
+`POI_Sequence`, `Ligase_Name`, `Cell_Line_ID`/`Cell_Line`, `Assay_Time`. The
+output CSV appends `prediction`, `uncertainty`, and percentile/SEM 95%
+confidence-interval columns (suffixed per task when the ensemble spans multiple
+tasks).
 
 ### 🧬 PROTAC-STAN Evaluation
 

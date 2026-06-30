@@ -12,3 +12,6 @@ cell_line_col: "Cell_Line_ID"
 normalize_labels: true
 standardize_labels: false
 impute_labels: true
+fp_size: 512
+radius: 16
+categorical_encoding: minmax

@@ -11,3 +11,4 @@ cell_line_col: "Cell_Line_ID"
 normalize_labels: true
 standardize_labels: false
 impute_labels: true
+categorical_encoding: minmax

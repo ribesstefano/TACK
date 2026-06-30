@@ -48,8 +48,90 @@ from tackai.data.embeddings.mol_embeddings import MolEmbedding
 from tackai.config import load_config_from_yaml
 
 
+# Processing kinds for a feature, used to decide what can be reused across CV
+# folds / ensemble members and what must be recomputed per training fold.
+STATELESS = "stateless"  # deterministic per input; disk-cached once and shared
+FITTED = "fitted"        # depends on the training fold; refit on every fold
+
+# Declarative map: datamodule feature flag -> processing metadata. Mirrors the
+# fit/transform split in ``setup()``. STATELESS features are produced by a pure
+# ``transform`` whose result only depends on the input value (SMILES, sequence,
+# cell line) and is cached on disk in ``TACKAI_CACHE``; they are computed once
+# and reused for every fold and every ensemble member. FITTED features rely on a
+# sklearn estimator (encoder, scaler, PCA, count-vectorizer) that is fit on the
+# training fold and therefore must be refit per fold.
+#
+# Notes:
+# - ``embedder_attr`` is the datamodule attribute holding the embedder whose
+#   on-disk cache file documents where the stateless result is stored.
+# - Raw precomputed protein embeddings are STATELESS; the optional PCA applied
+#   on top of them (``use_poi_pca`` / ``use_ligase_pca``) is a separate FITTED
+#   step recorded independently.
+# - Raw RDKit descriptors are STATELESS (cached), but they are subsequently
+#   passed through the FITTED numeric pipeline (a cheap scaler); the expensive
+#   part — descriptor computation — is the compute-once concern captured here.
+FEATURE_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "use_fingerprints": {
+        "name": "fingerprint", "kind": STATELESS, "token": "FP",
+        "embedder_attr": "fp_embedder", "feature_keys": ["Feature_Fingerprint"],
+    },
+    "use_descriptors": {
+        "name": "descriptors", "kind": STATELESS, "token": "Mol-Desc",
+        "embedder_attr": "desc_embedder", "feature_keys": ["Feature_Descriptor_"],
+    },
+    "use_poi_precomputed_embedding": {
+        "name": "poi_precomputed", "kind": STATELESS, "token": "POI-ESM",
+        "embedder_attr": "poi_precomputed_embedding",
+        "feature_keys": ["Feature_POI_Precomputed_Embedding"],
+    },
+    "use_ligase_precomputed_embedding": {
+        "name": "ligase_precomputed", "kind": STATELESS, "token": "E3-ESM",
+        "embedder_attr": "ligase_precomputed_embedding",
+        "feature_keys": ["Feature_Ligase_Precomputed_Embedding"],
+    },
+    "use_cell_description_embedding": {
+        "name": "cell_description", "kind": STATELESS, "token": "Cell-Text",
+        "embedder_attr": "cell_description_embedding",
+        "feature_keys": ["Feature_{cell_line_col}_Description"],
+    },
+    "use_poi_sequence_embedding": {
+        "name": "poi_sequence", "kind": FITTED, "token": "POI-Vec",
+        "embedder_attr": "poi_sequence_embedding",
+        "feature_keys": ["Feature_{poi_sequence_col}"],
+    },
+    "use_poi_name_embedding": {
+        "name": "poi_name", "kind": FITTED, "token": "POI-Cat",
+        "embedder_attr": None, "feature_keys": ["Feature_{poi_col}"],
+    },
+    "use_ligase_name_embedding": {
+        "name": "ligase_name", "kind": FITTED, "token": "E3-Cat",
+        "embedder_attr": None, "feature_keys": ["Feature_{ligase_col}"],
+    },
+    "use_cell_name_embedding": {
+        "name": "cell_name", "kind": FITTED, "token": "Cell-Cat",
+        "embedder_attr": None, "feature_keys": ["Feature_{cell_line_col}"],
+    },
+    "use_assay_type_encoding": {
+        "name": "assay_type", "kind": FITTED, "token": "Assay",
+        "embedder_attr": None, "feature_keys": ["Feature_{assay_type_col}"],
+    },
+    "use_treatment_time": {
+        "name": "treatment_time", "kind": FITTED, "token": "Time",
+        "embedder_attr": None, "feature_keys": ["Feature_{treatment_time_col}"],
+    },
+    "use_poi_pca": {
+        "name": "poi_pca", "kind": FITTED, "token": "POI-PCA",
+        "embedder_attr": None, "feature_keys": ["Feature_POI_Precomputed_Embedding"],
+    },
+    "use_ligase_pca": {
+        "name": "ligase_pca", "kind": FITTED, "token": "E3-PCA",
+        "embedder_attr": None, "feature_keys": ["Feature_Ligase_Precomputed_Embedding"],
+    },
+}
+
+
 class DegradationComplexDataModule(pl.LightningDataModule):
-    
+
     """ Wrapper module to handle data loading and featurization for the TACK
     dataset.
     """
@@ -1239,8 +1321,87 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         excluded = set()
         if exclude_tokenizer:
             excluded = {'input_ids', 'attention_mask', 'token_type_ids', 'Prompt'}
-        
+
         return sum(dim for name, dim in self.feature_dims.items() if name not in excluded)
+
+    def _resolve_feature_keys(self, key_templates: List[str]) -> List[str]:
+        """ Resolve ``Feature_*`` key templates against this config's columns.
+
+        Templates may contain column placeholders (e.g.
+        ``"Feature_{poi_col}"``) or a trailing-prefix marker (e.g.
+        ``"Feature_Descriptor_"`` matches every descriptor feature key).
+
+        Args:
+            key_templates: List of feature-key templates from FEATURE_REGISTRY.
+
+        Returns:
+            Concrete feature keys present in ``self.feature_dims`` (when set up),
+            otherwise the formatted template keys.
+        """
+        resolved: List[str] = []
+        for template in key_templates:
+            key = template.format(
+                poi_col=self.poi_col,
+                ligase_col=self.ligase_col,
+                cell_line_col=self.cell_line_col,
+                assay_type_col=self.assay_type_col,
+                poi_sequence_col=self.poi_sequence_col,
+                treatment_time_col=self.treatment_time_col,
+            )
+            if key.endswith('_'):
+                # Prefix marker: expand to all matching feature_dims keys.
+                matches = [k for k in self.feature_dims if k.startswith(key)]
+                resolved.extend(matches if matches else [key])
+            else:
+                resolved.append(key)
+        return resolved
+
+    def get_feature_spec(self) -> List[Dict[str, Any]]:
+        """ Describe the active processed features and how they are produced.
+
+        Returns one entry per enabled feature with its processing ``kind``
+        (``stateless`` vs ``fitted``; see :data:`FEATURE_REGISTRY`), the
+        concrete ``Feature_*`` keys it maps to, the total ``dim`` (when the data
+        module has been set up), and the on-disk ``cache`` file for stateless,
+        disk-cached embedders.
+
+        This is the structured replacement for reverse-parsing ``str(self)``: it
+        is recorded verbatim in the run manifest so downstream tooling can tell,
+        without string matching, which features were used and which can be
+        computed once and shared across folds / ensemble members.
+
+        Returns:
+            List of ``{name, kind, token, feature_keys, dim, cache}`` dicts,
+            ordered as in FEATURE_REGISTRY.
+        """
+        spec: List[Dict[str, Any]] = []
+        for flag, meta in FEATURE_REGISTRY.items():
+            if not getattr(self, flag, False):
+                continue
+
+            feature_keys = self._resolve_feature_keys(meta["feature_keys"])
+            dim = sum(self.feature_dims.get(k, 0) for k in feature_keys)
+
+            cache = None
+            embedder_attr = meta.get("embedder_attr")
+            if embedder_attr is not None:
+                embedder = getattr(self, embedder_attr, None)
+                if embedder is not None:
+                    cache_path = (
+                        getattr(embedder, "embeddings_file", None)
+                        or getattr(embedder, "filename", None)
+                    )
+                    cache = str(cache_path) if cache_path is not None else None
+
+            spec.append({
+                "name": meta["name"],
+                "kind": meta["kind"],
+                "token": meta["token"],
+                "feature_keys": feature_keys,
+                "dim": int(dim) if dim else None,
+                "cache": cache,
+            })
+        return spec
 
     def _create_category_pipeline(self):
         """ Create sklearn pipeline for categorical feature preprocessing."""
@@ -1264,6 +1425,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 # The +1 shift (unknown → 0, known → 1..N) is applied in
                 # _run_category_pipeline() after transformation.
                 inner = Pipeline([
+                    ('imputer', SimpleImputer(strategy='constant', fill_value='Unknown')),
                     ('ordinal', OrdinalEncoder(
                         handle_unknown='use_encoded_value',
                         unknown_value=-1,
@@ -1272,6 +1434,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 ])
             elif self.categorical_encoding == 'onehot':
                 inner = Pipeline([
+                    ('imputer', SimpleImputer(strategy='constant', fill_value='Unknown')),
                     ('onehot', OneHotEncoder(
                         handle_unknown='ignore',
                         sparse_output=False
@@ -1280,6 +1443,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             else:
                 # Default 'minmax' mode: ordinal + MinMax scaling to [0, 1]
                 inner = Pipeline([
+                    ('imputer', SimpleImputer(strategy='constant', fill_value='Unknown')),
                     ('ordinal', OrdinalEncoder(
                         handle_unknown='use_encoded_value',
                         unknown_value=-1,
@@ -1452,44 +1616,6 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 # ('minmax', MinMaxScaler()),
             ]
             return Pipeline(transformers)
-    
-    # def _create_label_pipeline(self, target_type: str = 'Dmax') -> Pipeline:
-    #     """ Create pipeline for label normalization.
-        
-    #     Args:
-    #         target_type: 'Dmax' or 'DC50'
-            
-    #     Returns:
-    #         An sklearn Pipeline for label transformation.
-    #     """
-    #     if target_type == 'Dmax':
-    #         # STRATEGY 1: Dmax (Logit Transform)
-    #         # Transforms skewed 0-100% data into a bell-curve shape
-    #         return Pipeline([
-    #             ('logit_transform', FunctionTransformer(
-    #                 func=_dmax_logit_forward,
-    #                 inverse_func=_dmax_logit_inverse,
-    #                 validate=True,
-    #                 check_inverse=False # often safer to disable strict checking for floats
-    #             )),
-    #             ('scaler', StandardScaler())
-    #         ])
-    #     elif target_type == 'DC50':
-    #         # STRATEGY 2: DC50 (Log10 + Standardization)
-    #         # Transforms raw concentrations to pDC50, then Z-scores them.
-    #         return Pipeline([
-    #             ('to_pdc50', FunctionTransformer(
-    #                 func=_dc50_to_pdc50_vectorized,
-    #                 inverse_func=_pdc50_to_dc50_inverse,
-    #                 kw_args={'unit': 'nM'},        # Pass arguments here
-    #                 inv_kw_args={'unit': 'nM'},    # Pass arguments for inverse here
-    #                 validate=True
-    #             )),
-    #             ('scaler', StandardScaler())
-    #         ])
-            
-    #     else:
-    #         raise ValueError(f"Unknown target_type: {target_type}. Must be 'Dmax' or 'DC50'.")
 
     def _fit_label_transformers(self, train_df: pd.DataFrame) -> None:
         """ Fit label transformers on training data.
@@ -1910,18 +2036,18 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             self.numerical_cols = state_dict.get('numerical_cols', [])
             self.numeric_pipeline = pickle.loads(state_dict['numeric_pipeline'])
 
-        # 4. Restore label transformers
+        # Restore label transformers
         if (self.normalize_labels or self.standardize_labels) and 'label_transformers' in state_dict:
             for key, bytes_data in state_dict['label_transformers'].items():
                 # Pickle loads directly from bytes
                 self.label_transformers[key] = pickle.loads(bytes_data)
 
-        # 5. Restore POI sequence embedding (TfidfVectorizer)
+        # Restore POI sequence embedding (TfidfVectorizer)
         if self.use_poi_sequence_embedding and 'poi_sequence_embedding_sklearn_encoder' in state_dict:
             if self.poi_sequence_embedding is not None:
                 self.poi_sequence_embedding.sklearn_encoder = pickle.loads(state_dict['poi_sequence_embedding_sklearn_encoder'])
         
-        # 6. Restore tokenizer (Transformers are best loaded by name)
+        # Restore tokenizer (Transformers are best loaded by name)
         if self.use_tokenizer and 'tokenizer_name' in state_dict:
             self.tokenizer_name = state_dict['tokenizer_name']
             self.max_length = state_dict.get('max_length', self.max_length)
@@ -1929,7 +2055,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # 7. Restore PCA transformers
+        # Restore PCA transformers
         if self.use_poi_pca and 'poi_pca' in state_dict:
             self.poi_pca = pickle.loads(state_dict['poi_pca'])
         

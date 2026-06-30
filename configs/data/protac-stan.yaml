@@ -37,3 +37,12 @@ use_treatment_time: false
 normalize_labels: true
 standardize_labels: false
 impute_labels: true
+fp_size: 512
+radius: 16
+categorical_encoding: minmax
+poi_embeddings_format: npz
+poi_residue_pooling: sum
+poi_embeddings_id_type: sequence
+ligase_embeddings_format: npz
+ligase_residue_pooling: sum
+ligase_embeddings_id_type: sequence

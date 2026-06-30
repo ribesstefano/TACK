@@ -3,10 +3,10 @@
 # Compose a run by selecting a data feature-set and a model from the config
 # groups below, and override any field on the command line, e.g.:
 #
-#   python scripts/train_models.py model=mlp data=fp task=dmax group=scaffold
-#   python scripts/train_models.py -m model=xgboost,mlp data=fp,simple task=dmax,dc50
+#   tack train model=mlp data=fp task=dmax group=scaffold          # single run
+#   tack sweep -m model=xgboost,mlp data=fp,simple task=dmax,dc50  # multirun sweep
 #
-# Inspect the merged config without training:  ... --cfg job
+# Inspect the merged config without training:  tack sweep --cfg job
 defaults:
   - data: fp        # any file stem under configs/data/
   - model: xgboost  # any file stem under configs/model/

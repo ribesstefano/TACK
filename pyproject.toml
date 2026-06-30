@@ -61,6 +61,8 @@ dependencies = [
     "tensorboard>=2.20.0",
     # Configuration / CLI
     "hydra-core>=1.3.0",
+    # Statistical model comparison (omnibus ranking + critical-difference diagrams)
+    "autorank>=1.2.0",
 ]
 
 [project.optional-dependencies]
@@ -87,6 +89,9 @@ Repository = "https://github.com/ribesstefano/TACK"
 
 [project.scripts]
 tack = "tackai.cli:main"
+# Hydra multirun sweep launcher (supports `-m model=a,b data=c,d task=...`).
+# `tack train` remains the single-run convenience path (Hydra compose API).
+tack-sweep = "tackai.train_app:main_hydra"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tackai", "tack_dataset"]

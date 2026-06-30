@@ -6,3 +6,5 @@ batch_size: 32
 normalize_labels: false
 standardize_labels: true
 impute_labels: true
+max_length: 512
+is_bert_multitask: false
