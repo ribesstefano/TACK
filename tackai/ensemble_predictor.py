@@ -961,11 +961,11 @@ class EnsemblePredictor:
                     
                     # Determine format based on model type
                     if model_type == 'xgboost':
-                        features = datamodule.featurize_sample(filled_sample, return_tensor='xgb')
+                        features = datamodule.transform([filled_sample], return_tensor='xgb')
                     elif model_type == 'lightning':
-                        features = datamodule.featurize_sample(filled_sample, return_tensor='pt')
+                        features = datamodule.transform([filled_sample], return_tensor='pt')
                     else:
-                        features = datamodule.featurize_sample(filled_sample, return_tensor=return_format)
+                        features = datamodule.transform([filled_sample], return_tensor=return_format)
                     
                     featurized[name] = features
                 except Exception as e:
@@ -985,7 +985,7 @@ class EnsemblePredictor:
         because it:
         1. Validates/fills defaults **once per datamodule** for the whole
            batch (identical logic, but key-normalisation happens once).
-        2. Uses ``datamodule.featurize_samples_batch`` which runs sklearn
+        2. Uses ``datamodule.transform`` which runs sklearn
            pipelines on one big DataFrame and deduplicates embedding lookups.
         3. Passes a **shared embedding cache** across datamodules so that
            two models that both need the same Morgan fingerprint or protein
@@ -1000,8 +1000,6 @@ class EnsemblePredictor:
             where each ``features_sample_i`` has the format required by the
             model type (xgb tuple, pt dict, etc.).
         """
-        # Shared cache across all datamodules for this batch
-        shared_cache = {}
         featurized = {}
         timings = defaultdict(list)
 
@@ -1030,21 +1028,10 @@ class EnsemblePredictor:
 
             # --- Batch featurize using the datamodule -----------------------
             model_type = self.model_types.get(name, 'unknown')
-            if model_type == 'xgboost':
-                ret = 'xgb'
-            elif model_type == 'lightning':
-                # 'pt' returns a single Dict[str, Tensor] with batch dim,
-                # skipping the per-sample dict loop and re-stacking in inference.
-                ret = 'pt'
-            else:
-                ret = 'np'
-            
+            ret = 'xgb' if model_type == 'xgboost' else 'pt'
+
             start = time.time()
-            batch_feat = datamodule.featurize_samples_batch(
-                filled_samples,
-                return_tensor=ret,
-                shared_cache=shared_cache,
-            )
+            batch_feat = datamodule.transform(filled_samples, return_tensor=ret)
             stop = time.time()
             timings['featurize_batch'].append(stop - start)
             featurized[name] = batch_feat
@@ -1560,7 +1547,7 @@ class EnsemblePredictor:
             if verbose:
                 print(f"  Preprocessed context for model '{model_name}'")
 
-            ctx_feats = datamodule.transform_context_features(filled)
+            ctx_feats = datamodule.transform_context(filled)
             context_features[model_name] = ctx_feats
 
             if self.model_types[model_name] == 'xgboost':
@@ -1671,38 +1658,20 @@ class EnsemblePredictor:
             ctx_feats = context.context_features[model_name]
 
             start = time.time()
-            smiles_feats = datamodule.transform_smiles_features(smiles_list)
-            total_smiles += time.time() - start
-
-            start = time.time()
             if model_type == 'xgboost':
-                layout = context.xgb_layouts[model_name]
-                total_dim = context.xgb_total_dims[model_name]
-                template = context.xgb_row_template[model_name]
-                # One allocation; broadcast tiling of the prefilled
-                # context row, then overwrite the SMILES slices.
-                matrix = np.broadcast_to(template, (n, total_dim)).copy()
-                for key, offset, width in layout:
-                    if key in smiles_feats:
-                        matrix[:, offset:offset + width] = smiles_feats[key]
-                feat_arg = (matrix, context.xgb_feature_names[model_name])
+                feat_arg = datamodule.transform(
+                    smiles_list, context=ctx_feats, return_tensor='xgb'
+                )
             elif model_type == 'lightning':
-                batch: Dict[str, torch.Tensor] = {}
-                for key, arr in ctx_feats.items():
-                    tensor = torch.from_numpy(
-                        np.ascontiguousarray(arr, dtype=np.float32)
-                    ).unsqueeze(0).expand(n, -1)
-                    batch[key] = tensor
-                for key, arr in smiles_feats.items():
-                    batch[key] = torch.from_numpy(
-                        np.ascontiguousarray(arr, dtype=np.float32)
-                    )
-                feat_arg = batch
+                feat_arg = datamodule.transform(
+                    smiles_list, context=ctx_feats, return_tensor='pt'
+                )
             else:
                 raise ValueError(
                     f"Unsupported model type '{model_type}' for {model_name}"
                 )
-            total_assemble += time.time() - start
+            total_smiles += time.time() - start
+            total_assemble = 0.0
 
             start = time.time()
             try:
@@ -1741,9 +1710,9 @@ class EnsemblePredictor:
         Accepts two input formats:
 
         * **Dict[str, Tensor]** (fast path) — produced by
-          ``featurize_samples_batch(return_tensor='pt_batch')``.  All samples
-          are already stacked; tensors are moved to device and the model is
-          called once.  No per-sample loop, no re-stacking overhead.
+          ``transform(return_tensor='pt')``.  All samples are already
+          stacked; tensors are moved to device and the model is called once.
+          No per-sample loop, no re-stacking overhead.
 
         * **List[Optional[Dict]]** (legacy path) — list of per-sample feature
           dicts.  ``None`` entries produce NaN rows in the output.  Samples
