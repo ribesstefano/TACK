@@ -24,23 +24,23 @@ class CellEmbedding(EmbeddingMixin):
     def __init__(
         self,
         embeddings_type: Literal["one_hot", "ordinal", "transformer", "sentence_transformer"] = "sentence_transformer",
-        not_found_description: str = "Unknown cell line.",  # TODO: What about: f"Cell line {cell_line} not found in the embeddings."
-        
+        not_found_description: str = "Unknown cell line.",
+
         # One-hot encoding configurations
         onehot_enc_kwargs: Optional[dict] = None,
         ordinal_enc_kwargs: Optional[dict] = None,
-        
+
         # Transformer configurations
         pretrained_model: str = "sentence-transformers/all-mpnet-base-v1",
         batch_size: int = 64,
         device: Union[int, str] = "cpu",
         pooling: Literal["cls", "mean", "sum", "max", "mean_sqrt_len"] = "sum",
         return_tensors: Literal["pt", "np"] = "np",
-        
+
         # Cell line processing configurations
         get_cellosaurus_descriptions: bool = True,
         min_similarity_score: float = 90,
-        
+
         # EmbeddingMixin parameters
         embeddings: Optional[Union[Dict[str, np.ndarray], np.ndarray]] = None,
         model: Optional[Union[AutoModel, str]] = None,
@@ -51,28 +51,30 @@ class CellEmbedding(EmbeddingMixin):
         verbose: int = 0,
     ):
         """ Initialize the CellEmbedding class.
-        
+
         Args:
-            embeddings_type: Type of embeddings to compute consistently for this instance
-            onehot_enc_kwargs: Parameters for OneHotEncoder (only used if embeddings_type="one_hot")
-            pretrained_model: Name of the pre-trained model to use
-            batch_size: Batch size for encoding
-            device: Device to run the model on ("cpu" or GPU index)
-            pooling: Pooling method for transformer embeddings
-            return_tensors: Return type of the embeddings ("pt" for PyTorch tensors, "np" for NumPy arrays)
-            get_cellosaurus_descriptions: Whether to get descriptions from Cellosaurus and encode those
-            min_similarity_score: Minimum similarity score for fuzzy matching
-            embeddings: Precomputed embeddings
-            model: Pre-trained transformer model
-            tokenizer: Tokenizer for the transformer model
-            load_from_cache: Whether to load embeddings from cache
-            filename: Path to the file containing embeddings
-            cache_dir: Directory to store cached embeddings
+            embeddings_type: Type of embeddings to compute consistently for this instance.
+            not_found_description: Fallback text/embedding used for unrecognized cell lines.
+            onehot_enc_kwargs: Parameters for OneHotEncoder (only used if embeddings_type="one_hot").
+            ordinal_enc_kwargs: Parameters for OrdinalEncoder (only used if embeddings_type="ordinal").
+            pretrained_model: Name of the pre-trained model to use.
+            batch_size: Batch size for encoding.
+            device: Device to run the model on ("cpu" or GPU index).
+            pooling: Pooling method for transformer embeddings.
+            return_tensors: Return type of the embeddings ("pt" for PyTorch tensors, "np" for NumPy arrays).
+            get_cellosaurus_descriptions: Whether to encode Cellosaurus descriptions instead of raw cell line IDs.
+            min_similarity_score: Minimum similarity score for fuzzy matching (0–100).
+            embeddings: Precomputed embeddings.
+            model: Pre-trained transformer model.
+            tokenizer: Tokenizer for the transformer model.
+            load_from_cache: Whether to load embeddings from cache.
+            filename: Path to the file containing embeddings.
+            cache_dir: Directory to store cached embeddings.
+            verbose: Logging verbosity (0=ERROR, 1=WARNING, 2=DEBUG).
         """
-        # Set default filename based on embeddings_type if not provided
         if filename is None:
             filename = f"cell_embeddings_{embeddings_type}.npz"
-        
+
         super().__init__(
             embeddings=embeddings,
             model=model,
@@ -82,7 +84,6 @@ class CellEmbedding(EmbeddingMixin):
             cache_dir=cache_dir,
         )
 
-        # Store embedding configuration
         self.embeddings_type = embeddings_type
         self.not_found_description = not_found_description
         self.pretrained_model = pretrained_model
@@ -92,8 +93,7 @@ class CellEmbedding(EmbeddingMixin):
         self.return_tensors = return_tensors
         self.get_cellosaurus_descriptions = get_cellosaurus_descriptions
         self.min_similarity_score = min_similarity_score
-        
-        # Setup logging
+
         self.verbose = verbose
         self.logger = logging.getLogger(__name__)
         if verbose == 0:
@@ -103,12 +103,10 @@ class CellEmbedding(EmbeddingMixin):
         elif verbose == 2:
             self.logger.setLevel(logging.DEBUG)
 
-        # Initialize Cellosaurus data (existing code)
         self.logger.debug("Loading Cellosaurus data...")
         cellosaurus_text = self._get_cellosaurus_text(cache_dir=cache_dir)
         self.logger.debug("Parsing Cellosaurus data...")
-        
-        # Load JSON files if they exist to avoid reprocessing
+
         filepath_data = Path(cache_dir or get_cache_dir()) / "cell2data.json"
         filepath_descr = Path(cache_dir or get_cache_dir()) / "cell2description.json"
         filepath_cell_id = Path(cache_dir or get_cache_dir()) / "cell2cell_id.json"
@@ -124,7 +122,7 @@ class CellEmbedding(EmbeddingMixin):
             cell_lines = self._parse_cellosaurus_text(cellosaurus_text)
             self.cell2description = {}
             self.cell2data = {}
-            self.cell2cell_id = {} # Used for PROTAC-DB data curation
+            self.cell2cell_id = {}
             self.logger.debug(f"Processing {len(cell_lines)} cell lines from Cellosaurus...")
             for cell_line in cell_lines:
                 cell_data, cell_descr = self.clean_cell_line_cellosaurus_entry(cell_line)
@@ -133,22 +131,20 @@ class CellEmbedding(EmbeddingMixin):
                 self.cell2description[cell_line['AC']] = cell_descr
                 self.cell2cell_id[cell_line['ID']] = cell_line['AC']
 
-            # Save processed Cellosaurus data to a JSON file for reference
             with open(filepath_data, 'w') as f:
                 json.dump(self.cell2data, f, indent=4)
             self.logger.debug(f"Processed Cellosaurus data saved to {filepath_data}")
-            
+
             with open(filepath_descr, 'w') as f:
                 json.dump(self.cell2description, f, indent=4)
             self.logger.debug(f"Cell line descriptions saved to {filepath_descr}")
-            
+
             with open(filepath_cell_id, 'w') as f:
                 json.dump(self.cell2cell_id, f, indent=4)
             self.logger.debug(f"Cell line ID mappings saved to {filepath_cell_id}")
 
         self.cell_id2data = {v: self.cell2data[k] for k, v in self.cell2cell_id.items()}
 
-        # Map all synonyms to the main ID
         self.synonym2cell_line = {}
         for cell_id, cell_data in self.cell2data.items():
             if 'SY' in cell_data:
@@ -157,12 +153,9 @@ class CellEmbedding(EmbeddingMixin):
                     if synonym and synonym not in self.synonym2cell_line:
                         self.synonym2cell_line[synonym] = cell_id
 
-        # Initialize type-specific components
         self.sklearn_encoder = None
         if embeddings_type == "one_hot":
-            encoder_args = {
-                "handle_unknown": "ignore",
-            }
+            encoder_args = {"handle_unknown": "ignore"}
             encoder_args.update({} if onehot_enc_kwargs is None else onehot_enc_kwargs)
             self.sklearn_encoder = OneHotEncoder(**encoder_args)
         elif embeddings_type == "ordinal":
@@ -173,12 +166,73 @@ class CellEmbedding(EmbeddingMixin):
             }
             encoder_args.update({} if ordinal_enc_kwargs is None else ordinal_enc_kwargs)
             self.sklearn_encoder = OrdinalEncoder(**encoder_args)
-            
-        # Fit the sklearn encoder if applicable
+
         if self.sklearn_encoder is not None:
             X = self.get_cell_lines() + list(self.synonym2cell_line.keys())
             self.sklearn_encoder.fit(np.array(X).reshape(-1, 1))
-            
+
+    # --- EmbeddingMixin hooks ----------------------------------------------------
+
+    def _normalize_items(self, items: List[str]) -> List[str]:
+        """ Ensure not_found_description is encoded, then normalize None/"" entries. """
+        self._ensure_not_found_encoded()
+        return [s if s not in [None, ""] else self.not_found_description for s in items]
+
+    def _resolve_keys(self, keys: List[str]) -> Dict[str, str]:
+        """ Apply fuzzy matching to map raw cell line names to canonical Cellosaurus IDs. """
+        if self.min_similarity_score <= 0:
+            return {k: k for k in keys}
+        return {s: self.get_fuzzy_cell_line(s, self.min_similarity_score)[0] for s in keys}
+
+    def _transform_batch(self, keys: List[str]) -> Dict[str, np.ndarray]:
+        """ Encode a batch of canonical cell line IDs into embeddings. """
+        if self.embeddings_type in ["one_hot", "ordinal"]:
+            # sklearn encoder is fitted on cell line IDs, not descriptions
+            return self._encode_sklearn(keys)
+
+        # Transformer-based methods encode Cellosaurus descriptions
+        if self.get_cellosaurus_descriptions:
+            descriptions = [self.get_cell_description(s) for s in keys]
+            descriptions = [s if s not in [None, ""] else self.not_found_description for s in descriptions]
+        else:
+            descriptions = keys
+
+        if self.embeddings_type == "transformer":
+            return self._encode_with_transformer(descriptions, keys)
+        elif self.embeddings_type == "sentence_transformer":
+            return self._encode_with_sentence_transformer(descriptions, keys)
+        else:
+            raise ValueError(f"Unsupported embeddings_type: {self.embeddings_type}")
+
+    def transform(
+        self,
+        cell_lines: Union[str, List[str], None],
+        skip_existing: bool = True,
+        update_cache: bool = False,
+    ) -> Union[Dict[str, np.ndarray], np.ndarray]:
+        """ Encode cell lines into embeddings using the configured method.
+
+        Args:
+            cell_lines: Cell line string, list of cell line strings, or None.
+                None returns the not_found_description embedding directly.
+            skip_existing: Whether to skip already encoded cell lines.
+            update_cache: Whether to update the cache with new embeddings.
+
+        Returns:
+            Dict[str, Union[np.array, torch.Tensor]] or a single embedding array.
+        """
+        if cell_lines is None:
+            self._ensure_not_found_encoded()
+            return self.embeddings[self.not_found_description]
+        return super().transform(cell_lines, skip_existing=skip_existing, update_cache=update_cache)
+
+    def _ensure_not_found_encoded(self):
+        """ Encode and cache the not_found_description embedding if not already present. """
+        if self.not_found_description not in self.embeddings:
+            nf_embs = self._transform_batch([self.not_found_description])
+            self.embeddings.update(nf_embs)
+
+    # --- Cell line utilities -----------------------------------------------------
 
     def get_cell_lines(self) -> List[str]:
         """ Get all cell lines available in the embeddings. """
@@ -186,10 +240,10 @@ class CellEmbedding(EmbeddingMixin):
 
     def get_cell_line_data(self, cell_line: str) -> Dict[str, Union[str, List[str]]]:
         """ Get data for a specific cell line.
-        
+
         Args:
-            cell_line (str): Cell line ID or name.
-        
+            cell_line: Cell line ID or name.
+
         Returns:
             Dict[str, Union[str, List[str]]]: Data for the cell line.
         """
@@ -202,10 +256,10 @@ class CellEmbedding(EmbeddingMixin):
 
     def get_cell_line_description(self, cell_line: str) -> str:
         """ Get the description for a specific cell line.
-        
+
         Args:
-            cell_line (str): Cell line ID or name.
-        
+            cell_line: Cell line ID or name.
+
         Returns:
             str: Description of the cell line.
         """
@@ -215,6 +269,19 @@ class CellEmbedding(EmbeddingMixin):
             return self.cell2description[self.synonym2cell_line[cell_line]]
         else:
             raise ValueError(f"Cell line {cell_line} not found in the embeddings.")
+
+    def __getitem__(self, key: str) -> np.ndarray:
+        """ Get the embedding for a given cell line, with fuzzy matching fallback.
+
+        Args:
+            key: Cell line ID or name.
+
+        Returns:
+            np.ndarray: Embedding for the cell line.
+        """
+        if key in self.embeddings:
+            return self.embeddings[key]
+        return self.embeddings[self.get_fuzzy_cell_line(key)[0]]
 
     @staticmethod
     def _get_cellosaurus_text(cache_dir: Union[str, Path] = None) -> str:
@@ -232,7 +299,7 @@ class CellEmbedding(EmbeddingMixin):
         if response.status_code == 200:
             with open(filepath, 'w') as file:
                 file.write(response.text)
-                return response.text
+            return response.text
         else:
             raise ValueError(f"Failed to download Cellosaurus text file. Status code: {response.status_code}")
 
@@ -243,20 +310,12 @@ class CellEmbedding(EmbeddingMixin):
         """ Parse a Cellosaurus text file and return a list of cell line entries.
 
         Args:
-            cellosaurus_text (str): Content of the Cellosaurus text file.
+            cellosaurus_text: Content of the Cellosaurus text file.
 
         Returns:
-            List[Dict[str, Union[str, List[str]]]]: List of dictionaries containing cell line information. Keys include:
-                - 'ID': Cell line ID
-                - 'AC': Accession number
-                - 'SY': Cell line name
-                - 'DR': List of database references
-                - 'RX': List of references
-                - 'CC': List of comments
-                - 'OX': Organism
-                - 'HI': Hierarchy information
-                - 'CA': Cell line characteristics
-                - 'DT': Date of last update
+            List[Dict[str, Union[str, List[str]]]]: List of dictionaries containing cell line
+                information. Keys include 'ID', 'AC', 'SY', 'DR', 'RX', 'CC', 'OX', 'HI',
+                'CA', 'DT'.
         """
         lines = cellosaurus_text.splitlines()
 
@@ -286,9 +345,7 @@ class CellEmbedding(EmbeddingMixin):
                 cell_line_entry['CA'] = line[5:].strip()
             elif line.startswith("DT   "):
                 cell_line_entry['DT'] = line[5:].strip()
-            # Add similar elif blocks for other line codes as needed
 
-        # Add the last entry
         if cell_line_entry:
             cell_lines.append(cell_line_entry)
 
@@ -298,16 +355,15 @@ class CellEmbedding(EmbeddingMixin):
     def clean_cell_line_cellosaurus_entry(cell_line, cc_headers_to_ignore=None, unique_columns_ranking=None):
         """
         Clean and process a single cell line entry from Cellosaurus data.
-        
+
         Args:
             cell_line (dict): Single cell line entry from parse_cellosaurus_text
             cc_headers_to_ignore (list): List of CC headers to ignore during processing
             unique_columns_ranking (list): Ordered list of columns by uniqueness ranking
-        
+
         Returns:
             tuple: (cleaned_cell_data_dict, description_string)
         """
-        
         if cc_headers_to_ignore is None:
             cc_headers_to_ignore = [
                 'Miscellaneous',
@@ -318,32 +374,27 @@ class CellEmbedding(EmbeddingMixin):
                 'Registration',
                 'Discontinued',
             ]
-        
+
         if unique_columns_ranking is None:
-            # Default ranking based on your analysis - you may want to update this
             unique_columns_ranking = [
-                'Genome ancestry', 'Karyotypic information', 'Senescence', 
+                'Genome ancestry', 'Karyotypic information', 'Senescence',
                 'Biotechnology', 'Virology', 'Caution', 'Donor information',
                 'Sequence variation', 'Characteristics', 'Transfected with',
                 'Monoclonal antibody target', 'HLA typing', 'Knockout cell',
                 'Microsatellite instability', 'HI', 'Breed/subspecies',
-                'Derived from site', 'Population', 'Group', 
+                'Derived from site', 'Population', 'Group',
                 'Monoclonal antibody isotype', 'Cell type', 'Transformant',
                 'Selected for resistance to', 'CA'
             ]
-        
-        # Step 1: Process CC comments into separate columns
+
         cell_data = cell_line.copy()
         for comment in cell_data.get('CC', []):
             cc_header = comment.split(':')[0].strip()
             if cc_header not in cc_headers_to_ignore:
                 cc_text = comment.split(':')[1].strip()
                 cell_data[cc_header] = cell_data.get(cc_header, '') + cc_text + ' '
-        
-        # Step 2: Remove unwanted fields
+
         fields_to_ignore = ['CC', 'DT', 'SY']
-        
-        # Step 3: Remove features to ignore
         features_to_ignore = [
             'Problematic cell line',
             'Omics',
@@ -351,27 +402,20 @@ class CellEmbedding(EmbeddingMixin):
             'OX',
             'Doubling time',
         ]
-        
-        # Step 4: Generate description from ranked columns
+
         cell_description = ""
         for col in unique_columns_ranking:
             if col in fields_to_ignore or col in features_to_ignore:
                 continue
             if col in cell_data and cell_data.get(col) is not None:
-                cell_description += f"{cell_data[col].strip()}"
-                cell_description += '\n'
-        
-        # Step 5: Clean description text
-        # Remove PubMed references
+                cell_description += f"{cell_data[col].strip()}\n"
+
         cell_description = re.sub(r'\(PubMed=.*?\)', '', cell_description)
-        # Remove UBERON references
         cell_description = re.sub(r'UBERON=.*?\.', '', cell_description)
-        # Clean up whitespace
         cell_description = cell_description.strip()
         cell_description = cell_description.replace(' .', '.')
         cell_description = cell_description.replace('  ', ' ')
 
-        # Step 6: Clean cell synonyms
         if 'SY' in cell_data:
             cell_data['SY'] = cell_data['SY'].split(';')
             cell_data['SY'] = [syn.strip() for syn in cell_data['SY'] if syn.strip()]
@@ -385,43 +429,38 @@ class CellEmbedding(EmbeddingMixin):
             get_list: bool = False,
     ) -> Tuple[str, float]:
         """ Get the closest matching cell line ID among the available cell lines.
-        
+
         Args:
-            cell_line (str): Cell line ID or name.
-            min_similarity_score (float): Minimum similarity score for fuzzy matching. Must be between 0 and 100.
-            get_list (bool): If True, return all matches above the minimum similarity score.
+            cell_line: Cell line ID or name.
+            min_similarity_score: Minimum similarity score for fuzzy matching (0–100).
+            get_list: If True, return all matches above the minimum similarity score.
 
         Returns:
-            str: Closest matching cell line ID.
+            Tuple of (matched cell line ID, score).
         """
         all_cell_lines = list(self.cell2description.keys())
         all_synonyms = list(self.synonym2cell_line.keys())
-        
+
         if cell_line is None or cell_line == "":
             return self.not_found_description, 0
-        
+
         if cell_line in self.cell2description:
             return ([cell_line], 100) if get_list else (cell_line, 100)
         elif cell_line in self.synonym2cell_line:
             cell_id = self.synonym2cell_line[cell_line]
             return ([cell_id], 100) if get_list else (cell_id, 100)
-        
+
         if not get_list:
-            closest_match, score = process.extractOne(
-                cell_line,
-                all_cell_lines + all_synonyms,
-            )
+            closest_match, score = process.extractOne(cell_line, all_cell_lines + all_synonyms)
             if score > min_similarity_score:
                 if closest_match in self.cell2description:
-                    # self.logger.debug(f"Using exact match '{closest_match}' for cell line '{cell_line}' with score {score}.")
                     return closest_match, score
                 else:
-                    # If the closest match is a synonym, return the corresponding cell line ID
                     closest_synonym = self.synonym2cell_line.get(closest_match, closest_match)
                     self.logger.debug(f"Using synonym '{closest_match}' for cell line '{cell_line}' with score {score}.")
                     return closest_synonym, score
             else:
-                matches = get_close_matches(cell_line, all_cell_lines + all_synonyms, n=1, cutoff=min_similarity_score/100)
+                matches = get_close_matches(cell_line, all_cell_lines + all_synonyms, n=1, cutoff=min_similarity_score / 100)
                 if matches:
                     closest_match = matches[0]
                     if closest_match in self.cell2description:
@@ -431,15 +470,11 @@ class CellEmbedding(EmbeddingMixin):
                         closest_synonym = self.synonym2cell_line.get(closest_match, closest_match)
                         self.logger.debug(f"Using close synonym '{closest_match}' for cell line '{cell_line}' with score {score}.")
                         return closest_synonym, score
-                
+
                 self.logger.debug(f"No suitable match found for cell line '{cell_line}' with minimum score {min_similarity_score}.")
                 return self.not_found_description, 0
         else:
-            matches = process.extract(
-                cell_line,
-                all_cell_lines + all_synonyms,
-                limit=None,
-            )
+            matches = process.extract(cell_line, all_cell_lines + all_synonyms, limit=None)
             filtered_matches = [(m[0], m[1]) for m in matches if m[1] >= min_similarity_score]
             if filtered_matches:
                 return filtered_matches, 0
@@ -455,19 +490,20 @@ class CellEmbedding(EmbeddingMixin):
             passthrough_if_not_found: bool = True,
     ) -> str:
         """ Get the description of a cell line.
-        
+
         Args:
-            cell_line (str): Cell line ID or name.
-            use_fuzzy_matching (bool): Whether to use fuzzy matching if exact match not found
-            min_similarity_score (float): Minimum similarity score for fuzzy matching. Must be between 0 and 100.
-            passthrough_if_not_found (bool): If True, return the input cell_line if not found; otherwise raise an error.
-        
+            cell_line: Cell line ID or name.
+            use_fuzzy_matching: Whether to use fuzzy matching if exact match not found.
+            min_similarity_score: Minimum similarity score for fuzzy matching (0–100).
+            passthrough_if_not_found: If True, return the input cell_line if not found;
+                otherwise raise an error.
+
         Returns:
             str: Description of the cell line.
         """
         if not (0 <= min_similarity_score <= 100):
             raise ValueError("min_similarity_score must be between 0 and 100.")
-        
+
         if cell_line is None and passthrough_if_not_found:
             return self.not_found_description
         elif cell_line in self.cell2description:
@@ -480,141 +516,29 @@ class CellEmbedding(EmbeddingMixin):
                 cell_line=cell_line,
                 min_similarity_score=min_similarity_score,
             )
-            descr = self.cell2description.get(closest_synonym, self.not_found_description)
-            # self.logger.debug(f"Closest match for {cell_line}: {closest_synonym} with score {score}.")
-            return descr
+            return self.cell2description.get(closest_synonym, self.not_found_description)
         elif passthrough_if_not_found:
             return cell_line
         else:
             raise ValueError(f"Cell line \"{cell_line}\" not found in the embeddings.")
 
-    def __getitem__(self, key: str) -> np.ndarray:
-        """ Get the embedding for a given cell line.
-        
-        Args:
-            key (str): Cell line ID or name.
-        
-        Returns:
-            np.ndarray: Embedding for the cell line.
-        """
-        if key in self.embeddings:
-            return self.embeddings[key]
-        else:
-            return self.embeddings[self.get_fuzzy_cell_line(key)[0]]
+    # --- Internal encoding methods -----------------------------------------------
 
-    def transform(
-        self,
-        cell_lines: Union[str, List[str]],
-        skip_existing: bool = True,
-        update_cache: bool = False,
-    ) -> Dict[str, Union[np.array, torch.Tensor]]:
-        """ Encode cell lines into embeddings using the configured method.
-        
-        Args:
-            cell_lines: Cell line string or list of cell line strings
-            skip_existing: Whether to skip already encoded cell lines
-            update_cache: Whether to update the cache with new embeddings
-    
-        Returns:
-            Dict[str, Union[np.array, torch.Tensor]]: Encoded embeddings
-        """
-        # Pre-encode the not_found_description embedding if not already present
-        if self.not_found_description not in self.embeddings:
-            self.logger.debug(f"Pre-encoding not_found_description embedding for: '{self.not_found_description}'")
-            not_found_embedding = self._encode_cell_lines([self.not_found_description])
-            self.embeddings[self.not_found_description] = not_found_embedding[self.not_found_description]
-
-        # Handle None input by returning the not_found_description embedding
-        if cell_lines is None:
-            return self.embeddings[self.not_found_description]
-        
-        if isinstance(cell_lines, str):
-            cells_list = [cell_lines]
-        elif isinstance(cell_lines, list):
-            cells_list = cell_lines
-        else:
-            raise ValueError(f"Input cell_lines must be a string or a list of strings. Got {type(cell_lines)} instead: {cell_lines}")
-
-        # Assign not_found_description to any empty or None cell lines
-        cells_list = [s if s not in [None, ""] else self.not_found_description for s in cells_list]
-    
-        # Set aside the cell lines that are already encoded
-        if skip_existing:
-            cells_to_encode = [s for s in cells_list if s not in self.embeddings]
-            cells_encoded = {s: self.embeddings[s] for s in cells_list if s in self.embeddings}
-        else:
-            cells_to_encode = cells_list
-
-        # Modify the cell lines to match the existing embeddings using fuzzy matching
-        if self.min_similarity_score > 0:
-            cells2fuzzy = {s: self.get_fuzzy_cell_line(s, self.min_similarity_score)[0] for s in cells_to_encode}
-            cells_to_encode = list(cells2fuzzy.values())
-    
-        if not cells_to_encode:
-            encoded_embeddings = {}
-        else:
-            encoded_embeddings = self._encode_cell_lines(cells_to_encode)
-    
-        if skip_existing:
-            if self.min_similarity_score > 0:
-                # Map back to original cell line names
-                encoded_embeddings = {orig_s: encoded_embeddings[fuzzy_s] for orig_s, fuzzy_s in cells2fuzzy.items()}
-            # Combine with already encoded embeddings
-            encoded_embeddings = {**cells_encoded, **encoded_embeddings}
-    
-        # Update instance encoded_embeddings
-        if len(encoded_embeddings) > 0:
-            self.embeddings.update(encoded_embeddings)
-    
-        if update_cache:
-            self.save()
-
-        if isinstance(cell_lines, str):
-            processed_cell = cells_list[0]
-            not_found_embedding = self.embeddings.get(self.not_found_description)
-            return self.embeddings.get(processed_cell, not_found_embedding)
-
-        return encoded_embeddings
-
-    def _encode_cell_lines(self, cells_to_encode: List[str]) -> Dict[str, Union[np.ndarray, torch.Tensor]]:
-        """ Internal method to encode cell lines based on the configured embeddings_type. """
-        # Get Cellosaurus descriptions if configured to do so
-        if self.get_cellosaurus_descriptions:
-            original_cells = cells_to_encode
-            cells_to_encode = [self.get_cell_description(s) for s in cells_to_encode]
-            self.logger.debug(f"Encoded {len(cells_to_encode)} cell lines with descriptions.")
-        else:
-            original_cells = cells_to_encode
-        
-        # Assign not_found_description to any empty or None descriptions
-        cells_to_encode = [s if s not in [None, ""] else self.not_found_description for s in cells_to_encode]
-    
-        if self.embeddings_type in ["one_hot", "ordinal"]:
-            return self._encode_sklearn(cells_to_encode, original_cells)
-        elif self.embeddings_type == "transformer":
-            return self._encode_with_transformer(cells_to_encode, original_cells)
-        elif self.embeddings_type == "sentence_transformer":
-            return self._encode_with_sentence_transformer(cells_to_encode, original_cells)
-        else:
-            raise ValueError(f"Unsupported embeddings_type: {self.embeddings_type}")
-
-    def _encode_sklearn(self, cells_to_encode: List[str], original_cells: List[str]) -> Dict[str, np.ndarray]:
-        """ Encode cell lines using one-hot encoding. """
-        embeddings = np.array(cells_to_encode).reshape(-1, 1)
-        embeddings = self.sklearn_encoder.transform(embeddings).toarray()
-        if self.embeddings_type == "ordinal":
-            # NOTE: The unknown value is encoded as -1, so after adding 1 it
-            # will become 0, perfect for embedding layers.
+    def _encode_sklearn(self, keys: List[str]) -> Dict[str, np.ndarray]:
+        """ Encode cell line IDs using the fitted sklearn encoder. """
+        X = np.array(keys).reshape(-1, 1)
+        if self.embeddings_type == "one_hot":
+            embeddings = self.sklearn_encoder.transform(X).toarray()
+        else:  # ordinal
+            embeddings = self.sklearn_encoder.transform(X).astype(np.float32)
+            # Shift by 1: OrdinalEncoder uses -1 for unknowns, making 0 a valid embedding index
             embeddings = embeddings + 1
-        self.logger.debug(f"One-hot encoded embeddings shape: {embeddings.shape}")
-        
-        # Map to original cell names
-        return {s: e for s, e in zip(original_cells, embeddings)}
+        return {k: e for k, e in zip(keys, embeddings)}
 
-    def _encode_with_transformer(self, cells_to_encode: List[str], original_cells: List[str]) -> Dict[str, Union[np.ndarray, torch.Tensor]]:
-        """ Encode cell lines using transformer model. """
+    def _encode_with_transformer(self, descriptions: List[str], original_keys: List[str]) -> Dict[str, np.ndarray]:
+        """ Encode descriptions using transformer model, keyed by original cell line IDs. """
         embeddings = self.encode_with_transformer(
-            strings=cells_to_encode,
+            strings=descriptions,
             tokenizer=self.tokenizer,
             model=self.model,
             pretrained_model=self.pretrained_model,
@@ -624,27 +548,20 @@ class CellEmbedding(EmbeddingMixin):
             return_tensors=self.return_tensors,
             return_dict=True,
         )
-        
-        # Map to original cell names
-        return {s: e for s, e in zip(original_cells, embeddings.values())}
+        return {k: e for k, e in zip(original_keys, embeddings.values())}
 
-    def _encode_with_sentence_transformer(self, cells_to_encode: List[str], original_cells: List[str]) -> Dict[str, Union[np.ndarray, torch.Tensor]]:
-        """ Encode cell lines using sentence transformer model. """
-        # Use self.model if available, otherwise load the model
-        if self.model is None:
-            model = SentenceTransformer(self.pretrained_model)
-        else:
-            model = self.model
+    def _encode_with_sentence_transformer(self, descriptions: List[str], original_keys: List[str]) -> Dict[str, np.ndarray]:
+        """ Encode descriptions using sentence transformer model, keyed by original cell line IDs. """
+        model = self.model if self.model is not None else SentenceTransformer(self.pretrained_model)
 
         embeddings = model.encode(
-            cells_to_encode,
+            descriptions,
             batch_size=self.batch_size,
             device=self.device,
             output_value="token_embeddings",
         )
         self.logger.debug(f"Embeddings shapes: {', '.join([str(e.shape) for e in embeddings])}")
 
-        # Pool the token embeddings
         if self.pooling == "sum":
             embeddings = [e.sum(axis=0) for e in embeddings]
         elif self.pooling == "mean":
@@ -661,5 +578,4 @@ class CellEmbedding(EmbeddingMixin):
 
         self.logger.debug(f"Embeddings shapes after pooling: {', '.join([str(e.shape) for e in embeddings])}")
 
-        # Map to original cell names
-        return {s: e for s, e in zip(original_cells, embeddings)}
+        return {k: e for k, e in zip(original_keys, embeddings)}

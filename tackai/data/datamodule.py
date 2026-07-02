@@ -640,7 +640,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         if (stage == "test" or stage is None) and "test" in self.dataset:
             self.test_dataset = self.featurize_dataset(self.dataset["test"], "test", self.num_proc)
 
-    def _encode_batch(
+    def _transform_batch(
         self,
         examples: List[Dict],
         return_tensor: Literal['np', 'pt', 'xgb'] = 'np',
@@ -837,8 +837,8 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         # ------------------------------------------------------------------
 
         # Fast path for Lightning models: build one batched tensor dict directly
-        # from the already-computed matrices, skipping the per-sample loop and
-        # the re-stacking that _predict_lightning_batch would otherwise do.
+        # from the already-computed matrices, skipping per-sample loop and
+        # re-stacking.
         if return_tensor == 'pt':
             batch_out: Dict[str, torch.Tensor] = {}
 
@@ -989,7 +989,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
 
         return batch_features
 
-    def _encode_molecular_batch(
+    def _transform_molecular_batch(
         self,
         smiles_list: List[str],
     ) -> List[Dict[str, np.ndarray]]:
@@ -1237,10 +1237,10 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 if batch_size else [examples]
             )
             if return_tensor == 'pt':
-                # _encode_batch has a native 'pt' fast path that avoids
+                # _transform_batch has a native 'pt' fast path that avoids
                 # per-sample loops and builds the batched tensor dict directly
                 batches = [
-                    self._encode_batch(chunk, return_tensor='pt')
+                    self._transform_batch(chunk, return_tensor='pt')
                     for chunk in chunks
                 ]
                 if len(batches) == 1:
@@ -1250,7 +1250,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
 
             raw: List[Dict[str, np.ndarray]] = []
             for chunk in chunks:
-                raw.extend(self._encode_batch(chunk, return_tensor='np'))
+                raw.extend(self._transform_batch(chunk, return_tensor='np'))
             return self._finalize_output(raw, return_tensor)
 
         # ------------------------------------------------------------------
@@ -1263,7 +1263,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         )
         mol_raw: List[Dict[str, np.ndarray]] = []
         for chunk in chunks_smi:
-            mol_raw.extend(self._encode_molecular_batch(chunk))
+            mol_raw.extend(self._transform_molecular_batch(chunk))
         merged = [{**mol_feats, **context} for mol_feats in mol_raw]
         return self._finalize_output(merged, return_tensor)
 
@@ -1311,7 +1311,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         tasks_list: List[Any] = []
 
         all_samples = [dataset[i] for i in range(len(dataset))]
-        all_features = self._encode_batch(all_samples, return_tensor='np')
+        all_features = self._transform_batch(all_samples, return_tensor='np')
         for sample, features in zip(all_samples, all_features):
             features.update(self._featurize_and_normalize_labels(sample))
             features_list.append(features)
@@ -1793,7 +1793,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         - `context_numeric_pipeline`: treatment time only (SMILES-independent).
         - `mol_numeric_pipeline`: RDKit descriptors only (SMILES-dependent).
         - `numeric_pipeline`: both combined; kept for the legacy single-pass
-          featurization path (`_run_numeric_pipeline`, `_encode_batch`).
+          featurization path (`_run_numeric_pipeline`, `_transform_batch`).
         """
         default_treatment_time = 24  # hours
 

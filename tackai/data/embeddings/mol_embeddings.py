@@ -13,9 +13,10 @@ from transformers import AutoTokenizer, AutoModel
 from tackai.config import config
 from tackai.data.embeddings.utils import EmbeddingMixin
 
+
 class MolEmbedding(EmbeddingMixin):
     """ Class for handling molecular embeddings. """
-    
+
     def __init__(
         self,
         embeddings_type: Literal["fingerprint", "rdkit_descriptors", "transformer"] = "fingerprint",
@@ -39,32 +40,30 @@ class MolEmbedding(EmbeddingMixin):
         cache_dir: Optional[Union[Path, str]] = None,
     ):
         """ Initialize the MolEmbedding class.
-        
+
         Args:
-            embeddings_type: Type of embeddings to compute consistently for this instance
-            radius: Radius for Morgan fingerprints (only used if embeddings_type="fingerprint")
-            fp_size: Size of the Morgan fingerprints (only used if embeddings_type="fingerprint")
-            morgan_fpgen: Predefined Morgan fingerprint generator (only used if embeddings_type="fingerprint")
-            pretrained_model: Name of the pre-trained model to use if tokenizer or model is None
-            batch_size: Batch size for transformer encoding
-            device: Device to run the model on ("cpu" or "cuda")
-            pooling: Pooling method for transformer embeddings
-            return_tensors: Format of the returned tensors
-            embeddings: Precomputed embeddings or fingerprints
-            model: Pre-trained transformer model for embeddings
-            tokenizer: Tokenizer for the transformer model
-            load_from_cache: Whether to load embeddings from cache
-            filename: Path to the file containing embeddings
-            cache_dir: Directory to store cached embeddings
+            embeddings_type: Type of embeddings to compute consistently for this instance.
+            radius: Radius for Morgan fingerprints (only used if embeddings_type="fingerprint").
+            fp_size: Size of the Morgan fingerprints (only used if embeddings_type="fingerprint").
+            use_relevant_descriptors: If True, restrict to the curated RELEVANT_RDKIT_DESCRIPTORS list.
+            selected_descriptors: Explicit list of RDKit descriptor names to compute.
+            pretrained_model: Name of the pre-trained model to use if tokenizer or model is None.
+            batch_size: Batch size for transformer encoding.
+            device: Device to run the model on ("cpu" or "cuda").
+            pooling: Pooling method for transformer embeddings.
+            return_tensors: Format of the returned tensors.
+            embeddings: Precomputed embeddings or fingerprints.
+            model: Pre-trained transformer model for embeddings.
+            tokenizer: Tokenizer for the transformer model.
+            load_from_cache: Whether to load embeddings from cache.
+            filename: Path to the file containing embeddings.
+            cache_dir: Directory to store cached embeddings.
         """
-        # Set default filename based on embeddings_type if not provided
         if filename is None:
             filename = f"mol_embeddings_{embeddings_type}.npz"
-        else:
-            # Check that the filename ends with ".npz"
-            if filename.split(".")[-1] != "npz":
-                raise ValueError(f"Provided embedding filename must end with '.npz'. Provided: '{filename}'")
-        
+        elif Path(filename).suffix != ".npz":
+            raise ValueError(f"Provided embedding filename must end with '.npz'. Provided: '{filename}'")
+
         super().__init__(
             embeddings=embeddings,
             model=model,
@@ -73,22 +72,19 @@ class MolEmbedding(EmbeddingMixin):
             filename=filename,
             cache_dir=cache_dir,
         )
-        
-        # Store embedding configuration
+
         self.embeddings_type = embeddings_type
         self.pretrained_model = pretrained_model
         self.batch_size = batch_size
         self.device = device
         self.pooling = pooling
         self.return_tensors = return_tensors
-        
-        # Initialize fingerprint-specific components
+
         self.radius = radius
         self.fp_size = fp_size
         self.use_relevant_descriptors = use_relevant_descriptors
         self.selected_descriptors = selected_descriptors
-        
-        # Cache the Morgan fingerprint generator to avoid recreating it on every call
+
         self._morgan_fpgen = None
         if embeddings_type == "fingerprint":
             self._morgan_fpgen = Chem.rdFingerprintGenerator.GetMorganGenerator(
@@ -96,7 +92,17 @@ class MolEmbedding(EmbeddingMixin):
                 fpSize=fp_size,
                 includeChirality=True,
             )
-    
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # RDKit FingerprintGenerator is a Boost.Python object and cannot be pickled.
+        # It is recreated lazily in _encode_as_fingerprints when needed.
+        state['_morgan_fpgen'] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
     def get_descriptor_names(self) -> List[str]:
         """ Get the list of RDKit descriptor names used in this embedding. """
         if self.embeddings_type != "rdkit_descriptors":
@@ -108,107 +114,51 @@ class MolEmbedding(EmbeddingMixin):
         else:
             return [name for name, _ in Descriptors._descList]
 
-    def transform(
-        self,
-        smiles: Union[str, List[str]],
-        skip_existing: bool = True,
-        update_cache: bool = False,
-    ) -> Dict[str, Union[np.array, torch.Tensor]]:
-        """ Encode SMILES strings into fingerprints or embeddings using the configured method.
-        
-        Args:
-            smiles: SMILES string or list of SMILES strings
-            skip_existing: Whether to skip existing embeddings in the cache
-            update_cache: Whether to update the cache with the new embeddings
-            
-        Returns:
-            Dict[str, Union[np.array, torch.Tensor]]: Encoded embeddings
-        """
-        if isinstance(smiles, str):
-            smiles_list = [smiles]
-        elif isinstance(smiles, list):
-            smiles_list = smiles
-        else:
-            raise ValueError("Input smiles must be a string or a list of strings.")
-
-        if skip_existing:
-            smiles_to_encode = [s for s in smiles_list if s not in self.embeddings]
-            smiles_encoded = {s: self.embeddings[s] for s in smiles_list if s in self.embeddings}
-        else:
-            smiles_to_encode = smiles_list
-
-        if not smiles_to_encode:
-            embeddings = {}
-        else:
-            embeddings = self._encode_smiles(smiles_to_encode)
-
-        if skip_existing:
-            all_embeddings = {**smiles_encoded, **embeddings}
-            embeddings = {s: all_embeddings[s] for s in smiles_list}
-
-        # Update instance embeddings
-        if len(embeddings) > 0:
-            self.embeddings.update(embeddings)
-
-        if update_cache:
-            self.save()
-
-        # Return single embedding if input was a single SMILES
-        if isinstance(smiles, str):
-            return embeddings[smiles]
-        return embeddings
-
-    def _encode_smiles(self, smiles_list: List[str]) -> Dict[str, Union[np.ndarray, torch.Tensor]]:
-        """ Internal method to encode SMILES based on the configured embeddings_type. """
+    def _transform_batch(self, smiles_list: List[str]) -> Dict[str, np.ndarray]:
+        """ Encode SMILES strings using the configured method. """
         if self.embeddings_type == "fingerprint":
-            return self._encode_smiles_as_fingerprints(smiles_list)
+            return self._encode_as_fingerprints(smiles_list)
         elif self.embeddings_type == "rdkit_descriptors":
-            return self._encode_rdkit_descriptors(smiles_list)
+            return self._encode_as_rdkit_descriptors(smiles_list)
         elif self.embeddings_type == "transformer":
             return self._encode_with_transformer(smiles_list)
         else:
-            raise ValueError(f"Unsupported embeddings_type: {self.embeddings_type}, must be one of 'fingerprint', 'rdkit_descriptors', or 'transformer'.")
+            raise ValueError(
+                f"Unsupported embeddings_type: {self.embeddings_type}, "
+                "must be one of 'fingerprint', 'rdkit_descriptors', or 'transformer'."
+            )
 
-    def _encode_smiles_as_fingerprints(self, smiles_list: List[str]) -> Dict[str, np.ndarray]:
+    def _encode_as_fingerprints(self, smiles_list: List[str]) -> Dict[str, np.ndarray]:
         """ Encode SMILES as Morgan fingerprints. """
-        morgan_fpgen = self._morgan_fpgen
-        if morgan_fpgen is None:
-            morgan_fpgen = Chem.rdFingerprintGenerator.GetMorganGenerator(
+        if self._morgan_fpgen is None:
+            self._morgan_fpgen = Chem.rdFingerprintGenerator.GetMorganGenerator(
                 radius=self.radius,
                 fpSize=self.fp_size,
                 includeChirality=True,
             )
-            self._morgan_fpgen = morgan_fpgen
         fingerprints = {}
         for smiles in smiles_list:
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
                 raise ValueError(f"Invalid SMILES string: {smiles}")
-            else:
-                fp = morgan_fpgen.GetFingerprintAsNumPy(mol).astype(np.float32)
-                fingerprints[smiles] = fp
+            fingerprints[smiles] = self._morgan_fpgen.GetFingerprintAsNumPy(mol).astype(np.float32)
         return fingerprints
-    
-    def _encode_rdkit_descriptors(self, smiles_list: List[str]) -> Dict[str, np.ndarray]:
+
+    def _encode_as_rdkit_descriptors(self, smiles_list: List[str]) -> Dict[str, np.ndarray]:
         """ Encode SMILES as RDKit molecular descriptors. """
         descriptors = {}
         for smiles in smiles_list:
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
                 raise ValueError(f"Invalid SMILES string: {smiles}")
-            else:
-                desc_dict = self.get_mol_descriptors(mol)
-
-                # Clip all descriptor values to be finite
-                for name, val in desc_dict.items():
-                    if val > 1e20 or val < -1e20 or val is None or np.isnan(val) or np.isinf(val):
-                        desc_dict[name] = -1
-                
-                desc_array = np.array(list(desc_dict.values()), dtype=np.float32).flatten()
-                descriptors[smiles] = desc_array
+            desc_dict = self.get_mol_descriptors(mol)
+            for name, val in desc_dict.items():
+                if val is None or np.isnan(val) or np.isinf(val) or val > 1e20 or val < -1e20:
+                    desc_dict[name] = -1
+            descriptors[smiles] = np.array(list(desc_dict.values()), dtype=np.float32).flatten()
         return descriptors
 
-    def _encode_with_transformer(self, smiles_list: List[str]) -> Dict[str, Union[np.ndarray, torch.Tensor]]:
+    def _encode_with_transformer(self, smiles_list: List[str]) -> Dict[str, np.ndarray]:
         """ Encode SMILES using transformer model. """
         return self.encode_with_transformer(
             strings=smiles_list,
@@ -229,16 +179,16 @@ class MolEmbedding(EmbeddingMixin):
         radius: int = config.morgan_radius,
         fp_size: int = config.fingerprint_size,
     ) -> Dict[str, np.ndarray]:
-        """ Static method to get the Morgan fingerprint of molecules.
-        
+        """ Get the Morgan fingerprint of one or more molecules.
+
         Args:
-            smiles: The SMILES string(s) of the molecule(s)
-            morgan_fpgen: The Morgan fingerprint generator
-            radius: Radius for Morgan fingerprints
-            fp_size: Size of the Morgan fingerprints
+            smiles: The SMILES string(s) of the molecule(s).
+            morgan_fpgen: Pre-built Morgan fingerprint generator. Created if not provided.
+            radius: Radius for Morgan fingerprints.
+            fp_size: Size of the Morgan fingerprints.
 
         Returns:
-            Dict[str, np.ndarray]: Dictionary mapping SMILES to fingerprints
+            Dict[str, np.ndarray]: Dictionary mapping SMILES to fingerprints.
         """
         if isinstance(smiles, str):
             smiles_list = [smiles]
@@ -259,9 +209,7 @@ class MolEmbedding(EmbeddingMixin):
             mol = Chem.MolFromSmiles(smiles_str)
             if mol is None:
                 raise ValueError(f"Invalid SMILES string: {smiles_str}")
-            else:
-                fp = morgan_fpgen.GetFingerprintAsNumPy(mol).astype(np.float32)
-                fingerprints[smiles_str] = fp
+            fingerprints[smiles_str] = morgan_fpgen.GetFingerprintAsNumPy(mol).astype(np.float32)
 
         return fingerprints
 
@@ -271,11 +219,11 @@ class MolEmbedding(EmbeddingMixin):
         missing: Any = np.nan,
     ) -> dict:
         """ Calculate the full list of descriptors for a molecule.
-        
+
         Args:
-            mol (Union[str, Chem.Mol]): The molecule as a SMILES string or an RDKit Mol object.
-            missing (Any): Value to use if a descriptor cannot be calculated.
-            
+            mol: The molecule as a SMILES string or an RDKit Mol object.
+            missing: Value to use if a descriptor cannot be calculated.
+
         Returns:
             dict: A dictionary mapping descriptor names to their calculated values.
         """
@@ -286,15 +234,13 @@ class MolEmbedding(EmbeddingMixin):
         for name, fn in Descriptors._descList:
             if name not in descriptors_list:
                 continue
-            # Some of the descriptor fucntions can throw errors if they fail,
-            # catch those here:
             try:
                 val = fn(mol)
             except:
-                # And set the descriptor value to whatever `missing` is
                 val = missing
             res[name] = val
         return res
+
 
 RELEVANT_RDKIT_DESCRIPTORS = [
     "VSA_EState3",
