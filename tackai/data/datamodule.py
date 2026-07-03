@@ -15,6 +15,18 @@ if not hasattr(_sklearn_ct, '_RemainderColsList'):
             super().__init__(columns)
             self.future_dtype = future_dtype
     _sklearn_ct._RemainderColsList = _RemainderColsList
+
+from sklearn.impute import SimpleImputer
+# Compatibility shim: newer sklearn's SimpleImputer.transform() reads
+# self._fill_dtype, which older sklearn didn't set when fitting. Pickled
+# imputers from old checkpoints are missing this attribute.
+_original_simple_imputer_transform = SimpleImputer.transform
+def _patched_simple_imputer_transform(self, X):
+    if not hasattr(self, '_fill_dtype'):
+        self._fill_dtype = self.statistics_.dtype
+    return _original_simple_imputer_transform(self, X)
+SimpleImputer.transform = _patched_simple_imputer_transform
+
 import pandas as pd
 from tqdm import tqdm
 import numpy as np
