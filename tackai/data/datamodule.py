@@ -80,59 +80,59 @@ CONTEXT = "context"
 #   passed through the FITTED numeric pipeline (a cheap scaler); the expensive
 #   part — descriptor computation — is the compute-once concern captured here.
 FEATURE_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "use_fingerprints": {
+    "fingerprint": {
         "name": "fingerprint", "kind": STATELESS, "token": "FP", "group": MOLECULAR,
         "embedder_attr": "fp_embedder", "feature_keys": ["Feature_Fingerprint"],
     },
-    "use_descriptors": {
+    "descriptors": {
         "name": "descriptors", "kind": STATELESS, "token": "Mol-Desc", "group": MOLECULAR,
         "embedder_attr": "desc_embedder", "feature_keys": ["Feature_Descriptor_"],
     },
-    "use_poi_precomputed_embedding": {
+    "poi_precomputed": {
         "name": "poi_precomputed", "kind": STATELESS, "token": "POI-ESM", "group": CONTEXT,
         "embedder_attr": "poi_precomputed_embedding",
         "feature_keys": ["Feature_POI_Precomputed_Embedding"],
     },
-    "use_ligase_precomputed_embedding": {
+    "ligase_precomputed": {
         "name": "ligase_precomputed", "kind": STATELESS, "token": "E3-ESM", "group": CONTEXT,
         "embedder_attr": "ligase_precomputed_embedding",
         "feature_keys": ["Feature_Ligase_Precomputed_Embedding"],
     },
-    "use_cell_description_embedding": {
+    "cell_description": {
         "name": "cell_description", "kind": STATELESS, "token": "Cell-Text", "group": CONTEXT,
         "embedder_attr": "cell_description_embedding",
         "feature_keys": ["Feature_{cell_line_col}_Description"],
     },
-    "use_poi_sequence_embedding": {
+    "poi_sequence": {
         "name": "poi_sequence", "kind": FITTED, "token": "POI-Vec", "group": CONTEXT,
         "embedder_attr": "poi_sequence_embedding",
         "feature_keys": ["Feature_{poi_sequence_col}"],
     },
-    "use_poi_name_embedding": {
+    "poi_name": {
         "name": "poi_name", "kind": FITTED, "token": "POI-Cat", "group": CONTEXT,
         "embedder_attr": None, "feature_keys": ["Feature_{poi_col}"],
     },
-    "use_ligase_name_embedding": {
+    "ligase_name": {
         "name": "ligase_name", "kind": FITTED, "token": "E3-Cat", "group": CONTEXT,
         "embedder_attr": None, "feature_keys": ["Feature_{ligase_col}"],
     },
-    "use_cell_name_embedding": {
+    "cell_name": {
         "name": "cell_name", "kind": FITTED, "token": "Cell-Cat", "group": CONTEXT,
         "embedder_attr": None, "feature_keys": ["Feature_{cell_line_col}"],
     },
-    "use_assay_type_encoding": {
+    "assay_type": {
         "name": "assay_type", "kind": FITTED, "token": "Assay", "group": CONTEXT,
         "embedder_attr": None, "feature_keys": ["Feature_{assay_type_col}"],
     },
-    "use_treatment_time": {
+    "treatment_time": {
         "name": "treatment_time", "kind": FITTED, "token": "Time", "group": CONTEXT,
         "embedder_attr": None, "feature_keys": ["Feature_{treatment_time_col}"],
     },
-    "use_poi_pca": {
+    "poi_pca": {
         "name": "poi_pca", "kind": FITTED, "token": "POI-PCA", "group": CONTEXT,
         "embedder_attr": None, "feature_keys": ["Feature_POI_Precomputed_Embedding"],
     },
-    "use_ligase_pca": {
+    "ligase_pca": {
         "name": "ligase_pca", "kind": FITTED, "token": "E3-PCA", "group": CONTEXT,
         "embedder_attr": None, "feature_keys": ["Feature_Ligase_Precomputed_Embedding"],
     },
@@ -206,19 +206,15 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         normalize_labels: bool = False,
         standardize_labels: bool = False,
         impute_labels: bool = False,
-        # Molecular embeddings parameters
+        # Molecular feature specification
         fp_size: int = 512,
         radius: int = 16,
-        use_fingerprints: bool = False,
-        use_descriptors: bool = False,
+        mol_features: Optional[str] = None,  # "fingerprint", "descriptors", "fingerprint+descriptors"
         use_relevant_descriptors: bool = False,
         selected_descriptors: Optional[List[str]] = None,
-        # Protein embedding flags
-        use_poi_sequence_embedding: bool = False,  # POI sequence -> amino acid count
-        use_poi_name_embedding: bool = False,     # POI name -> ordinal encoding
-        use_ligase_name_embedding: bool = False,   # Ligase name -> ordinal encoding (via categorical)
-        use_poi_precomputed_embedding: bool = False,  # POI -> precomputed embeddings
-        use_ligase_precomputed_embedding: bool = False,  # Ligase -> precomputed embeddings
+        # Protein/cell feature specifications
+        poi_features: Optional[str] = None,    # "precomputed", "sequence", "name"
+        ligase_features: Optional[str] = None, # "precomputed", "name"
         # Precomputed protein embeddings parameters
         poi_embeddings_file: Optional[Union[Path, str]] = None,
         poi_embeddings_format: Literal["npz", "h5"] = "npz",
@@ -235,9 +231,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         poi_pca_n_components: Optional[int] = None,
         use_ligase_pca: bool = False,
         ligase_pca_n_components: Optional[int] = None,
-        # Cell line embedding flags
-        use_cell_description_embedding: bool = False,   # Cell line -> sentence transformer
-        use_cell_name_embedding: bool = False,      # Cell line -> ordinal encoding
+        cell_features: Optional[str] = None,   # "description", "name"
         # Tokenizer parameters (for BERT-based models)
         use_tokenizer: bool = False,
         tokenizer_name: str = "google-bert/bert-base-cased",
@@ -260,6 +254,16 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         features_order: Literal["sorted", "mol_first"] = "mol_first",
         sort_features: Optional[bool] = None,
         categorical_encoding: Literal['minmax', 'onehot', 'embedding'] = 'minmax',
+        # --- Deprecated boolean flags (pre-refactor API) ---
+        use_fingerprints: Optional[bool] = None,
+        use_descriptors: Optional[bool] = None,
+        use_poi_sequence_embedding: Optional[bool] = None,
+        use_poi_name_embedding: Optional[bool] = None,
+        use_poi_precomputed_embedding: Optional[bool] = None,
+        use_ligase_name_embedding: Optional[bool] = None,
+        use_ligase_precomputed_embedding: Optional[bool] = None,
+        use_cell_description_embedding: Optional[bool] = None,
+        use_cell_name_embedding: Optional[bool] = None,
     ):
         """Initialize the datamodule.
 
@@ -282,15 +286,16 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             impute_labels: Keep NaN-label samples in the dataset (no filtering).
             fp_size: Morgan fingerprint bit size.
             radius: Morgan fingerprint radius.
-            use_fingerprints: Include Morgan fingerprint features.
-            use_descriptors: Include RDKit descriptor features.
+            mol_features: Molecular feature(s) to include. One of ``"fingerprint"``,
+                ``"descriptors"``, or ``"fingerprint+descriptors"`` to combine both.
+                ``None`` disables all molecular features (requires ``use_tokenizer``).
             use_relevant_descriptors: Use the curated relevant-descriptor subset.
             selected_descriptors: Explicit list of descriptor names to include.
-            use_poi_sequence_embedding: Encode POI sequence as amino-acid counts (TF-IDF).
-            use_poi_name_embedding: Encode POI name as a categorical feature.
-            use_ligase_name_embedding: Encode ligase name as a categorical feature.
-            use_poi_precomputed_embedding: Use precomputed ESM embeddings for POI.
-            use_ligase_precomputed_embedding: Use precomputed ESM embeddings for ligase.
+            poi_features: POI encoding — ``"precomputed"`` (ESM embeddings),
+                ``"sequence"`` (amino-acid count TF-IDF), or ``"name"`` (ordinal/one-hot).
+                ``None`` omits POI features.
+            ligase_features: Ligase encoding — ``"precomputed"`` (ESM embeddings) or
+                ``"name"`` (ordinal/one-hot). ``None`` omits ligase features.
             poi_embeddings_file: Path to the POI embedding archive (.npz or .h5).
             poi_embeddings_format: Format of the POI embedding archive.
             poi_embeddings_per_residue: Whether the archive stores per-residue embeddings.
@@ -305,8 +310,8 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             poi_pca_n_components: Number of PCA components for POI embeddings.
             use_ligase_pca: Reduce ligase precomputed embeddings with PCA.
             ligase_pca_n_components: Number of PCA components for ligase embeddings.
-            use_cell_description_embedding: Encode cell line via sentence-transformer embeddings.
-            use_cell_name_embedding: Encode cell line name as a categorical feature.
+            cell_features: Cell line encoding — ``"description"`` (sentence-transformer
+                embeddings) or ``"name"`` (ordinal/one-hot). ``None`` omits cell features.
             use_tokenizer: Tokenize a text prompt (BERT-based models).
             tokenizer_name: HuggingFace tokenizer identifier.
             max_length: Maximum token sequence length.
@@ -332,9 +337,61 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             categorical_encoding: How to encode categorical features —
                 'minmax' (ordinal + MinMax), 'onehot', or 'embedding' (ordinal index for nn.Embedding).
         """
+        # --- Backward-compatibility: translate legacy boolean flags --------
+        _LEGACY_PARAMS = [
+            'use_fingerprints', 'use_descriptors',
+            'use_poi_sequence_embedding', 'use_poi_name_embedding',
+            'use_poi_precomputed_embedding', 'use_ligase_name_embedding',
+            'use_ligase_precomputed_embedding',
+            'use_cell_description_embedding', 'use_cell_name_embedding',
+        ]
+        _legacy_used = [
+            p for p in _LEGACY_PARAMS if locals()[p] is not None
+        ]
+        if _legacy_used:
+            warnings.warn(
+                f"DegradationComplexDataModule received deprecated parameter(s): "
+                f"{', '.join(_legacy_used)}. "
+                "Replace use_fingerprints/use_descriptors with mol_features, "
+                "use_poi_*/use_ligase_*/use_cell_* booleans with poi_features, "
+                "ligase_features, and cell_features respectively.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            # mol_features
+            if mol_features is None:
+                if use_fingerprints and use_descriptors:
+                    mol_features = 'fingerprint+descriptors'
+                elif use_fingerprints:
+                    mol_features = 'fingerprint'
+                elif use_descriptors:
+                    mol_features = 'descriptors'
+            # poi_features
+            if poi_features is None:
+                if use_poi_precomputed_embedding:
+                    poi_features = 'precomputed'
+                elif use_poi_sequence_embedding:
+                    poi_features = 'sequence'
+                elif use_poi_name_embedding:
+                    poi_features = 'name'
+            # ligase_features
+            if ligase_features is None:
+                if use_ligase_precomputed_embedding:
+                    ligase_features = 'precomputed'
+                elif use_ligase_name_embedding:
+                    ligase_features = 'name'
+            # cell_features
+            if cell_features is None:
+                if use_cell_description_embedding:
+                    cell_features = 'description'
+                elif use_cell_name_embedding:
+                    cell_features = 'name'
+        # -------------------------------------------------------------------
+
         super().__init__()
-        # Exclude 'dataset' and 'hf_token' from hyperparameters since they shouldn't be serialized
-        self.save_hyperparameters(ignore=['dataset', 'hf_token'])
+        # Exclude dataset/hf_token (not serializable) and deprecated legacy
+        # flags (already translated above) from the saved hyperparameters.
+        self.save_hyperparameters(ignore=['dataset', 'hf_token'] + _LEGACY_PARAMS)
         
         # Column names
         self.smiles_col = smiles_col
@@ -351,16 +408,11 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         self.label_task_col = label_task_col
         self.degrader_type_col = degrader_type_col
         
-        # Feature inclusion flags
-        self.use_fingerprints = use_fingerprints
-        self.use_descriptors = use_descriptors
-        self.use_poi_sequence_embedding = use_poi_sequence_embedding
-        self.use_poi_name_embedding = use_poi_name_embedding
-        self.use_ligase_name_embedding = use_ligase_name_embedding
-        self.use_poi_precomputed_embedding = use_poi_precomputed_embedding
-        self.use_ligase_precomputed_embedding = use_ligase_precomputed_embedding
-        self.use_cell_description_embedding = use_cell_description_embedding
-        self.use_cell_name_embedding = use_cell_name_embedding
+        # Feature specifications
+        self.mol_features = mol_features
+        self.poi_features = poi_features
+        self.ligase_features = ligase_features
+        self.cell_features = cell_features
         self.use_treatment_time = use_treatment_time
         self.include_prompt = include_prompt
         self.default_degrader_type = default_degrader_type
@@ -423,7 +475,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             fp_size=fp_size,
             load_from_cache=False,
             filename=f"morgan_fp_radius{radius}_size{fp_size}.npz",
-        ) if use_fingerprints else None
+        ) if self.mol_features and "fingerprint" in self.mol_features else None
 
         # RDKit descriptors embedder
         filename = "rdkit_descriptors.npz"
@@ -438,15 +490,15 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             selected_descriptors=selected_descriptors,
             load_from_cache=True,
             filename=filename,
-        ) if use_descriptors else None
+        ) if self.mol_features and "descriptors" in self.mol_features else None
 
         # POI sequence embedding (amino acid count)
         self.poi_sequence_embedding = ProteinEmbedding(
             embeddings_type="amino_acid_count",
             load_from_cache=False,
             filename="protein_embeddings_amino_acid_count.npz",
-        ) if use_poi_sequence_embedding else None
-        
+        ) if self.poi_features == "sequence" else None
+
         # POI precomputed embedding
         self.poi_precomputed_embedding = ProteinEmbedding(
             embeddings_type="precomputed",
@@ -455,8 +507,8 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             embeddings_per_residue=poi_embeddings_per_residue,
             residue_pooling=poi_residue_pooling,
             load_from_cache=False,
-        ) if use_poi_precomputed_embedding else None
-        
+        ) if self.poi_features == "precomputed" else None
+
         # Ligase precomputed embedding
         self.ligase_precomputed_embedding = ProteinEmbedding(
             embeddings_type="precomputed",
@@ -465,15 +517,15 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             embeddings_per_residue=ligase_embeddings_per_residue,
             residue_pooling=ligase_residue_pooling,
             load_from_cache=False,
-        ) if use_ligase_precomputed_embedding else None
-        
+        ) if self.ligase_features == "precomputed" else None
+
         # Cell line description embedding (sentence transformer)
         self.cell_description_embedding = CellEmbedding(
             embeddings_type="sentence_transformer",
             pooling="sum",
             load_from_cache=True,
             filename="cell_embeddings_model=sentence-transformer_pooling=sum.npz",
-        ) if use_cell_description_embedding else None
+        ) if self.cell_features == "description" else None
         
         # Labels-related column names
         default_labels = [
@@ -498,8 +550,8 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.num_proc = num_proc
         
-        if not use_tokenizer and not use_fingerprints and not use_descriptors:
-            raise ValueError("At least one of use_fingerprints, use_descriptors, or use_tokenizer must be True.")
+        if not use_tokenizer and mol_features is None:
+            raise ValueError("At least one of mol_features or use_tokenizer must be set.")
         
         self.dataset = dataset
 
@@ -569,7 +621,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             train_df = self.dataset["train"].to_pandas()
 
             # Fit POI sequence embedding
-            if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
+            if self.poi_features == "sequence" and self.poi_sequence_embedding is not None:
                 poi_seqs = list(set(self.dataset["train"][self.poi_sequence_col]))
                 self.logger.debug(f"Fitting POI sequence encoder on {len(poi_seqs)} sequences: {poi_seqs[:5]}...")
                 self.poi_sequence_embedding.fit(poi_seqs)
@@ -579,7 +631,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             smiles_list = list(set(self.dataset["train"][self.smiles_col]))
 
             # Fit molecular embeddings
-            if self.use_fingerprints:
+            if self.mol_features and "fingerprint" in self.mol_features:
                 self.logger.debug("Fitting fingerprint embedder on training data...")
                 self.fp_embedder.transform(smiles_list, update_cache=True)
                 self.logger.debug("Fingerprint embedder fitted on training data")
@@ -593,7 +645,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             cell_lines = list(set(cell_lines))
             
             # Fit cell description embedding
-            if self.use_cell_description_embedding and self.cell_description_embedding is not None:
+            if self.cell_features == "description" and self.cell_description_embedding is not None:
                 self.logger.debug(f"Fitting cell description embedding on {len(cell_lines)} cell lines: {cell_lines[:5]}...")
                 self.cell_description_embedding.transform(cell_lines, update_cache=True)
                 self.logger.debug("Cell description embedding fitted on training data")
@@ -679,27 +731,27 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         smiles_vals = [ex[self.smiles_col] for ex in examples]
 
         # Fingerprints
-        if self.use_fingerprints and self.fp_embedder is not None:
+        if self.mol_features and "fingerprint" in self.mol_features and self.fp_embedder is not None:
             unique_smiles = list(dict.fromkeys(smiles_vals))
             fp_results = self.fp_embedder.transform(unique_smiles)
 
         # Cell description embedding
-        if self.use_cell_description_embedding and self.cell_description_embedding is not None:
+        if self.cell_features == "description" and self.cell_description_embedding is not None:
             unique_cells = list(dict.fromkeys(ex[self.cell_line_col] for ex in examples))
             cell_text_results = self.cell_description_embedding.transform(unique_cells)
 
         # POI sequence embedding (amino acid count / tfidf)
-        if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
+        if self.poi_features == "sequence" and self.poi_sequence_embedding is not None:
             unique_seqs = list(dict.fromkeys(ex[self.poi_sequence_col] for ex in examples))
             poi_vec_results = self.poi_sequence_embedding.transform(unique_seqs)
 
         # POI precomputed embedding (raw, before PCA)
-        if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
+        if self.poi_features == "precomputed" and self.poi_precomputed_embedding is not None:
             unique_poi_ids = list(dict.fromkeys(self._get_protein_id(ex, 'poi') for ex in examples))
             poi_precomp_results = self.poi_precomputed_embedding.transform(unique_poi_ids)
 
         # Ligase precomputed embedding (raw, before PCA)
-        if self.use_ligase_precomputed_embedding and self.ligase_precomputed_embedding is not None:
+        if self.ligase_features == "precomputed" and self.ligase_precomputed_embedding is not None:
             unique_lig_ids = list(dict.fromkeys(self._get_protein_id(ex, 'ligase') for ex in examples))
             ligase_precomp_results = self.ligase_precomputed_embedding.transform(unique_lig_ids)
 
@@ -745,7 +797,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             if self.use_treatment_time:
                 num_data[self.treatment_time_col] = [ex[self.treatment_time_col] for ex in examples]
 
-            if self.use_descriptors:
+            if self.mol_features and "descriptors" in self.mol_features:
                 desc_names = self.desc_embedder.get_descriptor_names()
                 unique_smiles = list(dict.fromkeys(smiles_vals))
                 desc_all = self.desc_embedder.transform(unique_smiles)
@@ -760,7 +812,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             # directly with cached sklearn parameters, avoiding expensive
             # ColumnTransformer overhead with many 1-column transformers.
             used_fast_path = False
-            if self.use_descriptors and desc_matrix is not None and hasattr(self.numeric_pipeline, 'transformers_'):
+            if self.mol_features and "descriptors" in self.mol_features and desc_matrix is not None and hasattr(self.numeric_pipeline, 'transformers_'):
                 try:
                     desc_col_to_idx = {
                         f'Descriptor_{name}': idx for idx, name in enumerate(desc_names)
@@ -842,24 +894,24 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         if return_tensor == 'pt':
             batch_out: Dict[str, torch.Tensor] = {}
 
-            if self.use_fingerprints and self.fp_embedder is not None:
+            if self.mol_features and "fingerprint" in self.mol_features and self.fp_embedder is not None:
                 fp_mat = np.stack([fp_results[ex[self.smiles_col]] for ex in examples])
                 batch_out['Feature_Fingerprint'] = torch.from_numpy(fp_mat).float()
 
-            if self.use_cell_description_embedding and self.cell_description_embedding is not None:
+            if self.cell_features == "description" and self.cell_description_embedding is not None:
                 cell_mat = np.stack([cell_text_results[ex[self.cell_line_col]] for ex in examples])
                 batch_out[f'Feature_{self.cell_line_col}_Description'] = torch.from_numpy(cell_mat).float()
 
-            if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
+            if self.poi_features == "sequence" and self.poi_sequence_embedding is not None:
                 poi_mat = np.stack([poi_vec_results[ex[self.poi_sequence_col]] for ex in examples])
                 batch_out[f'Feature_{self.poi_sequence_col}'] = torch.from_numpy(poi_mat).float()
 
-            if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
+            if self.poi_features == "precomputed" and self.poi_precomputed_embedding is not None:
                 emb_res = poi_pca_results if (self.use_poi_pca and self.poi_pca is not None and poi_pca_results) else poi_precomp_results
                 poi_mat = np.stack([emb_res[self._get_protein_id(ex, 'poi')] for ex in examples])
                 batch_out['Feature_POI_Precomputed_Embedding'] = torch.from_numpy(poi_mat).float()
 
-            if self.use_ligase_precomputed_embedding and self.ligase_precomputed_embedding is not None:
+            if self.ligase_features == "precomputed" and self.ligase_precomputed_embedding is not None:
                 emb_res = ligase_pca_results if (self.use_ligase_pca and self.ligase_pca is not None and ligase_pca_results) else ligase_precomp_results
                 lig_mat = np.stack([emb_res[self._get_protein_id(ex, 'ligase')] for ex in examples])
                 batch_out['Feature_Ligase_Precomputed_Embedding'] = torch.from_numpy(lig_mat).float()
@@ -905,23 +957,23 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         for i, ex in enumerate(examples):
             features: Dict[str, Any] = {}
 
-            if self.use_fingerprints and self.fp_embedder is not None:
+            if self.mol_features and "fingerprint" in self.mol_features and self.fp_embedder is not None:
                 features['Feature_Fingerprint'] = fp_results[ex[self.smiles_col]]
 
-            if self.use_cell_description_embedding and self.cell_description_embedding is not None:
+            if self.cell_features == "description" and self.cell_description_embedding is not None:
                 features[f'Feature_{self.cell_line_col}_Description'] = cell_text_results[ex[self.cell_line_col]]
 
-            if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
+            if self.poi_features == "sequence" and self.poi_sequence_embedding is not None:
                 features[f'Feature_{self.poi_sequence_col}'] = poi_vec_results[ex[self.poi_sequence_col]]
 
-            if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
+            if self.poi_features == "precomputed" and self.poi_precomputed_embedding is not None:
                 pid = self._get_protein_id(ex, 'poi')
                 if self.use_poi_pca and self.poi_pca is not None:
                     features['Feature_POI_Precomputed_Embedding'] = poi_pca_results[pid]
                 else:
                     features['Feature_POI_Precomputed_Embedding'] = poi_precomp_results[pid]
 
-            if self.use_ligase_precomputed_embedding and self.ligase_precomputed_embedding is not None:
+            if self.ligase_features == "precomputed" and self.ligase_precomputed_embedding is not None:
                 lid = self._get_protein_id(ex, 'ligase')
                 if self.use_ligase_pca and self.ligase_pca is not None:
                     features['Feature_Ligase_Precomputed_Embedding'] = ligase_pca_results[lid]
@@ -1010,12 +1062,12 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             return []
 
         fp_results: Dict[str, np.ndarray] = {}
-        if self.use_fingerprints and self.fp_embedder is not None:
+        if self.mol_features and "fingerprint" in self.mol_features and self.fp_embedder is not None:
             unique_smiles = list(dict.fromkeys(smiles_list))
             fp_results = self.fp_embedder.transform(unique_smiles)
 
         mol_num_results: Optional[np.ndarray] = None
-        if self.use_descriptors and self.desc_embedder is not None and self.mol_numeric_pipeline is not None:
+        if self.mol_features and "descriptors" in self.mol_features and self.desc_embedder is not None and self.mol_numeric_pipeline is not None:
             desc_names = self.desc_embedder.get_descriptor_names()
             unique_smiles = list(dict.fromkeys(smiles_list))
             desc_all = self.desc_embedder.transform(unique_smiles)
@@ -1032,7 +1084,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         results: List[Dict[str, np.ndarray]] = []
         for i, smi in enumerate(smiles_list):
             feats: Dict[str, np.ndarray] = {}
-            if self.use_fingerprints and fp_results:
+            if self.mol_features and "fingerprint" in self.mol_features and fp_results:
                 feats['Feature_Fingerprint'] = fp_results[smi]
             if mol_num_results is not None:
                 for j, col in enumerate(self.mol_numerical_cols):
@@ -1060,24 +1112,24 @@ class DegradationComplexDataModule(pl.LightningDataModule):
 
         feats: Dict[str, np.ndarray] = {}
 
-        if self.use_cell_description_embedding and self.cell_description_embedding is not None:
+        if self.cell_features == "description" and self.cell_description_embedding is not None:
             feats[f'Feature_{self.cell_line_col}_Description'] = (
                 self.cell_description_embedding.transform(example[self.cell_line_col])
             )
 
-        if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
+        if self.poi_features == "sequence" and self.poi_sequence_embedding is not None:
             feats[f'Feature_{self.poi_sequence_col}'] = (
                 self.poi_sequence_embedding.transform(example[self.poi_sequence_col])
             )
 
-        if self.use_poi_precomputed_embedding and self.poi_precomputed_embedding is not None:
+        if self.poi_features == "precomputed" and self.poi_precomputed_embedding is not None:
             poi_id = self._get_protein_id(example, 'poi')
             poi_emb = self.poi_precomputed_embedding.transform(poi_id)
             if self.use_poi_pca and self.poi_pca is not None:
                 poi_emb = self.poi_pca.transform(poi_emb.reshape(1, -1)).flatten()
             feats['Feature_POI_Precomputed_Embedding'] = poi_emb
 
-        if self.use_ligase_precomputed_embedding and self.ligase_precomputed_embedding is not None:
+        if self.ligase_features == "precomputed" and self.ligase_precomputed_embedding is not None:
             lig_id = self._get_protein_id(example, 'ligase')
             lig_emb = self.ligase_precomputed_embedding.transform(lig_id)
             if self.use_ligase_pca and self.ligase_pca is not None:
@@ -1638,6 +1690,32 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 resolved.append(key)
         return resolved
 
+    def _is_feature_active(self, key: str) -> bool:
+        """Return whether the named FEATURE_REGISTRY entry is enabled by the current config.
+
+        Args:
+            key: A key from :data:`FEATURE_REGISTRY`.
+
+        Returns:
+            True if the corresponding feature is active.
+        """
+        checks = {
+            "fingerprint":        lambda: bool(self.mol_features and "fingerprint" in self.mol_features),
+            "descriptors":        lambda: bool(self.mol_features and "descriptors" in self.mol_features),
+            "poi_precomputed":    lambda: self.poi_features == "precomputed",
+            "poi_sequence":       lambda: self.poi_features == "sequence",
+            "poi_name":           lambda: self.poi_features == "name",
+            "ligase_precomputed": lambda: self.ligase_features == "precomputed",
+            "ligase_name":        lambda: self.ligase_features == "name",
+            "cell_description":   lambda: self.cell_features == "description",
+            "cell_name":          lambda: self.cell_features == "name",
+            "assay_type":         lambda: self.use_assay_type_encoding,
+            "treatment_time":     lambda: self.use_treatment_time,
+            "poi_pca":            lambda: self.use_poi_pca,
+            "ligase_pca":         lambda: self.use_ligase_pca,
+        }
+        return checks.get(key, lambda: False)()
+
     def get_feature_spec(self) -> List[Dict[str, Any]]:
         """ Describe the active processed features and how they are produced.
 
@@ -1658,7 +1736,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         """
         spec: List[Dict[str, Any]] = []
         for flag, meta in FEATURE_REGISTRY.items():
-            if not getattr(self, flag, False):
+            if not self._is_feature_active(flag):
                 continue
 
             feature_keys = self._resolve_feature_keys(meta["feature_keys"])
@@ -1691,11 +1769,11 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         
         # Ordinal encoding + shift + MinMax for each categorical feature
         self.categorical_cols = []
-        if self.use_ligase_name_embedding:
+        if self.ligase_features == "name":
             self.categorical_cols.append(self.ligase_col)
-        if self.use_poi_name_embedding:
+        if self.poi_features == "name":
             self.categorical_cols.append(self.poi_col)
-        if self.use_cell_name_embedding:
+        if self.cell_features == "name":
             self.categorical_cols.append(self.cell_line_col)
         if self.use_assay_type_encoding:
             self.categorical_cols.append(self.assay_type_col)
@@ -1819,7 +1897,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         combined_transformers = [
             ('treatment_time_pipeline', _treatment_time_transformer(), [self.treatment_time_col])
         ] if self.use_treatment_time else []
-        if self.use_descriptors:
+        if self.mol_features and "descriptors" in self.mol_features:
             for desc_name in self.desc_embedder.get_descriptor_names():
                 col = f'Descriptor_{desc_name}'
                 self.mol_numerical_cols.append(col)
@@ -1866,7 +1944,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         if self.use_treatment_time:
             data[self.treatment_time_col] = train_df[self.treatment_time_col]
 
-        if self.use_descriptors:
+        if self.mol_features and "descriptors" in self.mol_features:
             descs_list = []
             for _, row in train_df.iterrows():
                 # Each descriptor is an array of shape: (num_descriptors,)
@@ -1905,7 +1983,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         if self.use_treatment_time:
             data[self.treatment_time_col] = example[self.treatment_time_col]
         
-        if self.use_descriptors:
+        if self.mol_features and "descriptors" in self.mol_features:
             descs = self.desc_embedder.transform(example[self.smiles_col])
             for i, name in enumerate(self.desc_embedder.get_descriptor_names()):
                 data[f'Descriptor_{name}'] = np.array([descs[i]], dtype=np.float32)
@@ -2079,7 +2157,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         
     def cache_mol_descriptors(self):
         """ Precompute and cache molecular descriptors for all SMILES in the dataset."""
-        if not self.use_descriptors or self.desc_embedder is None:
+        if not self.mol_features and "descriptors" in self.mol_features or self.desc_embedder is None:
             return
         
         all_smiles = set()
@@ -2093,7 +2171,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
 
     def cache_cell_description_embeddings(self):
         """ Precompute and cache cell description embeddings for all cell lines in the dataset."""
-        if not self.use_cell_description_embedding or self.cell_description_embedding is None:
+        if not self.cell_features == "description" or self.cell_description_embedding is None:
             return
         
         all_cell_lines = set()
@@ -2302,13 +2380,13 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             state['label_transformers'] = _serialize_estimators(self.label_transformers)
             
         # Save POI sequence embedding (TfidfVectorizer)
-        if self.use_poi_sequence_embedding and self.poi_sequence_embedding is not None:
+        if self.poi_features == "sequence" and self.poi_sequence_embedding is not None:
             if hasattr(self.poi_sequence_embedding, 'sklearn_encoder') and \
                hasattr(self.poi_sequence_embedding.sklearn_encoder, 'vocabulary_'):
                 state['poi_sequence_embedding_sklearn_encoder'] = pickle.dumps(self.poi_sequence_embedding.sklearn_encoder)
         
         # Save fingerprint embedder info
-        if self.use_fingerprints and self.fp_embedder is not None:
+        if self.mol_features and "fingerprint" in self.mol_features and self.fp_embedder is not None:
             state['fp_embedder'] = {
                 'fp_size': self.fp_size,
                 'radius': self.radius,
@@ -2367,7 +2445,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 self.label_transformers[key] = pickle.loads(bytes_data)
 
         # Restore POI sequence embedding (TfidfVectorizer)
-        if self.use_poi_sequence_embedding and 'poi_sequence_embedding_sklearn_encoder' in state_dict:
+        if self.poi_features == "sequence" and 'poi_sequence_embedding_sklearn_encoder' in state_dict:
             if self.poi_sequence_embedding is not None:
                 self.poi_sequence_embedding.sklearn_encoder = pickle.loads(state_dict['poi_sequence_embedding_sklearn_encoder'])
         
@@ -2602,9 +2680,9 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         parts = []
         
         # Add feature flags
-        if getattr(self, 'use_fingerprints', False):
+        if self.mol_features and "fingerprint" in self.mol_features:
             parts.append(f'fp{getattr(self, "fp_size", 512)}r{getattr(self, "radius", 16)}')
-        if getattr(self, 'use_descriptors', False):
+        if self.mol_features and "descriptors" in self.mol_features:
             if getattr(self, 'use_relevant_descriptors', False):
                 parts.append('desc')
             elif getattr(self, 'selected_descriptors', False):
@@ -2614,34 +2692,34 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         if getattr(self, 'use_tokenizer', False):
             tokenizer = getattr(self, 'tokenizer_name', 'bert')
             parts.append(f'tok_{tokenizer.split("/")[-1].replace("-", "_")}')
-        if getattr(self, 'use_poi_name_embedding', False):
+        if self.poi_features == "name":
             if self.categorical_encoding == 'embedding':
                 parts.append('poi_pt')
             elif self.categorical_encoding == 'onehot':
                 parts.append('poi_onehot')
             else:
                 parts.append('poi_ord')
-        if getattr(self, 'use_poi_sequence_embedding', False):
+        if self.poi_features == "sequence":
             parts.append('poi_vec')
-        if getattr(self, 'use_poi_precomputed_embedding', False):
+        if self.poi_features == "precomputed":
             parts.append('poi_emb')
-        if getattr(self, 'use_ligase_precomputed_embedding', False):
+        if self.ligase_features == "precomputed":
             parts.append('lig_emb')
-        if getattr(self, 'use_ligase_name_embedding', False):
+        if self.ligase_features == "name":
             if self.categorical_encoding == 'embedding':
                 parts.append('lig_pt')
             elif self.categorical_encoding == 'onehot':
                 parts.append('lig_onehot')
             else:
                 parts.append('lig_ord')
-        if getattr(self, 'use_cell_name_embedding', False):
+        if self.cell_features == "name":
             if self.categorical_encoding == 'embedding':
                 parts.append('cell_pt')
             elif self.categorical_encoding == 'onehot':
                 parts.append('cell_onehot')
             else:
                 parts.append('cell_ord')
-        if getattr(self, 'use_cell_description_embedding', False):
+        if self.cell_features == "description":
             parts.append('cell_text')
         if getattr(self, 'use_assay_type_encoding', False):
             parts.append('assay')
@@ -2684,25 +2762,57 @@ class DegradationComplexDataModule(pl.LightningDataModule):
 
 
 def load_datamodule(
-    hparams_path: Union[Path, str],
     state_dict_path: Union[Path, str],
+    hparams_path: Optional[Union[Path, str]] = None,
+    hparam_overrides: Optional[Dict[str, Any]] = None,
 ) -> DegradationComplexDataModule:
-    """ Load a DegradationComplexDataModule from YAML hyperparameters and a saved state dict.
-    
+    """Load a DegradationComplexDataModule from a saved state dict.
+
+    Hyperparameters are sourced in priority order:
+    1. ``hparam_overrides`` — any key here wins over everything else.
+    2. ``hparams_path`` YAML file — used when provided.
+    3. ``hparams`` key embedded in the state dict — used when the YAML file is absent.
+
+    A ``FileNotFoundError`` is raised if neither a YAML file nor an embedded
+    ``hparams`` key is available.
+
     Args:
-        hparams_path: Path to the YAML file with hyperparameters.
-        state_dict_path: Path to the saved state dict file.
-        
+        state_dict_path: Path to the saved ``.pt`` state dict file.
+        hparams_path: Optional path to a YAML file with hyperparameters.
+            If ``None``, the state dict must contain an ``'hparams'`` key.
+        hparam_overrides: Optional dict of hparam key/value pairs that
+            override whatever is loaded from the YAML or the state dict.
+            Use this to fix stale paths, e.g.::
+
+                load_datamodule(
+                    'model_state.pt',
+                    hparam_overrides={
+                        'poi_embeddings_file': '/new/path/embeddings.npz',
+                        'ligase_embeddings_file': '/new/path/embeddings.npz',
+                    },
+                )
+
     Returns:
-        An instance of DegradationComplexDataModule with loaded state.
+        A :class:`DegradationComplexDataModule` with all transformers restored.
     """
-    hparams_path = Path(hparams_path)
     state_path = Path(state_dict_path)
-    dm = DegradationComplexDataModule(
-        dataset=None,
-        **load_config_from_yaml(hparams_path)
-    )
-    dm.load_state_dict(torch.load(state_path))
+    state_dict = torch.load(state_path, map_location='cpu', weights_only=False)
+
+    if hparams_path is not None:
+        hparams = load_config_from_yaml(Path(hparams_path))
+    elif 'hparams' in state_dict:
+        hparams = dict(state_dict['hparams'])
+    else:
+        raise FileNotFoundError(
+            f"No hparams_path was provided and the state dict at '{state_path}' "
+            "does not contain an 'hparams' key. Pass hparams_path explicitly."
+        )
+
+    if hparam_overrides:
+        hparams.update(hparam_overrides)
+
+    dm = DegradationComplexDataModule(dataset=None, **hparams)
+    dm.load_state_dict(state_dict)
 
     # Check if any of the non-None encoders are fitted, this will raise an error
     # if they are not have been fitted, and so that the checkpoints are broken.
@@ -2721,7 +2831,7 @@ def load_datamodule(
     if dm.use_ligase_pca and dm.ligase_pca is not None:
         check_is_fitted(dm.ligase_pca)
     if dm.poi_sequence_embedding is not None:
-        if dm.use_poi_sequence_embedding:
+        if dm.poi_features == "sequence":
             check_is_fitted(dm.poi_sequence_embedding.sklearn_encoder)
 
     return dm
