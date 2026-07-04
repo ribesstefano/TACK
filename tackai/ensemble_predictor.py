@@ -3,6 +3,7 @@ Ensemble Predictor for TACK Models
 Handles loading and prediction from multiple model types (XGBoost, Lightning)
 with weighted averaging and uncertainty quantification.
 """
+import gc
 import os
 import re
 import json
@@ -14,14 +15,19 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Literal
 from dataclasses import dataclass, field
 
+# xgboost must be imported before torch to avoid an OpenMP runtime conflict on
+# macOS: torch's libtorch sets up Intel OpenMP (libiomp5), and if xgb.Booster()
+# is first called afterwards it initialises a second OpenMP runtime → SIGSEGV.
+import xgboost as xgb
 import torch
 import numpy as np
 import pandas as pd
-import xgboost as xgb
 from tqdm import tqdm
 
 from tackai.data.datamodule import DegradationComplexDataModule, load_datamodule
-from tackai.models.tack_model import TACKModel
+# TACKModel is imported lazily inside _load_lightning_model so that XGBoost-only
+# ensembles never trigger the PyTorch/OpenMP initialisation that conflicts with
+# XGBoost's own OpenMP runtime on macOS.
 
 warnings.filterwarnings('ignore')
 
@@ -231,6 +237,12 @@ class EnsemblePredictor:
         self.device = 'cuda' if device == 'gpu' else device
         self.n_jobs = n_jobs
 
+        # Lazy-loading state — populated by from_directory(lazy_loading=True)
+        self._lazy: bool = False
+        self._model_paths: Dict[str, Path] = {}
+        self._dm_paths: Dict[str, Tuple[Optional[Path], Path]] = {}
+        self._hparam_overrides: Optional[Dict[str, Any]] = None
+
         if n_jobs is not None and n_jobs > 1:
             omp = os.environ.get('OMP_NUM_THREADS')
             if omp is None or int(omp) < n_jobs:
@@ -273,6 +285,7 @@ class EnsemblePredictor:
         n_jobs: Optional[int] = None,
         pattern: Optional[str] = None,
         hparam_overrides: Optional[Dict[str, Any]] = None,
+        lazy_loading: bool = True,
     ) -> 'EnsemblePredictor':
         """Load ensemble from a directory containing models and datamodules.
 
@@ -296,6 +309,11 @@ class EnsemblePredictor:
                             'ligase_embeddings_file': '/new/embeddings.npz',
                         },
                     )
+            lazy_loading: If ``True`` (default), models and datamodules are
+                loaded one at a time during inference and immediately freed
+                afterwards. This keeps peak memory proportional to a single
+                model rather than the whole ensemble. Set to ``False`` to
+                load everything eagerly upfront (old behaviour).
 
         Returns:
             Initialized :class:`EnsemblePredictor`.
@@ -346,9 +364,61 @@ class EnsemblePredictor:
                 )
             model_files = [f for f in model_files if f.stem in wanted_stems]
 
-        print(f"Loading {len(model_files)} model(s) from {model_dir}")
+        print(f"{'Registering' if lazy_loading else 'Loading'} {len(model_files)} model(s) from {model_dir}")
 
-        # --- Load models and datamodules ----------------------------------
+        # ------------------------------------------------------------------ #
+        # LAZY PATH — store paths, infer metadata from filenames/extensions  #
+        # ------------------------------------------------------------------ #
+        if lazy_loading:
+            model_tasks: Dict[str, str] = {}
+            model_types: Dict[str, str] = {}
+            model_paths: Dict[str, Path] = {}
+            dm_paths: Dict[str, Tuple[Optional[Path], Path]] = {}
+
+            for model_file in model_files:
+                name = model_file.stem
+                paths = cls._find_dm_paths(model_file)
+                if paths is None:
+                    print(f"  Warning: no datamodule found for {name} — skipping.")
+                    continue
+                mtype = (
+                    'xgboost'
+                    if model_file.suffix.lower() in ('.json', '.ubj', '.pkl')
+                    else 'lightning'
+                )
+                model_paths[name] = model_file
+                dm_paths[name] = paths
+                model_tasks[name] = cls._infer_model_task(name, None)
+                model_types[name] = mtype
+                print(f"  Registered ({len(model_paths)}/{len(model_files)}): {name} ({mtype})")
+
+            if not model_paths:
+                raise ValueError(f"No models with matching datamodules found in {model_dir}")
+
+            if weights is None:
+                task_to_names: Dict[str, List[str]] = defaultdict(list)
+                for name, task in model_tasks.items():
+                    task_to_names[task].append(name)
+                weights = {
+                    name: 1.0 / len(names)
+                    for names in task_to_names.values()
+                    for name in names
+                }
+            else:
+                weights = {k: v for k, v in weights.items() if k in model_paths}
+
+            predictor = cls(models={}, datamodules={}, weights=weights, device=device, n_jobs=n_jobs)
+            predictor._lazy = True
+            predictor._model_paths = model_paths
+            predictor._dm_paths = dm_paths
+            predictor._hparam_overrides = hparam_overrides
+            predictor.model_tasks = model_tasks
+            predictor.model_types = model_types
+            return predictor
+
+        # ------------------------------------------------------------------ #
+        # EAGER PATH — load everything upfront                               #
+        # ------------------------------------------------------------------ #
         models: Dict[str, Any] = {}
         datamodules: Dict[str, Any] = {}
 
@@ -366,9 +436,8 @@ class EnsemblePredictor:
         if not models:
             raise ValueError(f"No models could be loaded from {model_dir}")
 
-        # --- Build weights dict -------------------------------------------
         if weights is None:
-            task_to_names: Dict[str, List[str]] = defaultdict(list)
+            task_to_names = defaultdict(list)
             for name in models:
                 task = cls._infer_model_task(name, datamodules.get(name))
                 task_to_names[task].append(name)
@@ -387,29 +456,15 @@ class EnsemblePredictor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _load_datamodule(
+    def _find_dm_paths(
         model_path: Path,
-        hparam_overrides: Optional[Dict[str, Any]] = None,
-    ) -> Optional[DegradationComplexDataModule]:
-        """Load the datamodule paired with *model_path*.
-
-        Tries the ``*_state.pt`` naming convention (which stores hparams
-        embedded in the state dict) before falling back to the older
-        ``*_hparams.yaml`` + ``*_state.pt`` pair.
-
-        Args:
-            model_path: Path to the model file whose sibling datamodule to load.
-            hparam_overrides: Optional hparam overrides forwarded to
-                :func:`load_datamodule` (e.g. to fix stale embedding paths).
-
-        Returns:
-            Loaded :class:`DegradationComplexDataModule`, or ``None`` if no
-            matching file is found.
+    ) -> Optional[Tuple[Optional[Path], Path]]:
+        """Return the first existing ``(hparams_path_or_None, state_path)`` pair
+        for the datamodule paired with *model_path*, or ``None`` if nothing is found.
         """
         stem = model_path.stem
         parent = model_path.parent
 
-        # Parse stem: model=<arch>_<task>_protac-data=<cfg>-group=<g>-fold=<f>
         data_config = group = fold = None
         for part in stem.split('-'):
             if part.startswith('data='):
@@ -419,8 +474,7 @@ class EnsemblePredictor:
             elif part.startswith('fold='):
                 fold = part[5:]
 
-        # Ordered candidate list: state-only first (hparams embedded), then yaml+state pair
-        candidates: List[Union[Path, Tuple[Optional[Path], Path]]] = []
+        candidates: List[Tuple[Optional[Path], Path]] = []
         if data_config:
             dm_base = f"datamodule-data={data_config}-group={group}-fold={fold}"
             candidates.append((None, parent / f"{dm_base}_state.pt"))
@@ -434,18 +488,39 @@ class EnsemblePredictor:
 
         for hparams_path, state_path in candidates:
             yaml_ok = hparams_path is None or hparams_path.exists()
-            if not (yaml_ok and state_path.exists()):
-                continue
-            try:
-                return load_datamodule(
-                    state_dict_path=state_path,
-                    hparams_path=hparams_path,
-                    hparam_overrides=hparam_overrides,
-                )
-            except Exception as e:
-                warnings.warn(f"Failed to load datamodule from {state_path}: {e}")
-
+            if yaml_ok and state_path.exists():
+                return (hparams_path, state_path)
         return None
+
+    @staticmethod
+    def _load_datamodule(
+        model_path: Path,
+        hparam_overrides: Optional[Dict[str, Any]] = None,
+    ) -> Optional[DegradationComplexDataModule]:
+        """Load the datamodule paired with *model_path*.
+
+        Args:
+            model_path: Path to the model file whose sibling datamodule to load.
+            hparam_overrides: Optional hparam overrides forwarded to
+                :func:`load_datamodule` (e.g. to fix stale embedding paths).
+
+        Returns:
+            Loaded :class:`DegradationComplexDataModule`, or ``None`` if no
+            matching file is found.
+        """
+        paths = EnsemblePredictor._find_dm_paths(model_path)
+        if paths is None:
+            return None
+        hparams_path, state_path = paths
+        try:
+            return load_datamodule(
+                state_dict_path=state_path,
+                hparams_path=hparams_path,
+                hparam_overrides=hparam_overrides,
+            )
+        except Exception as e:
+            warnings.warn(f"Failed to load datamodule from {state_path}: {e}")
+            return None
 
     @staticmethod
     def _load_model(
@@ -463,6 +538,7 @@ class EnsemblePredictor:
 
     @staticmethod
     def _load_lightning_model(model_path: Path, device: str) -> Any:
+        from tackai.models.tack_model import TACKModel  # lazy import: avoids loading PyTorch until needed
         try:
             model = TACKModel.load_from_checkpoint(str(model_path), map_location=device)
         except Exception as e:
@@ -538,6 +614,49 @@ class EnsemblePredictor:
     @property
     def available_tasks(self) -> List[str]:
         return sorted(set(self.model_tasks.values()))
+
+    # ------------------------------------------------------------------
+    # Lazy-loading helpers
+    # ------------------------------------------------------------------
+
+    def _iter_model_names(
+        self, allowed_tasks: Optional[set] = None
+    ):
+        """Yield model names from either the lazy path registry or eager dict."""
+        names = list(self._model_paths if self._lazy else self.models)
+        for name in names:
+            if allowed_tasks and self.model_tasks.get(name) not in allowed_tasks:
+                continue
+            yield name
+
+    def _get_model_and_dm(
+        self, name: str
+    ) -> Tuple[Any, 'DegradationComplexDataModule']:
+        """Return (model, datamodule) — loading from disk in lazy mode."""
+        if self._lazy:
+            model = self._load_model(self._model_paths[name], self.device, self.n_jobs)
+            hparams_path, state_path = self._dm_paths[name]
+            dm = load_datamodule(state_path, hparams_path, self._hparam_overrides)
+            return model, dm
+        return self.models[name], self.datamodules[name]
+
+    def _get_dm(self, name: str) -> 'DegradationComplexDataModule':
+        """Return the datamodule only — avoids loading the model in lazy mode."""
+        if self._lazy:
+            hparams_path, state_path = self._dm_paths[name]
+            return load_datamodule(state_path, hparams_path, self._hparam_overrides)
+        return self.datamodules[name]
+
+    def _free_if_lazy(self, *objs: Any) -> None:
+        """Delete objects and collect garbage only when in lazy mode."""
+        if not self._lazy:
+            return
+        for obj in objs:
+            if obj is not None:
+                del obj
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Input validation / defaults
@@ -626,24 +745,31 @@ class EnsemblePredictor:
         self,
         samples: List[Union[SampleInput, Dict[str, Any]]],
     ) -> List[Dict[str, Any]]:
-        """Convert SampleInput / raw dicts to datamodule-compatible dicts."""
-        ref_dm = next(iter(self.datamodules.values()))
-        out = []
-        for s in samples:
-            if isinstance(s, SampleInput):
-                out.append(s.to_datamodule_dict(
-                    smiles_col=ref_dm.smiles_col,
-                    poi_col=ref_dm.poi_col,
-                    poi_sequence_col=ref_dm.poi_sequence_col,
-                    ligase_col=ref_dm.ligase_col,
-                    ligase_sequence_col=ref_dm.ligase_sequence_col,
-                    cell_line_col=ref_dm.cell_line_col,
-                    assay_type_col=ref_dm.assay_type_col,
-                    treatment_time_col=ref_dm.treatment_time_col,
-                ))
-            else:
-                out.append(s)
-        return out
+        """Convert SampleInput / raw dicts to datamodule-compatible dicts.
+
+        In lazy mode ``self.datamodules`` is empty so we fall back to the
+        default TACK column names (identical to ``DegradationComplexDataModule``
+        defaults), which ``_validate_and_fill_defaults`` normalises per-model.
+        """
+        if self.datamodules:
+            ref_dm = next(iter(self.datamodules.values()))
+            kwargs = dict(
+                smiles_col=ref_dm.smiles_col,
+                poi_col=ref_dm.poi_col,
+                poi_sequence_col=ref_dm.poi_sequence_col,
+                ligase_col=ref_dm.ligase_col,
+                ligase_sequence_col=ref_dm.ligase_sequence_col,
+                cell_line_col=ref_dm.cell_line_col,
+                assay_type_col=ref_dm.assay_type_col,
+                treatment_time_col=ref_dm.treatment_time_col,
+            )
+        else:
+            kwargs = {}  # SampleInput.to_datamodule_dict() defaults match DM defaults
+
+        return [
+            s.to_datamodule_dict(**kwargs) if isinstance(s, SampleInput) else s
+            for s in samples
+        ]
 
     # ------------------------------------------------------------------
     # Featurization
@@ -838,13 +964,20 @@ class EnsemblePredictor:
         self,
         model_name: str,
         feat_list: Any,
+        model: Any = None,
+        dm: Any = None,
     ) -> np.ndarray:
         """Run inference for one model and denormalize predictions.
 
+        *model* and *dm* may be passed explicitly (lazy path) to avoid
+        re-looking them up from ``self.models``/``self.datamodules``.
+
         Returns an ndarray of shape ``(n_samples,)`` in the original scale.
         """
-        model = self.models[model_name]
-        dm = self.datamodules[model_name]
+        if model is None:
+            model = self.models[model_name]
+        if dm is None:
+            dm = self.datamodules[model_name]
 
         if self.model_types[model_name] == 'xgboost':
             preds = self._predict_xgboost_batch(model, feat_list)
@@ -1003,34 +1136,46 @@ class EnsemblePredictor:
         sample_dicts = self._prepare_sample_dicts(samples)
         timings['prepare'] = time.time() - t0
 
-        # 2. Batch featurize
-        t0 = time.time()
-        batch_features, feat_timings = self.transform(sample_dicts, return_timings=True)
-        timings['featurize'] = time.time() - t0
-        timings.update(feat_timings)
-
-        # 3. Inference + denormalize
+        # 2+3. Per-model: (lazy) load → featurize → infer → denorm → (lazy) free
         allowed_tasks = set(tasks) if tasks else None
         model_batch_preds: Dict[str, np.ndarray] = {}
+        t_feat = t_infer = 0.0
 
-        t0 = time.time()
-        for model_name in tqdm(self.models, desc="Predicting", disable=not verbose):
-            if allowed_tasks and self.model_tasks.get(model_name) not in allowed_tasks:
-                continue
-
-            feat_list = batch_features.get(model_name)
-            if feat_list is None:
-                raise ValueError(f"No features for model {model_name}.")
-
+        for model_name in tqdm(
+            list(self._iter_model_names(allowed_tasks)), desc="Predicting", disable=not verbose
+        ):
+            model, dm = self._get_model_and_dm(model_name)
             try:
-                model_batch_preds[model_name] = self._infer_and_denormalize(model_name, feat_list)
-            except Exception as e:
-                msg = str(e)
-                if 'feature_names mismatch' in msg:
-                    msg = "feature_names mismatch (training/inference encoding incompatible)"
-                raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
+                filled_samples = []
+                for i, sd in enumerate(sample_dicts):
+                    filled, missing = self._validate_and_fill_defaults(sd, dm, verbose=(i == 0))
+                    if missing:
+                        raise ValueError(
+                            f"Sample {i} is missing required input(s) for model '{model_name}': "
+                            f"{', '.join(missing)}."
+                        )
+                    filled_samples.append(filled)
 
-        timings['inference'] = time.time() - t0
+                ret = 'xgb' if self.model_types[model_name] == 'xgboost' else 'pt'
+                t0 = time.time()
+                feat_list = dm.transform(filled_samples, return_tensor=ret)
+                t_feat += time.time() - t0
+
+                t0 = time.time()
+                try:
+                    model_batch_preds[model_name] = self._infer_and_denormalize(
+                        model_name, feat_list, model=model, dm=dm
+                    )
+                except Exception as e:
+                    msg = str(e)
+                    if 'feature_names mismatch' in msg:
+                        msg = "feature_names mismatch (training/inference encoding incompatible)"
+                    raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
+                t_infer += time.time() - t0
+            finally:
+                self._free_if_lazy(model, dm)
+
+        timings.update(featurize=t_feat, inference=t_infer)
 
         # 4. Assemble per-sample results
         t0 = time.time()
@@ -1077,28 +1222,32 @@ class EnsemblePredictor:
         model_batch_preds: Dict[str, np.ndarray] = {}
         t_smiles = t_infer = 0.0
 
-        for model_name in tqdm(self.models, desc="Predicting", disable=not verbose):
-            if allowed_tasks and self.model_tasks.get(model_name) not in allowed_tasks:
-                continue
-
-            datamodule = self.datamodules[model_name]
-            ret = 'xgb' if self.model_types[model_name] == 'xgboost' else 'pt'
-
-            t0 = time.time()
-            feat_arg = datamodule.transform(
-                smiles_list, context=context.context_features[model_name], return_tensor=ret
-            )
-            t_smiles += time.time() - t0
-
-            t0 = time.time()
+        for model_name in tqdm(
+            list(self._iter_model_names(allowed_tasks)), desc="Predicting", disable=not verbose
+        ):
+            model, dm = self._get_model_and_dm(model_name)
             try:
-                model_batch_preds[model_name] = self._infer_and_denormalize(model_name, feat_arg)
-            except Exception as e:
-                msg = str(e)
-                if 'feature_names mismatch' in msg:
-                    msg = "feature_names mismatch (training/inference encoding incompatible)"
-                raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
-            t_infer += time.time() - t0
+                ret = 'xgb' if self.model_types[model_name] == 'xgboost' else 'pt'
+
+                t0 = time.time()
+                feat_arg = dm.transform(
+                    smiles_list, context=context.context_features[model_name], return_tensor=ret
+                )
+                t_smiles += time.time() - t0
+
+                t0 = time.time()
+                try:
+                    model_batch_preds[model_name] = self._infer_and_denormalize(
+                        model_name, feat_arg, model=model, dm=dm
+                    )
+                except Exception as e:
+                    msg = str(e)
+                    if 'feature_names mismatch' in msg:
+                        msg = "feature_names mismatch (training/inference encoding incompatible)"
+                    raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
+                t_infer += time.time() - t0
+            finally:
+                self._free_if_lazy(model, dm)
 
         timings.update(smiles_featurize=t_smiles, inference=t_infer)
 
@@ -1144,56 +1293,68 @@ class EnsemblePredictor:
         xgb_feature_names: Dict[str, List[str]] = {}
         source_context: Dict[str, Any] = {}
 
-        for model_name, datamodule in self.datamodules.items():
-            if getattr(datamodule, 'use_tokenizer', False):
-                raise ValueError(
-                    f"Model '{model_name}' uses a tokenizer; use predict() directly instead of "
-                    "transform_context + predict(context=...)."
+        for model_name in self._iter_model_names():
+            dm = self._get_dm(model_name)
+            try:
+                if getattr(dm, 'use_tokenizer', False):
+                    raise ValueError(
+                        f"Model '{model_name}' uses a tokenizer; use predict() directly instead of "
+                        "transform_context + predict(context=...)."
+                    )
+
+                filled, missing = self._validate_and_fill_defaults(
+                    context_dict, dm, verbose=False,
                 )
+                missing = [c for c in missing if c != dm.smiles_col]
+                if missing:
+                    raise ValueError(
+                        f"Model '{model_name}' is missing required context field(s): "
+                        f"{', '.join(missing)}."
+                    )
+                if verbose:
+                    print(f"  Preprocessed context for model '{model_name}'")
 
-            filled, missing = self._validate_and_fill_defaults(
-                context_dict, datamodule, verbose=False,
-            )
-            missing = [c for c in missing if c != datamodule.smiles_col]
-            if missing:
-                raise ValueError(
-                    f"Model '{model_name}' is missing required context field(s): "
-                    f"{', '.join(missing)}."
-                )
-            if verbose:
-                print(f"  Preprocessed context for model '{model_name}'")
+                # Use dm.transform() — the same engine as predict — so that the
+                # same numeric_pipeline (properly pickled) handles treatment time.
+                # Supply a dummy SMILES so the molecular sub-pipeline runs
+                # without errors; those features are stripped immediately after.
+                dummy = dict(filled)
+                dummy[dm.smiles_col] = dummy.get(dm.smiles_col) or 'C'
+                all_feats = dm.transform([dummy], return_tensor='dict')  # {key: (1, dim)}
+                ctx_feats = {k: v[0] for k, v in all_feats.items()
+                             if not k.startswith(SMILES_FEATURE_PREFIXES)}
+                context_features[model_name] = ctx_feats
 
-            ctx_feats = datamodule.transform_context(filled)
-            context_features[model_name] = ctx_feats
+                if self.model_types[model_name] == 'xgboost':
+                    layout = dm.get_feature_layout()
+                    total_dim = sum(width for _, _, width in layout)
+                    template = np.zeros((1, total_dim), dtype=np.float32)
 
-            if self.model_types[model_name] == 'xgboost':
-                layout = datamodule.get_feature_layout()
-                total_dim = sum(width for _, _, width in layout)
-                template = np.zeros((1, total_dim), dtype=np.float32)
+                    for key, offset, width in layout:
+                        if key.startswith(SMILES_FEATURE_PREFIXES):
+                            continue
+                        if key not in ctx_feats:
+                            raise ValueError(
+                                f"Model '{model_name}' expects context feature '{key}' "
+                                "in its XGBoost layout, but the datamodule did not produce it."
+                            )
+                        val = np.asarray(ctx_feats[key], dtype=np.float32).flatten()
+                        if val.shape[0] != width:
+                            raise ValueError(
+                                f"Context feature '{key}' for model '{model_name}' has width "
+                                f"{val.shape[0]} but layout expects {width}."
+                            )
+                        template[0, offset:offset + width] = val
 
-                for key, offset, width in layout:
-                    if key.startswith(SMILES_FEATURE_PREFIXES):
-                        continue
-                    if key not in ctx_feats:
-                        raise ValueError(
-                            f"Model '{model_name}' expects context feature '{key}' "
-                            "in its XGBoost layout, but the datamodule did not produce it."
-                        )
-                    val = np.asarray(ctx_feats[key], dtype=np.float32).flatten()
-                    if val.shape[0] != width:
-                        raise ValueError(
-                            f"Context feature '{key}' for model '{model_name}' has width "
-                            f"{val.shape[0]} but layout expects {width}."
-                        )
-                    template[0, offset:offset + width] = val
+                    xgb_layouts[model_name] = layout
+                    xgb_total_dims[model_name] = total_dim
+                    xgb_row_template[model_name] = template
+                    xgb_feature_names[model_name] = dm.get_xgboost_feature_names()
 
-                xgb_layouts[model_name] = layout
-                xgb_total_dims[model_name] = total_dim
-                xgb_row_template[model_name] = template
-                xgb_feature_names[model_name] = datamodule.get_xgboost_feature_names()
-
-            if not source_context:
-                source_context = dict(filled)
+                if not source_context:
+                    source_context = dict(filled)
+            finally:
+                self._free_if_lazy(dm)
 
         return PreprocessedContext(
             context_features=context_features,
@@ -1287,19 +1448,22 @@ class EnsemblePredictor:
         return {col: sorted(vals) for col, vals in merged.items()}
 
     def get_model_info(self) -> Dict[str, Any]:
+        names = list(self._model_paths if self._lazy else self.models)
         return {
-            'n_models': len(self.models),
-            'model_names': list(self.models.keys()),
+            'n_models': len(names),
+            'model_names': names,
             'model_types': self.model_types,
             'model_tasks': self.model_tasks,
             'weights': self.weights,
             'available_tasks': self.available_tasks,
             'device': self.device,
-            'categorical_choices': self.get_categorical_choices(),
+            'categorical_choices': {} if self._lazy else self.get_categorical_choices(),
         }
 
     def __repr__(self) -> str:
+        n = len(self._model_paths if self._lazy else self.models)
+        mode = 'lazy' if self._lazy else 'eager'
         return (
-            f"EnsemblePredictor(n_models={len(self.models)}, "
-            f"tasks={self.available_tasks}, device='{self.device}')"
+            f"EnsemblePredictor(n_models={n}, "
+            f"tasks={self.available_tasks}, device='{self.device}', mode='{mode}')"
         )

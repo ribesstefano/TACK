@@ -6,6 +6,10 @@ import warnings
 from pathlib import Path
 from typing import Iterable, List, Optional, Union, Any, Dict, Literal, Tuple
 
+# xgboost must be imported before torch to avoid an OpenMP runtime conflict on
+# macOS: torch's libtorch sets up Intel OpenMP (libiomp5), and if xgb.Booster()
+# is first called afterwards it initialises a second OpenMP runtime → SIGSEGV.
+import xgboost as xgb
 import torch
 import sklearn.compose._column_transformer as _sklearn_ct
 if not hasattr(_sklearn_ct, '_RemainderColsList'):
@@ -19,7 +23,6 @@ if not hasattr(_sklearn_ct, '_RemainderColsList'):
 import pandas as pd
 from tqdm import tqdm
 import numpy as np
-import xgboost as xgb
 import pytorch_lightning as pl
 from torch.utils.data import DataLoader
 from datasets import load_dataset, concatenate_datasets, Dataset, DatasetDict
@@ -1075,11 +1078,38 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             for i, smi in enumerate(smiles_list):
                 desc_matrix[i] = desc_all[smi]
 
-            mol_num_df = pd.DataFrame({
-                f'Descriptor_{name}': desc_matrix[:, j]
-                for j, name in enumerate(desc_names)
-            })
-            mol_num_results = self.mol_numeric_pipeline.transform(mol_num_df)
+            # Fast path: read StandardScaler params directly from transformers_ to
+            # avoid ColumnTransformer.transform() which requires private sklearn
+            # attrs (_columns, _remainder) absent on legacy-reconstructed pipelines.
+            _used_fast = False
+            if hasattr(self.mol_numeric_pipeline, 'transformers_'):
+                try:
+                    _col_to_idx = {f'Descriptor_{name}': idx for idx, name in enumerate(desc_names)}
+                    _means = np.zeros(len(desc_names), dtype=np.float64)
+                    _scales = np.ones(len(desc_names), dtype=np.float64)
+                    _found = 0
+                    for _tname, _t, _cols in self.mol_numeric_pipeline.transformers_:
+                        if _tname == 'remainder' or not _cols:
+                            continue
+                        _idx = _col_to_idx.get(_cols[0])
+                        if _idx is None or not isinstance(_t, StandardScaler):
+                            raise TypeError("Unexpected mol_numeric_pipeline layout")
+                        _means[_idx] = float(np.ravel(_t.mean_)[0]) if hasattr(_t, 'mean_') else 0.0
+                        _s = float(np.ravel(_t.scale_)[0]) if hasattr(_t, 'scale_') else 1.0
+                        _scales[_idx] = _s if _s != 0.0 else 1.0
+                        _found += 1
+                    if _found == len(desc_names):
+                        mol_num_results = ((desc_matrix.astype(np.float64) - _means) / _scales).astype(np.float32, copy=False)
+                        _used_fast = True
+                except Exception:
+                    pass
+
+            if not _used_fast:
+                mol_num_df = pd.DataFrame({
+                    f'Descriptor_{name}': desc_matrix[:, j]
+                    for j, name in enumerate(desc_names)
+                })
+                mol_num_results = self.mol_numeric_pipeline.transform(mol_num_df)
 
         results: List[Dict[str, np.ndarray]] = []
         for i, smi in enumerate(smiles_list):
@@ -2406,6 +2436,22 @@ class DegradationComplexDataModule(pl.LightningDataModule):
 
         return state
     
+    @staticmethod
+    def _heal_column_transformer(ct: Any) -> Any:
+        """Back-populate private attributes on a ColumnTransformer loaded from an old pickle.
+
+        Older sklearn versions used ``sparse_threshold`` instead of the fitted
+        ``sparse_output_`` attribute that newer versions expect during transform.
+        """
+        if ct is None:
+            return ct
+        if not hasattr(ct, 'sparse_output_'):
+            if hasattr(ct, 'sparse_threshold'):
+                ct.sparse_output_ = ct.sparse_threshold < 1.0
+            else:
+                ct.sparse_output_ = False
+        return ct
+
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         """Load state dict to restore encoders and configuration.
         
@@ -2419,20 +2465,28 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         
         if 'category_pipeline' in state_dict:
             self.categorical_cols = state_dict.get('categorical_cols', [])
-            self.category_pipeline = pickle.loads(state_dict['category_pipeline'])
+            self.category_pipeline = self._heal_column_transformer(
+                pickle.loads(state_dict['category_pipeline'])
+            )
 
         if 'numeric_pipeline' in state_dict:
             self.numerical_cols = state_dict.get('numerical_cols', [])
-            self.numeric_pipeline = pickle.loads(state_dict['numeric_pipeline'])
+            self.numeric_pipeline = self._heal_column_transformer(
+                pickle.loads(state_dict['numeric_pipeline'])
+            )
 
         version = state_dict.get('state_dict_version', 1)
         if version >= 2:
             if 'context_numeric_pipeline' in state_dict:
                 self.context_numerical_cols = state_dict.get('context_numerical_cols', [])
-                self.context_numeric_pipeline = pickle.loads(state_dict['context_numeric_pipeline'])
+                self.context_numeric_pipeline = self._heal_column_transformer(
+                    pickle.loads(state_dict['context_numeric_pipeline'])
+                )
             if 'mol_numeric_pipeline' in state_dict:
                 self.mol_numerical_cols = state_dict.get('mol_numerical_cols', [])
-                self.mol_numeric_pipeline = pickle.loads(state_dict['mol_numeric_pipeline'])
+                self.mol_numeric_pipeline = self._heal_column_transformer(
+                    pickle.loads(state_dict['mol_numeric_pipeline'])
+                )
         elif 'numeric_pipeline' in state_dict:
             # Legacy state dict (version 1): reconstruct split pipelines from the
             # fitted combined pipeline without refitting.
@@ -2498,6 +2552,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 transformers=context_transformers, remainder='drop', sparse_threshold=0,
             )
             self.context_numeric_pipeline.transformers_ = context_transformers
+            self._heal_column_transformer(self.context_numeric_pipeline)
         else:
             self.context_numeric_pipeline = None
 
@@ -2506,6 +2561,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
                 transformers=mol_transformers, remainder='drop', sparse_threshold=0,
             )
             self.mol_numeric_pipeline.transformers_ = mol_transformers
+            self._heal_column_transformer(self.mol_numeric_pipeline)
         else:
             self.mol_numeric_pipeline = None
 
