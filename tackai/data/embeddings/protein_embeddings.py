@@ -174,7 +174,7 @@ class ProteinEmbedding(EmbeddingMixin):
             seq_ids = data[self.sequence_id_key]
             embs = data[self.embeddings_key]
         else:
-            logging.warning(
+            logging.debug(
                 f"Keys '{self.sequence_id_key}' and/or '{self.embeddings_key}' not found in npz file. "
                 "Assuming dictionary structure with sequence ids as keys and embeddings as values."
             )

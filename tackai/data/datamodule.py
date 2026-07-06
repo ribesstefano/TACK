@@ -650,7 +650,8 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             # Fit cell description embedding
             if self.cell_features == "description" and self.cell_description_embedding is not None:
                 self.logger.debug(f"Fitting cell description embedding on {len(cell_lines)} cell lines: {cell_lines[:5]}...")
-                self.cell_description_embedding.transform(cell_lines, update_cache=True)
+                is_cell_emb_empty = not bool(self.cell_description_embedding.embeddings)
+                self.cell_description_embedding.transform(cell_lines, update_cache=is_cell_emb_empty)
                 self.logger.debug("Cell description embedding fitted on training data")
             
             # Fit categorical and numeric pipelines

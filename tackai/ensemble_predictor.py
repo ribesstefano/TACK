@@ -892,7 +892,7 @@ class EnsemblePredictor:
             n = next(iter(feat_list.values())).shape[0]
             model.eval()
             with torch.no_grad():
-                output = model({k: v.to(self.device) for k, v in feat_list.items()})
+                output = model.predict_step({k: v.to(self.device) for k, v in feat_list.items()})
             return _extract_output(output, n)
 
         # Legacy path: list of per-sample feature dicts
@@ -918,7 +918,7 @@ class EnsemblePredictor:
                         t = torch.tensor(np.array(v), dtype=torch.float32)
                     tensors.append(t)
                 batch[k] = torch.stack(tensors, dim=0).to(self.device)
-            output = model(batch)
+            output = model.predict_step(batch)
 
         preds_valid = _extract_output(output, len(valid_feats))
         result = np.full((n, preds_valid.shape[1]), np.nan, dtype=np.float64)
