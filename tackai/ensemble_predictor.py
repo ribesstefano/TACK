@@ -713,7 +713,10 @@ class EnsemblePredictor:
             if not is_needed_fn():
                 continue
             current_val = filled.get(dm_col)
-            is_missing = current_val is None or (isinstance(current_val, str) and not current_val.strip())
+            is_missing = (
+                (isinstance(current_val, str) and not current_val.strip())
+                or (not isinstance(current_val, str) and pd.isna(current_val))
+            )
             if not is_missing:
                 continue
             if dm_col in required_cols:
