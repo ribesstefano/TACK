@@ -188,4 +188,12 @@ logs/
 /data/
 tackai_ensemble*/
 TPD-html-files.zip
+cache.zip
+ensembles.zip
+embeddings.npz
+setup_env.sh
 
+# Custom directories
+boltz_*
+cache/
+ensembles/

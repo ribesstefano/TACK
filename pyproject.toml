@@ -102,5 +102,6 @@ testpaths = ["test"]
 [dependency-groups]
 dev = [
     "huggingface-hub>=1.13.0",
+    "ipykernel>=7.2.0",
     "ipython>=9.13.0",
 ]
