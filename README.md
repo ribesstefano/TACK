@@ -146,6 +146,37 @@ set the default falls back to `~/.cache/tackai/`.
 
 See [this tutorial (TODO)](notebooks/README.md).
 
+### Load a pretrained ensemble from Hugging Face Hub
+
+As an alternative to the Zenodo archives above, pretrained ensembles and their
+cache assets are also published on the Hugging Face Hub:
+[`ailab-bio/TACK-ensembles`](https://huggingface.co/ailab-bio/TACK-ensembles)
+(one subfolder per task/strategy, e.g. `dmax_caruana`, `dc50_best_arch`) and
+[`ailab-bio/TACK-cache`](https://huggingface.co/datasets/ailab-bio/TACK-cache)
+(the shared cache assets). `EnsemblePredictor.from_pretrained` downloads and
+wires up both automatically — no manual unzip or `TACKAI_CACHE` setup needed:
+
+```python
+from tackai.ensemble_predictor import EnsemblePredictor
+
+predictor = EnsemblePredictor.from_pretrained(
+    "ailab-bio/TACK-ensembles", subfolder="dmax_caruana",
+)
+result = predictor.predict({"SMILES": "CCO", "POI_Name": "BRD4", ...})
+```
+
+Downloads use the standard Hugging Face cache and honor `HF_HOME` (see
+`.env.example`) the same way `datasets`/`transformers` do. `from_pretrained`
+also accepts a local directory (equivalent to the old `from_directory`), so
+the Zenodo-based workflow above still works unchanged — useful on clusters
+without outbound internet access from compute nodes.
+
+> [!NOTE]
+> Berzelius compute nodes may not have outbound internet access; if
+> `from_pretrained` can't reach the Hub from a compute node, download the
+> Zenodo archives (or run `from_pretrained` once from the login node to
+> populate the local HF cache) and use the local-directory workflow instead.
+
 ### What belongs in each archive
 
 The separation between **cache** and **models** is intentional:

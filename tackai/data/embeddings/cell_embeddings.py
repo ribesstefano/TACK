@@ -552,7 +552,7 @@ class CellEmbedding(EmbeddingMixin):
 
     def _encode_with_sentence_transformer(self, descriptions: List[str], original_keys: List[str]) -> Dict[str, np.ndarray]:
         """ Encode descriptions using sentence transformer model, keyed by original cell line IDs. """
-        model = self.model if self.model is not None else SentenceTransformer(self.pretrained_model)
+        model = self.model if self.model is not None else SentenceTransformer(self.pretrained_model, device=self.device)
 
         embeddings = model.encode(
             descriptions,

@@ -159,8 +159,15 @@ def predict(argv: Optional[List[str]] = None) -> None:
         prog="tack predict",
         description="Run ensemble inference on an input CSV (requires a SMILES column).",
     )
-    parser.add_argument("--checkpoints-dir", required=True,
-                        help="Directory with model checkpoints and datamodule states.")
+    model_source = parser.add_mutually_exclusive_group(required=True)
+    model_source.add_argument("--checkpoints-dir",
+                        help="Local directory with model checkpoints and datamodule states.")
+    model_source.add_argument("--repo-id",
+                        help="Hugging Face Hub repo id to load the ensemble from, "
+                             "e.g. ailab-bio/TACK-ensembles.")
+    parser.add_argument("--subfolder", default=None,
+                        help="Subfolder within --repo-id holding one ensemble's "
+                             "checkpoints, e.g. dmax_caruana. Ignored with --checkpoints-dir.")
     parser.add_argument("--input-csv", required=True,
                         help="Input CSV; must contain a SMILES column.")
     parser.add_argument("--output-csv", required=True,
@@ -205,9 +212,9 @@ def predict(argv: Optional[List[str]] = None) -> None:
         for key, candidates in _COLUMN_CANDIDATES.items()
     }
 
-    predictor = EnsemblePredictor.from_directory(
-        model_dir=args.checkpoints_dir,
-        datamodule_dir=args.checkpoints_dir,
+    predictor = EnsemblePredictor.from_pretrained(
+        args.checkpoints_dir if args.checkpoints_dir else args.repo_id,
+        subfolder=args.subfolder,
         weights_file=args.weights,
         device=args.device,
         n_jobs=args.n_jobs,

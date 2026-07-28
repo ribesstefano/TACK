@@ -24,10 +24,17 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+from tackai.config import load_config_from_yaml
 from tackai.data.datamodule import DegradationComplexDataModule, load_datamodule
 # TACKModel is imported lazily inside _load_lightning_model so that XGBoost-only
 # ensembles never trigger the PyTorch/OpenMP initialisation that conflicts with
 # XGBoost's own OpenMP runtime on macOS.
+
+# Default HF Hub repo holding the shared cache assets (Cellosaurus lookup
+# tables, cell/Morgan-FP embeddings, precomputed POI/ligase embeddings) that
+# from_pretrained() wires up via TACKAI_CACHE. See README's "Pre-trained
+# Models & Cache Files" section.
+DEFAULT_CACHE_REPO_ID = "ailab-bio/TACK-cache"
 
 warnings.filterwarnings('ignore')
 
@@ -196,12 +203,21 @@ class EnsemblePredictor:
     """Ensemble predictor that loads and combines predictions from multiple models.
 
     Supports XGBoost and PyTorch Lightning models with weighted averaging and
-    uncertainty quantification. Use :meth:`from_directory` to instantiate.
+    uncertainty quantification. Use :meth:`from_pretrained` to instantiate,
+    either from a local directory or a Hugging Face Hub repo id.
 
-    Example:
-        >>> predictor = EnsemblePredictor.from_directory(
-        ...     model_dir='ensembles/dmax',
-        ...     weights_file='ensemble_weights_dmax.json',
+    Example (local directory):
+        >>> predictor = EnsemblePredictor.from_pretrained(
+        ...     'outputs/tack2_dmax_scaffold/ensemble_caruana/checkpoints',
+        ...     weights_file='ensemble_weights_dmax_caruana_all_models.json',
+        ... )
+        >>> result = predictor.predict({
+        ...     'SMILES': 'CCO', 'POI_Name': 'BRD4', ...
+        ... })
+
+    Example (Hugging Face Hub):
+        >>> predictor = EnsemblePredictor.from_pretrained(
+        ...     'ailab-bio/TACK-ensembles', subfolder='dmax_caruana',
         ... )
         >>> result = predictor.predict({
         ...     'SMILES': 'CCO', 'POI_Name': 'BRD4', ...
@@ -277,7 +293,211 @@ class EnsemblePredictor:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_directory(
+    def from_pretrained(
+        cls,
+        model_id: Union[str, Path],
+        *,
+        subfolder: Optional[str] = None,
+        revision: Optional[str] = None,
+        cache_repo_id: Optional[str] = DEFAULT_CACHE_REPO_ID,
+        cache_revision: Optional[str] = None,
+        token: Optional[str] = None,
+        weights_file: Optional[Union[str, Path]] = None,
+        device: str = 'cpu',
+        n_jobs: Optional[int] = None,
+        pattern: Optional[str] = None,
+        hparam_overrides: Optional[Dict[str, Any]] = None,
+        lazy_loading: bool = True,
+    ) -> 'EnsemblePredictor':
+        """Load an ensemble from a local directory or a Hugging Face Hub repo.
+
+        If ``model_id`` is an existing local path, this behaves exactly like
+        the old ``from_directory`` (no network access). Otherwise ``model_id``
+        is treated as a HF Hub repo id: the checkpoints are downloaded via
+        :func:`huggingface_hub.snapshot_download` (respecting ``HF_HOME`` /
+        ``HF_HUB_CACHE`` like any other HF download), the shared cache assets
+        (``poi_embeddings_file`` / ``ligase_embeddings_file`` Boltz archives,
+        and — only if actually needed — the ~370 MB Cellosaurus lookup tables)
+        are downloaded from ``cache_repo_id``, and ``TACKAI_CACHE`` is pointed
+        at that download for the rest of the process — **overriding** any
+        ``TACKAI_CACHE`` already set (e.g. via ``.env``), since that value is
+        otherwise picked up first by ``load_dotenv()`` and would silently
+        shadow the freshly downloaded, known-complete snapshot. Pass
+        ``cache_repo_id=None`` to opt out and keep using your own
+        ``TACKAI_CACHE`` untouched.
+
+        Args:
+            model_id: Local directory, or a HF Hub repo id such as
+                ``'ailab-bio/TACK-ensembles'``.
+            subfolder: Subdirectory within the Hub repo holding one ensemble's
+                checkpoints (e.g. ``'dmax_caruana'``). Ignored for local paths
+                — pass the checkpoints directory directly instead.
+            revision: Hub revision (branch/tag/commit) for ``model_id``.
+            cache_repo_id: HF Hub dataset repo holding the shared cache assets
+                (precomputed POI/ligase embeddings, Cellosaurus tables, Morgan
+                fingerprint/cell-embedding caches). Defaults to
+                ``'ailab-bio/TACK-cache'``. When set (the default), any
+                existing ``TACKAI_CACHE`` is overridden to point at the
+                downloaded snapshot for the rest of the process. Pass
+                ``None`` to skip downloading cache assets entirely and leave
+                your own ``TACKAI_CACHE`` in charge (only safe if every
+                referenced precomputed-embedding file is already reachable
+                there).
+            cache_revision: Hub revision for ``cache_repo_id``.
+            token: HF Hub auth token, for private repos. Defaults to whatever
+                ``huggingface_hub`` resolves from the environment/CLI login.
+            weights_file: Optional JSON file with per-model weights. If not
+                given and ``model_id`` resolves to a Hub repo, a single
+                ``ensemble_weights_*.json`` found alongside the checkpoints is
+                used automatically.
+            device: Inference device (``'cpu'`` or ``'cuda'``).
+            n_jobs: XGBoost thread count (``None`` = all cores).
+            pattern: Optional regex to filter model file paths.
+            hparam_overrides: Optional hparam key/value pairs applied to every
+                datamodule before it is instantiated; caller-supplied values
+                win over anything this method infers (e.g. the resolved
+                ``poi_embeddings_file`` path). See :meth:`_from_local_directory`.
+            lazy_loading: If ``True`` (default), models/datamodules are loaded
+                one at a time during inference and freed immediately after.
+
+        Returns:
+            Initialized :class:`EnsemblePredictor`.
+        """
+        local_dir = Path(model_id)
+        if local_dir.exists():
+            return cls._from_local_directory(
+                local_dir,
+                weights_file=weights_file,
+                device=device,
+                n_jobs=n_jobs,
+                pattern=pattern,
+                hparam_overrides=hparam_overrides,
+                lazy_loading=lazy_loading,
+            )
+
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as e:
+            raise ImportError(
+                "huggingface_hub is required to load an EnsemblePredictor from "
+                "the Hugging Face Hub. Install it with `pip install huggingface_hub` "
+                "or pass a local directory to from_pretrained() instead."
+            ) from e
+
+        repo_id = str(model_id)
+        print(f"Downloading ensemble checkpoints from '{repo_id}'"
+              + (f" (subfolder={subfolder})" if subfolder else "") + " ...")
+        snapshot_root = Path(snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            token=token,
+            allow_patterns=[f"{subfolder}/**"] if subfolder else None,
+        ))
+        resolved_dir = snapshot_root / subfolder if subfolder else snapshot_root
+
+        # --- Auto-discover the weights file, if not given explicitly --------
+        if weights_file is None:
+            candidates = list(resolved_dir.glob('ensemble_weights_*.json'))
+            if len(candidates) == 1:
+                weights_file = candidates[0]
+                print(f"Auto-discovered weights file: {weights_file.name}")
+            elif len(candidates) > 1:
+                print(
+                    f"  Warning: {len(candidates)} ensemble_weights_*.json files found "
+                    f"under {resolved_dir}; pass weights_file= explicitly to disambiguate. "
+                    "Falling back to uniform per-task weights."
+                )
+
+        # --- Inspect hparams to know which cache assets are actually needed -
+        embeddings_basenames, needs_cellosaurus = cls._scan_hparams_for_cache_needs(resolved_dir)
+
+        resolved_overrides: Dict[str, Any] = {}
+        if cache_repo_id is not None and (embeddings_basenames or needs_cellosaurus):
+            cache_allow_patterns = [
+                'morgan_fp_*.npz', 'cell_embeddings_*.npz', 'rdkit_descriptors*.npz',
+            ] + [f'{name}' for name in embeddings_basenames]
+            if needs_cellosaurus:
+                cache_allow_patterns += ['cell2*.json', 'cellosaurus.txt']
+
+            print(f"Downloading shared cache assets from '{cache_repo_id}' ...")
+            cache_root = Path(snapshot_download(
+                repo_id=cache_repo_id,
+                repo_type='dataset',
+                revision=cache_revision,
+                token=token,
+                allow_patterns=cache_allow_patterns,
+            ))
+            # Override (not setdefault): TACKAI_CACHE is almost always already
+            # set via .env's load_dotenv() at import time, which would
+            # otherwise silently shadow this known-complete downloaded
+            # snapshot with a stale/incomplete local cache. Opt out via
+            # cache_repo_id=None to keep an existing TACKAI_CACHE untouched.
+            prev_cache = os.environ.get('TACKAI_CACHE')
+            if prev_cache and prev_cache != str(cache_root):
+                print(f"  Overriding TACKAI_CACHE ({prev_cache} -> {cache_root}) "
+                      "for this from_pretrained() session.")
+            os.environ['TACKAI_CACHE'] = str(cache_root)
+
+            for name in embeddings_basenames:
+                candidate = cache_root / name
+                if candidate.exists():
+                    resolved_overrides['poi_embeddings_file'] = str(candidate)
+                    resolved_overrides['ligase_embeddings_file'] = str(candidate)
+
+        if hparam_overrides:
+            resolved_overrides.update(hparam_overrides)
+
+        return cls._from_local_directory(
+            resolved_dir,
+            weights_file=weights_file,
+            device=device,
+            n_jobs=n_jobs,
+            pattern=pattern,
+            hparam_overrides=resolved_overrides or None,
+            lazy_loading=lazy_loading,
+        )
+
+    @staticmethod
+    def _scan_hparams_for_cache_needs(model_dir: Path) -> Tuple[List[str], bool]:
+        """Cheaply scan every ``*_hparams.yaml`` under *model_dir* (no torch/
+        datamodule construction) to find which cache assets from_pretrained()
+        needs to fetch: the basenames of any referenced precomputed
+        ``poi_embeddings_file`` / ``ligase_embeddings_file``, and whether any
+        datamodule uses ``cell_features: description`` (which requires the
+        large Cellosaurus lookup tables).
+        """
+        embeddings_basenames: set = set()
+        needs_cellosaurus = False
+        for yaml_path in model_dir.glob('**/*_hparams.yaml'):
+            try:
+                hparams = load_config_from_yaml(yaml_path)
+            except Exception:
+                continue
+            for key in ('poi_embeddings_file', 'ligase_embeddings_file'):
+                value = hparams.get(key)
+                if value:
+                    embeddings_basenames.add(Path(value).name)
+            if hparams.get('cell_features') == 'description':
+                needs_cellosaurus = True
+        return sorted(embeddings_basenames), needs_cellosaurus
+
+    @classmethod
+    def from_directory(cls, model_dir: Union[str, Path], **kwargs) -> 'EnsemblePredictor':
+        """Deprecated alias for :meth:`from_pretrained`.
+
+        Kept for backwards compatibility with existing callers. New code
+        should call :meth:`from_pretrained` directly — it accepts both local
+        directories and Hugging Face Hub repo ids.
+        """
+        warnings.warn(
+            "EnsemblePredictor.from_directory is deprecated; use from_pretrained "
+            "instead (it accepts both local directories and HF Hub repo ids).",
+            DeprecationWarning, stacklevel=2,
+        )
+        return cls.from_pretrained(model_dir, **kwargs)
+
+    @classmethod
+    def _from_local_directory(
         cls,
         model_dir: Union[str, Path],
         weights_file: Optional[Union[str, Path]] = None,
@@ -287,7 +507,11 @@ class EnsemblePredictor:
         hparam_overrides: Optional[Dict[str, Any]] = None,
         lazy_loading: bool = True,
     ) -> 'EnsemblePredictor':
-        """Load ensemble from a directory containing models and datamodules.
+        """Load ensemble from a local directory containing models and datamodules.
+
+        This is the shared implementation behind :meth:`from_pretrained` (once
+        it has resolved a HF Hub repo id to a local snapshot directory) and the
+        deprecated :meth:`from_directory` alias.
 
         Args:
             model_dir: Directory containing model files and paired datamodule
@@ -302,7 +526,7 @@ class EnsemblePredictor:
                 datamodule before it is instantiated. Useful for fixing stale
                 paths stored in old checkpoints, e.g.::
 
-                    EnsemblePredictor.from_directory(
+                    EnsemblePredictor.from_pretrained(
                         'ensembles/dc50',
                         hparam_overrides={
                             'poi_embeddings_file': '/new/embeddings.npz',
