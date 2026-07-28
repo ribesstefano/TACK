@@ -1,38 +1,41 @@
 # Molecule
-use_fingerprints: true
-use_descriptors: true
-use_relevant_descriptors: false
-# Cell Line
-use_cell_description_embedding: true
-cell_line_col: "Cell_Line_ID"
-# Proteins
-use_poi_precomputed_embedding: true
-use_ligase_precomputed_embedding: true
-poi_embeddings_file: "/cephyr/users/ribes/Alvis/mimer/stefano/TACK/data/tack/embeddings.npz"
-ligase_embeddings_file: "/cephyr/users/ribes/Alvis/mimer/stefano/TACK/data/tack/embeddings.npz"
-poi_embeddings_per_residue: false
-ligase_embeddings_per_residue: false
-use_poi_pca: true
-use_ligase_pca: true
-# NOTE: The following values were determined in the notebook 'get_pca_dim_for_esm-s_embeddings.ipynb'
-# We must use these exact values to have a consistent fitted dimension.
-# Otherwise, when using N% variance, we might end up with different dimensions
-# for each sample to process.
-poi_pca_n_components: 44
-ligase_pca_n_components: 6
-# Assay
-use_assay_type_encoding: true
-use_treatment_time: true
-# Labels
-normalize_labels: true
-impute_labels: true
+mol_features: "fingerprint+descriptors"
 fp_size: 512
 radius: 16
-categorical_encoding: minmax
-poi_embeddings_format: npz
-poi_residue_pooling: sum
-poi_embeddings_id_type: sequence
-ligase_embeddings_format: npz
-ligase_residue_pooling: sum
-ligase_embeddings_id_type: sequence
+use_relevant_descriptors: false
+
+# POI (target protein)
+poi_features: "precomputed"
+poi_embeddings_file: "/cephyr/users/ribes/Alvis/mimer/stefano/TACK/data/tack/embeddings.npz"
+poi_embeddings_format: "npz"
+poi_embeddings_per_residue: false
+poi_residue_pooling: "sum"
+poi_embeddings_id_type: "sequence"
+use_poi_pca: true
+poi_pca_n_components: 44
+
+# E3 ligase (recruiter)
+ligase_features: "precomputed"
+ligase_embeddings_file: "/cephyr/users/ribes/Alvis/mimer/stefano/TACK/data/tack/embeddings.npz"
+ligase_embeddings_format: "npz"
+ligase_embeddings_per_residue: false
+ligase_residue_pooling: "sum"
+ligase_embeddings_id_type: "sequence"
+use_ligase_pca: true
+ligase_pca_n_components: 6
+
+# Cell line
+cell_features: "description"
+cell_line_col: "Cell_Line_ID"
+
+# Assay context
+use_assay_type_encoding: true
+use_treatment_time: true
+
+# Categorical encoding
+categorical_encoding: "minmax"
+
+# Labels
+normalize_labels: true
 standardize_labels: false
+impute_labels: true

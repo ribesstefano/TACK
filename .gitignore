@@ -189,3 +189,10 @@ logs/
 tackai_ensemble*/
 TPD-html-files.zip
 
+boltz_*
+outputs/
+cache/
+embeddings/
+ensembles/
+**/*.npz
+**/*.zip

@@ -1,6 +1,7 @@
 # Molecule
-use_fingerprints: true
-use_descriptors: true
+mol_features: "fingerprint+descriptors"
+fp_size: 512
+radius: 16
 use_relevant_descriptors: false
 selected_descriptors:
   - MolWt
@@ -8,41 +9,42 @@ selected_descriptors:
   - MolLogP
   - HeavyAtomCount
   - RingCount
-  - NumHAcceptors             
+  - NumHAcceptors
   - NumHDonors
   - NumRotatableBonds
   - TPSA
-# Cell Line
-use_cell_description_embedding: false
-cell_line_col: "Cell_Line_ID"
-# Proteins
-use_poi_precomputed_embedding: true
-use_ligase_precomputed_embedding: true
+
+# POI (target protein)
+poi_features: "precomputed"
 poi_embeddings_file: "/cephyr/users/ribes/Alvis/mimer/stefano/TACK/data/tack/embeddings.npz"
-ligase_embeddings_file: "/cephyr/users/ribes/Alvis/mimer/stefano/TACK/data/tack/embeddings.npz"
+poi_embeddings_format: "npz"
 poi_embeddings_per_residue: false
-ligase_embeddings_per_residue: false
+poi_residue_pooling: "sum"
+poi_embeddings_id_type: "sequence"
 use_poi_pca: false
-use_ligase_pca: false
-# NOTE: The following values were determined in the notebook 'get_pca_dim_for_esm-s_embeddings.ipynb'
-# We must use these exact values to have a consistent fitted dimension.
-# Otherwise, when using N% variance, we might end up with different dimensions
-# for each sample to process.
 poi_pca_n_components: 44
+
+# E3 ligase (recruiter)
+ligase_features: "precomputed"
+ligase_embeddings_file: "/cephyr/users/ribes/Alvis/mimer/stefano/TACK/data/tack/embeddings.npz"
+ligase_embeddings_format: "npz"
+ligase_embeddings_per_residue: false
+ligase_residue_pooling: "sum"
+ligase_embeddings_id_type: "sequence"
+use_ligase_pca: false
 ligase_pca_n_components: 7
-# Assay
+
+# Cell line
+cell_line_col: "Cell_Line_ID"
+
+# Assay context
 use_assay_type_encoding: false
 use_treatment_time: false
+
+# Categorical encoding
+categorical_encoding: "minmax"
+
 # Labels
 normalize_labels: true
 standardize_labels: false
 impute_labels: true
-fp_size: 512
-radius: 16
-categorical_encoding: minmax
-poi_embeddings_format: npz
-poi_residue_pooling: sum
-poi_embeddings_id_type: sequence
-ligase_embeddings_format: npz
-ligase_residue_pooling: sum
-ligase_embeddings_id_type: sequence

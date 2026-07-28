@@ -1,16 +1,27 @@
-categorical_encoding: embedding
-cell_line_col: Cell_Line_ID
-impute_labels: false
-normalize_labels: false
-standardize_labels: false
-use_assay_type_encoding: true
-use_cell_description_embedding: true
-use_cell_name_embedding: false
-use_descriptors: true
-use_fingerprints: true
-use_ligase_name_embedding: true
-use_poi_sequence_embedding: true
-use_relevant_descriptors: false
-use_treatment_time: true
+# Molecule
+mol_features: "fingerprint+descriptors"
 fp_size: 512
 radius: 16
+use_relevant_descriptors: false
+
+# POI (target protein)
+poi_features: "sequence"
+
+# E3 ligase (recruiter)
+ligase_features: "name"
+
+# Cell line
+cell_features: "description"
+cell_line_col: "Cell_Line_ID"
+
+# Assay context
+use_assay_type_encoding: true
+use_treatment_time: true
+
+# Categorical encoding
+categorical_encoding: "embedding"
+
+# Labels
+normalize_labels: false
+standardize_labels: false
+impute_labels: false

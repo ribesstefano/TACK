@@ -1,10 +1,14 @@
-use_tokenizer: True
-tokenizer_name: 'google-bert/bert-base-cased'
-cell_line_col: 'Cell_Line'
-batch_size: 32
+# Cell line
+cell_line_col: "Cell_Line"
+
 # Labels
 normalize_labels: false
 standardize_labels: true
 impute_labels: true
+
+# Other
+use_tokenizer: true
+tokenizer_name: "google-bert/bert-base-cased"
+batch_size: 32
 max_length: 512
 is_bert_multitask: false

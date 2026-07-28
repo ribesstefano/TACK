@@ -1,17 +1,25 @@
 # Molecule
-use_descriptors: true
+mol_features: "descriptors"
 use_relevant_descriptors: false
-# Proteins
-use_poi_name_embedding: true
-use_ligase_name_embedding: true
-# Cell Line
-use_cell_name_embedding: true
+
+# POI (target protein)
+poi_features: "name"
+
+# E3 ligase (recruiter)
+ligase_features: "name"
+
+# Cell line
+cell_features: "name"
 cell_line_col: "Cell_Line_ID"
-# Assay
+
+# Assay context
 use_assay_type_encoding: true
 use_treatment_time: true
+
+# Categorical encoding
+categorical_encoding: "minmax"
+
 # Labels
 normalize_labels: true
 standardize_labels: false
 impute_labels: true
-categorical_encoding: minmax

@@ -29,8 +29,17 @@ tune_hyperparameters: true
 # Number of tuning trials; null -> 20 (xgboost) / 100 (mlp, bert)
 n_tuning_trials: null
 
-# Optional CSV overriding the default TACK dataset (same columns required)
+# Optional CSV overriding the default TACK dataset. Regression labels may be a
+# generic 'Value' column or native 'Dmax'/'DC50' columns (as in TACK2.0).
 custom_dataset_csv: null
+
+# On-the-fly held-out isolation, applied only when the dataset lacks a
+# 'SMILES_Held_Out' column (e.g. a raw TACK2.0 CSV). A diverse subset is picked
+# with the RDKit MaxMin algorithm; the seed is fixed and independent of `seed`
+# so the held-out set is identical across every model/feature-set experiment.
+# The per-`group` cluster column is likewise derived when absent.
+held_out_frac: 0.10
+held_out_seed: 42
 
 hydra:
   job:
