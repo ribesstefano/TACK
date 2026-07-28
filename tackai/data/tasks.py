@@ -12,8 +12,39 @@ import pandas as pd
 from datasets import Dataset, load_dataset
 
 from tackai import DegradationComplexDataModule
+from tackai.data.ids import assign_dataset_ids
+from tackai.training.splitting import assign_group_column, assign_held_out_column
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_label_column(ds: Dataset, source: str, target: str) -> Dataset:
+    """Ensure ``ds`` exposes a ``target`` label column.
+
+    The published TACK dataset stores regression labels under a generic
+    ``Value`` column that is renamed per task, whereas a raw dataset such as
+    TACK2.0 already carries the task-named columns (``Dmax`` / ``DC50``). This
+    renames ``source`` to ``target`` only when needed, so both layouts work.
+
+    Args:
+        ds: Dataset to inspect.
+        source: Generic column name to rename from (e.g. ``Value``).
+        target: Task-specific label column expected downstream (e.g. ``Dmax``).
+
+    Returns:
+        The dataset with a ``target`` column.
+
+    Raises:
+        ValueError: If neither ``source`` nor ``target`` is present.
+    """
+    if target in ds.column_names:
+        return ds
+    if source in ds.column_names:
+        return ds.rename_column(source, target)
+    raise ValueError(
+        f"Dataset must contain a '{target}' or '{source}' column; "
+        f"found columns: {ds.column_names}"
+    )
 
 
 def get_bin_label(
@@ -52,9 +83,11 @@ def get_bin_label(
 
 def map_bin_labels(example: Dict[str, Any]) -> Dict[str, Any]:
     """ Map binary activity labels to the example based on Dmax and DC50 values. """
+    # Prefer the multitask 'Value_*' columns (published TACK) but fall back to
+    # the native 'Dmax'/'DC50' columns of a raw dataset such as TACK2.0.
     row = {
-        'Dmax': example.get('Value_Dmax', np.nan),
-        'DC50': example.get('Value_DC50', np.nan),
+        'Dmax': example.get('Value_Dmax', example.get('Dmax', np.nan)),
+        'DC50': example.get('Value_DC50', example.get('DC50', np.nan)),
     }
     example['Activity'] = get_bin_label(row)
     return example
@@ -113,12 +146,24 @@ def load_task_dataset(
     task: str,
     model_type: str,
     custom_dataset_csv: Optional[str] = None,
+    group: str = 'random',
+    smiles_col: str = 'SMILES',
+    held_out_frac: float = 0.10,
+    held_out_seed: int = 42,
 ) -> Tuple[Dataset, Dataset, List[str]]:
     """ Load and prepare the dataset for a given task.
 
     Loads either a custom CSV or the published TACK dataset, applies the
     task-specific label processing (column renames, binary labelling, Dmax
-    clipping), and splits off the held-out set.
+    clipping), isolates the held-out set, and derives the CV grouping column.
+
+    When the dataset lacks the split columns of the published TACK dataset
+    (``SMILES_Held_Out`` and the per-``group`` cluster column) — as a raw
+    TACK2.0 CSV does — they are computed on the fly from the SMILES structures
+    (see :mod:`tackai.training.splitting`): the held-out set is isolated first
+    with a MaxMin diverse pick, then the remaining train/validation rows are
+    clustered for the requested ``group``. Datasets that already carry these
+    columns are left untouched.
 
     Args:
         task: Task to train on ('dmax', 'dc50', 'bin', 'dmax_bin', 'dc50_bin',
@@ -126,7 +171,15 @@ def load_task_dataset(
         model_type: Model type ('mlp', 'bert', 'xgboost'); affects dataset
             configuration selection and multitask handling.
         custom_dataset_csv: Optional path to a CSV that overrides the default
-            TACK dataset (must contain the same columns).
+            TACK dataset. Regression labels may be provided either as a generic
+            ``Value`` column or as native ``Dmax`` / ``DC50`` columns.
+        group: CV grouping strategy ('random', 'scaffold', 'butina'); selects
+            which cluster column to derive when it is absent.
+        smiles_col: Name of the SMILES column used for on-the-fly splitting.
+        held_out_frac: Fraction of unique compounds held out by the MaxMin pick
+            (only used when ``SMILES_Held_Out`` is absent).
+        held_out_seed: Fixed seed for the MaxMin held-out pick, kept independent
+            of the model seed so the held-out set is identical across runs.
 
     Returns:
         Tuple of (train/validation dataset, held-out dataset, label names).
@@ -149,30 +202,35 @@ def load_task_dataset(
     # Process dataset labels based on task
     labels = ['Value']
     if task == 'dmax':
-        ds = ds.rename_column('Value', 'Dmax')
+        ds = _ensure_label_column(ds, 'Value', 'Dmax')
+        # Keep only rows that actually carry the target. The published 'Dmax'
+        # config is already pre-filtered, but a raw TACK2.0 CSV mixes rows that
+        # report only DC50 (null Dmax), which have no regression label.
+        ds = ds.filter(lambda x: pd.notna(x['Dmax']))
         labels = ['Dmax']
     elif task == 'dc50':
-        ds = ds.rename_column('Value', 'DC50')
+        ds = _ensure_label_column(ds, 'Value', 'DC50')
+        ds = ds.filter(lambda x: pd.notna(x['DC50']))
         labels = ['DC50']
     elif task == 'bin':
         ds = ds.map(map_bin_labels)
         ds = ds.filter(lambda x: pd.notna(x['Activity']))
         labels = ['Activity']
     elif task == 'dmax_bin':
-        ds = ds.rename_column('Value', 'Dmax')
+        ds = _ensure_label_column(ds, 'Value', 'Dmax')
         ds = ds.map(map_bin_dmax_labels)
         ds = ds.filter(lambda x: pd.notna(x['Activity']))
         labels = ['Activity']
     elif task == 'dc50_bin':
-        ds = ds.rename_column('Value', 'DC50')
+        ds = _ensure_label_column(ds, 'Value', 'DC50')
         ds = ds.map(map_bin_dc50_labels)
         ds = ds.filter(lambda x: pd.notna(x['Activity']))
         labels = ['Activity']
     elif task == 'multitask' and model_type != 'bert':
-        # Rename 'Value_Dmax' and 'Value_DC50' to 'Dmax' and 'DC50'
-        # NOTE: This is needed for better reporting when collecting metrics
-        ds = ds.rename_column('Value_Dmax', 'Dmax')
-        ds = ds.rename_column('Value_DC50', 'DC50')
+        # Rename 'Value_Dmax'/'Value_DC50' to 'Dmax'/'DC50' for metric reporting;
+        # a native TACK2.0 CSV already exposes these columns directly.
+        ds = _ensure_label_column(ds, 'Value_Dmax', 'Dmax')
+        ds = _ensure_label_column(ds, 'Value_DC50', 'DC50')
         labels = ['Dmax', 'DC50']
     elif task == 'multitask' and model_type == 'bert':
         raise ValueError(
@@ -181,20 +239,37 @@ def load_task_dataset(
             "'Value' column."
         )
 
-    # Clip 'Dmax' values to [0, 100]
+    df = ds.to_pandas()
+
+    # Attach the stable content-hash identifiers (context_id / row_id) before
+    # any splitting or label derivation so every fold and the held-out set carry
+    # the same ids. The hash is taken over the RAW readouts (see ids.py), so it
+    # must precede the Dmax clipping below — otherwise row_id would depend on the
+    # derived [0, 100] value and stop being reproducible from the source dataset.
+    df = assign_dataset_ids(df)
+
+    # Clip 'Dmax' values to [0, 100].
     # NOTE: There is no need to clip before calculating binary activity, since
     # an entry will be labeled in the same way regardless, as Dmax < 0 is always
     # below the 80% threshold, and Dmax > 100 is always above it. Clipping is
     # only needed for regression tasks to avoid outliers dominating the training.
+    # Null Dmax is valid in multitask (a row may report only DC50); clip() leaves
+    # NaN untouched, so clipping stays a regression-only concern.
     if 'Dmax' in labels:
-        def clip_dmax(example):
-            example['Dmax'] = np.clip(example['Dmax'], 0, 100)
-            return example
-        ds = ds.map(clip_dmax)
+        df['Dmax'] = df['Dmax'].clip(lower=0, upper=100)
 
-    # Split held-out set
-    df = ds.to_pandas()
+    # Isolate the held-out set first, then derive the CV grouping column. When
+    # the dataset already carries these columns (published TACK) the helpers are
+    # no-ops; for a raw TACK2.0 CSV they are computed on the fly from the SMILES
+    # structures. The grouping column is derived for BOTH splits so the fold
+    # DatasetDict has a consistent schema across train/validation and test.
+    df = assign_held_out_column(
+        df, smiles_col=smiles_col, frac=held_out_frac, seed=held_out_seed,
+    )
     df, held_out_df = split_held_out(df)
+    df = assign_group_column(df, group=group, smiles_col=smiles_col)
+    held_out_df = assign_group_column(held_out_df, group=group, smiles_col=smiles_col)
+
     ds = Dataset.from_pandas(df, preserve_index=False)
     held_out_ds = Dataset.from_pandas(held_out_df, preserve_index=False)
 

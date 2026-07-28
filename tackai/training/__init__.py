@@ -33,6 +33,16 @@ from tackai.training.persistence import (
     save_data_module,
     load_data_module_state,
     save_predictions,
+    collect_predictions,
+    combined_predictions_path,
+    fold_predictions_exist,
+)
+from tackai.training.splitting import (
+    assign_group_column,
+    assign_held_out_column,
+    bemis_murcko_clusters,
+    butina_clusters,
+    maxmin_held_out_mask,
 )
 
 # Suppress Optuna warnings
@@ -51,4 +61,12 @@ __all__ = [
     "save_data_module",
     "load_data_module_state",
     "save_predictions",
+    "collect_predictions",
+    "combined_predictions_path",
+    "fold_predictions_exist",
+    "assign_group_column",
+    "assign_held_out_column",
+    "bemis_murcko_clusters",
+    "butina_clusters",
+    "maxmin_held_out_mask",
 ]

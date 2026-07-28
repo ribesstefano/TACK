@@ -202,8 +202,8 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         cell_line_col: str = "Cell_Line_ID",
         assay_type_col: str = "Assay",
         treatment_time_col: str = "Assay_Time",
-        treatment_time_dmax_col: str = "Assay_Time",
-        treatment_time_dc50_col: str = "Assay_Time",
+        treatment_time_dmax_col: str = "Dmax_h",
+        treatment_time_dc50_col: str = "DC50_h",
         treatment_time_ic50_col: str = "Treatment Time (h) (Cellular activities, IC50)",
         labels: Optional[List[str]] = None,
         normalize_labels: bool = False,
@@ -616,7 +616,12 @@ class DegradationComplexDataModule(pl.LightningDataModule):
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             self.logger.debug(f"Initialized tokenizer: {self.tokenizer_name}")
-        
+
+        # Drop rows that cannot be featurized under this config (missing protein
+        # sequence or precomputed embedding) before any fitting or featurization,
+        # so a handful of unfeaturizable rows can't abort the whole run.
+        self._drop_unfeaturizable_protein_rows()
+
         # Fit encoders only if they haven't been fitted yet (e.g., not loaded from checkpoint)
         # and we have training data and we're in training stage
         if not self._encoders_fitted and "train" in self.dataset and (stage == "train" or stage is None):
@@ -2586,6 +2591,77 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         """
         if 'datamodule_state_dict' in checkpoint:
             self.load_state_dict(checkpoint['datamodule_state_dict'])
+
+    @staticmethod
+    def _value_present(value: Any) -> bool:
+        """Return True if a cell holds a usable (non-empty, non-NaN) value."""
+        if value is None:
+            return False
+        if isinstance(value, float) and np.isnan(value):
+            return False
+        if isinstance(value, str) and not value.strip():
+            return False
+        return True
+
+    def _protein_row_featurizable(self, example: Dict, protein_type: Literal['poi', 'ligase']) -> bool:
+        """Whether a row can be featurized for the given protein under this config.
+
+        A ``sequence`` feature needs a non-empty sequence string; a ``precomputed``
+        feature additionally needs its lookup id (sequence or UniProt) to be
+        present in the loaded embedding table. ``name`` / ``None`` features impose
+        no requirement and always pass.
+
+        Args:
+            example: Data sample.
+            protein_type: 'poi' or 'ligase'.
+
+        Returns:
+            True if the row is featurizable (should be kept).
+        """
+        if protein_type == 'poi':
+            feat, seq_col, id_type = self.poi_features, self.poi_sequence_col, self.poi_embeddings_id_type
+            uniprot_col, embedder = 'POI_UniProt', self.poi_precomputed_embedding
+        else:
+            feat, seq_col, id_type = self.ligase_features, self.ligase_sequence_col, self.ligase_embeddings_id_type
+            uniprot_col, embedder = 'Ligase_UniProt', self.ligase_precomputed_embedding
+
+        if feat == 'sequence':
+            return self._value_present(example.get(seq_col))
+        if feat == 'precomputed':
+            key = example.get(seq_col if id_type == 'sequence' else uniprot_col)
+            if not self._value_present(key):
+                return False
+            return embedder is not None and key in embedder.embeddings
+        return True
+
+    def _drop_unfeaturizable_protein_rows(self):
+        """Drop rows lacking a required protein sequence / precomputed embedding.
+
+        Only active when a POI or ligase feature is ``sequence`` or ``precomputed``
+        (e.g. count-vectorized sequences or Boltz/ESM embeddings); name-based and
+        molecule-only configs are left untouched. Such rows would otherwise abort
+        the whole run at featurization, so they are removed up front, consistently
+        across every split.
+        """
+        needs_seq = {'sequence', 'precomputed'}
+        if self.poi_features not in needs_seq and self.ligase_features not in needs_seq:
+            return
+        if isinstance(self.dataset, str):
+            return
+        for split in list(self.dataset.keys()):
+            ds = self.dataset[split]
+            n0 = len(ds)
+            ds = ds.filter(
+                lambda ex: self._protein_row_featurizable(ex, 'poi')
+                and self._protein_row_featurizable(ex, 'ligase')
+            )
+            dropped = n0 - len(ds)
+            if dropped:
+                self.logger.warning(
+                    f"[{split}] dropped {dropped}/{n0} rows lacking a required "
+                    f"POI/ligase sequence or precomputed embedding."
+                )
+            self.dataset[split] = ds
 
     def _get_protein_id(self, example: Union[Dict, pd.Series], protein_type: Literal['poi', 'ligase']) -> str:
         """Get the appropriate protein identifier for embedding lookup.

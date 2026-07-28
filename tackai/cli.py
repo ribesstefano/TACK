@@ -1,7 +1,7 @@
 """
 Command-line interface for TACK.
 
-Exposes two subcommands through the ``tack`` console script:
+Exposes four subcommands through the ``tack`` console script:
 
 - ``tack train`` — run nested cross-validation training. Accepts Hydra-style
   ``key=value`` overrides composed from ``configs/train.yaml`` (e.g.
@@ -11,6 +11,12 @@ Exposes two subcommands through the ``tack`` console script:
   must contain a ``SMILES`` column; optional context columns (``POI_Name``,
   ``POI_Sequence``, ``Ligase_Name``, ``Cell_Line_ID``/``Cell_Line``,
   ``Assay_Time``) are auto-detected when present.
+- ``tack collect`` — concatenate a training run's per-fold ``preds-*.csv``
+  files into a single ``predictions.csv`` keyed by ``row_id``.
+- ``tack evaluate`` — discover runs under a ``predictions_dir``, compute
+  per-fold metrics, rank method+data configs via ``autorank`` (on the
+  validation set), and write ``report.md``/``ranking.csv``/``metrics.csv``
+  plus figures to an output directory.
 """
 import argparse
 import logging
@@ -74,6 +80,9 @@ def train_from_cfg(cfg: DictConfig) -> None:
         task=cfg.task,
         model_type=model_type,
         custom_dataset_csv=cfg.custom_dataset_csv,
+        group=cfg.group,
+        held_out_frac=cfg.held_out_frac,
+        held_out_seed=cfg.held_out_seed,
     )
 
     checkpoints_dir = Path(cfg.checkpoint_dir)
@@ -236,11 +245,96 @@ def predict(argv: Optional[List[str]] = None) -> None:
 
 
 # ----------------------------------------------------------------------------
+# Collect predictions
+# ----------------------------------------------------------------------------
+
+def collect(argv: Optional[List[str]] = None) -> None:
+    """Collapse per-fold prediction CSVs into one file per model/task/config."""
+    from tackai.training import collect_predictions
+
+    parser = argparse.ArgumentParser(
+        prog="tack collect",
+        description="Collapse per-fold preds-*.csv files into one file per "
+                    "model/task/config (folds and splits become columns).",
+    )
+    parser.add_argument("--predictions-dir", required=True,
+                        help="Directory holding the preds-*.csv files.")
+    parser.add_argument("--pattern", default="preds-*-fold=*-split=*.csv",
+                        help="Glob selecting the per-fold files to gather.")
+    parser.add_argument("--keep-sources", action="store_true",
+                        help="Keep the per-fold files instead of removing them "
+                             "after the combined file is written.")
+    args = parser.parse_args(argv)
+
+    collect_predictions(
+        predictions_dir=Path(args.predictions_dir),
+        remove_sources=not args.keep_sources,
+        pattern=args.pattern,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Evaluation
+# ----------------------------------------------------------------------------
+
+def evaluate(argv: Optional[List[str]] = None) -> None:
+    """Discover runs, compute metrics, rank via autorank, and write a report."""
+    from tackai.evaluation.report import run_evaluation
+
+    parser = argparse.ArgumentParser(
+        prog="tack evaluate",
+        description="Evaluate a training run's predictions: discover model+data "
+                    "configs, compute per-fold metrics, rank them via autorank "
+                    "(on the validation set), and write a report.",
+    )
+    parser.add_argument("--predictions-dir", required=True,
+                        help="A run's predictions directory: preds-*.csv files, "
+                             "per-fold and/or collapsed by `tack collect`.")
+    parser.add_argument("--output-dir", required=True,
+                        help="Destination for report.md, ranking.csv, metrics.csv, "
+                             "runs.csv, and figures/.")
+    parser.add_argument("--checkpoints-dir", default=None,
+                        help="A run's checkpoints directory (datamodule-*_hparams.yaml "
+                             "files), used to prettify method labels. Defaults to a "
+                             "sibling 'checkpoints/' next to --predictions-dir.")
+    parser.add_argument("--tasks", nargs="+", default=None,
+                        help="Tasks to evaluate (dmax/dc50/bin). Default: all present.")
+    parser.add_argument("--methods", nargs="+", default=None,
+                        help="Exact method-label whitelist. Default: all discovered.")
+    parser.add_argument("--subset", default="val", choices=["val", "test"],
+                        help="Which split's descriptive metrics/plots to report. "
+                             "Statistical ranking always uses 'val'. Default: val.")
+    parser.add_argument("--metric", default=None,
+                        help="Ranking metric key. Default per task: RMSE / ROC-AUC.")
+    parser.add_argument("--model-family", default=None,
+                        help="Restrict ranking to one family, e.g. 'xgb' or 'mlp'.")
+    parser.add_argument("--alpha", type=float, default=0.05,
+                        help="Significance level for the omnibus comparison.")
+    parser.add_argument("--no-plots", action="store_true",
+                        help="Skip rendering figures (boxplots/CD diagrams/ROC-PR).")
+    args = parser.parse_args(argv)
+
+    result = run_evaluation(
+        predictions_dir=args.predictions_dir,
+        output_dir=args.output_dir,
+        checkpoints_dir=args.checkpoints_dir,
+        tasks=args.tasks,
+        subset=args.subset,
+        metric=args.metric,
+        methods=args.methods,
+        model_family=args.model_family,
+        alpha=args.alpha,
+        make_plots=not args.no_plots,
+    )
+    logger.info(f"Wrote evaluation report to: {result['report']}")
+
+
+# ----------------------------------------------------------------------------
 # Entry point
 # ----------------------------------------------------------------------------
 
 def main() -> None:
-    """``tack`` console entry point: dispatch to ``train`` or ``predict``."""
+    """``tack`` console entry point: dispatch to ``train``/``predict``/``collect``/``evaluate``."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     parser = argparse.ArgumentParser(
@@ -256,12 +350,24 @@ def main() -> None:
         "predict", add_help=False,
         help="Run ensemble inference on an input CSV.",
     )
+    subparsers.add_parser(
+        "collect", add_help=False,
+        help="Concatenate a run's per-fold prediction CSVs into one file.",
+    )
+    subparsers.add_parser(
+        "evaluate", add_help=False,
+        help="Rank a run's model+data configs via autorank and write a report.",
+    )
 
     args, extra = parser.parse_known_args()
     if args.command == "train":
         train(extra)
     elif args.command == "predict":
         predict(extra)
+    elif args.command == "collect":
+        collect(extra)
+    elif args.command == "evaluate":
+        evaluate(extra)
 
 
 if __name__ == "__main__":

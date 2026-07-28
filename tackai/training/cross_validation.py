@@ -25,7 +25,13 @@ from tackai.training.lightning_models import (
     train_lightning_model,
     tune_lightning_hyperparameters,
 )
-from tackai.training.persistence import save_data_module, save_predictions
+from tackai.training.persistence import (
+    save_data_module,
+    save_predictions,
+    collect_predictions,
+    fold_predictions_exist,
+)
+from tackai.training.splitting import GROUP_TO_COLUMN
 
 
 def create_cv_splits(
@@ -112,12 +118,8 @@ def run_cv_experiment(
     checkpoints_dir.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    # Determine group column
-    group_col = None
-    if group == 'scaffold':
-        group_col = 'SMILES_Scaffold_Cluster'
-    elif group == 'butina':
-        group_col = 'SMILES_Butina_Cluster'
+    # Determine group column (canonical mapping lives in splitting.py).
+    group_col = GROUP_TO_COLUMN.get(group)
 
     # Initialize results storage
     all_results = []
@@ -169,19 +171,12 @@ def run_cv_experiment(
         print(f"Task: {task_name} | Group: {group} | Fold: {fold_id} | Data: {data_name}")
         print(f"{'='*70}")
 
-        # Check if the predictions for this fold already exist, if so, skip it
-        skip_fold = True
+        # Check if the predictions for this fold already exist, if so, skip it.
+        # Looks at both the per-fold files (present mid-run) and the collapsed
+        # combined file (present after a completed run, once per-fold files
+        # were removed by collect_predictions).
         tasks = ['dmax', 'dc50'] if task_name == 'multitask' else [task_name]
-        for task in tasks:
-            for split_name in ['val', 'test']:
-                preds_path = results_dir / f"preds-model={model_name}-task={task}-group={group}-fold={fold_id}-split={split_name}.csv"
-                if not preds_path.exists():
-                    skip_fold = False
-                    break
-                print(f"Found existing predictions at: {preds_path}")
-            if not skip_fold:
-                break
-        if skip_fold:
+        if fold_predictions_exist(results_dir, model_name, tasks, group, fold_id):
             print(f"Predictions for fold {fold_id} already exist. Skipping...")
             continue
 
@@ -344,5 +339,20 @@ def run_cv_experiment(
             'model_type': model_type,
             'predictions': predictions,
         })
+
+    # Consolidate every per-fold prediction CSV of this run into a single
+    # combined file for convenience/resume, but KEEP the per-fold '-split=' files
+    # in place: ensemble selection (scripts/ensemble_comparison.py) parses the
+    # split label from those filenames, and removing them would leave it with
+    # nothing to load. Deleting them is left to an explicit `tack collect`.
+    # Non-fatal: a run that trained models successfully should not fail just
+    # because the roll-up step did (e.g. all folds were skipped).
+    try:
+        collect_predictions(results_dir, remove_sources=False)
+    except FileNotFoundError:
+        print(f"No per-fold prediction files found in {results_dir}; "
+              "skipping collection.")
+    except Exception as exc:  # noqa: BLE001 - roll-up must not abort a run
+        print(f"Warning: failed to collect predictions in {results_dir}: {exc}")
 
     return all_results
