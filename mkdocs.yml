@@ -1,0 +1,110 @@
+site_name: TACK
+site_description: >-
+  Python API documentation for running TACK's pre-trained PROTAC
+  degradation-activity ensembles via the Hugging Face Hub.
+site_url: https://ribesstefano.github.io/TACK/
+repo_url: https://github.com/ribesstefano/TACK
+repo_name: ribesstefano/TACK
+edit_uri: edit/main/docs/
+
+# Regenerates docs/tutorial/ensemble_predictor_tutorial.ipynb from the
+# notebooks/ directory before every build — see docs/hooks.py.
+hooks:
+  - docs/hooks.py
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - content.code.copy
+    - content.action.edit
+    - search.suggest
+    - search.highlight
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+  - User Guide:
+      - Loading a Pretrained Ensemble: guide/loading-models.md
+      - Making Predictions: guide/making-predictions.md
+      - Fast Screening (Reusing Context): guide/screening.md
+      - Loading the TACK Dataset: guide/loading-dataset.md
+      - Command-Line Interface: guide/cli.md
+  - Tutorial Notebook: tutorial/ensemble_predictor_tutorial.ipynb
+  - API Reference:
+      - EnsemblePredictor: api/ensemble-predictor.md
+      - Data Types: api/data-types.md
+
+plugins:
+  - search
+  - mkdocs-jupyter:
+      include: ["*.ipynb"]
+      execute: false
+      include_source: true
+      show_input: true
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: ["."]
+          options:
+            docstring_style: google
+            docstring_section_style: table
+            show_source: true
+            show_root_heading: true
+            show_root_full_path: false
+            merge_init_into_class: true
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: true
+            members_order: source
+            summary: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/ribesstefano/TACK
+    - icon: simple/huggingface
+      link: https://huggingface.co/ailab-bio/TACK-ensembles
+
+copyright: Copyright &copy; 2026 Stefano Ribes, Nils Dunlop — MIT License
