@@ -5,8 +5,9 @@ Exposes four subcommands through the ``tack`` console script:
 
 - ``tack train`` — run nested cross-validation training. Accepts Hydra-style
   ``key=value`` overrides composed from ``configs/train.yaml`` (e.g.
-  ``tack train model=mlp data=fp task=dmax``). For multi-run sweeps use the
-  Hydra launcher directly: ``python scripts/train_models.py -m ...``.
+  ``tack train model=mlp data=fp task=dmax``). ``tack train`` uses the Hydra
+  compose API directly, not the multirun launcher, so for sweeps use a shell
+  loop over ``tack train`` (see ``configs/train.yaml``'s header comment).
 - ``tack predict`` — run weighted ensemble inference on an input CSV. The CSV
   must contain a ``SMILES`` column; optional context columns (``POI_Name``,
   ``POI_Sequence``, ``Ligase_Name``, ``Cell_Line_ID``/``Cell_Line``,
@@ -109,9 +110,9 @@ def train_from_cfg(cfg: DictConfig) -> None:
 def train(argv: Optional[List[str]] = None) -> None:
     """Compose ``configs/train.yaml`` with the given overrides and train.
 
-    This is the single-run convenience path. For sweeps, call the Hydra
-    launcher (``python scripts/train_models.py -m ...``) which supports
-    ``--multirun`` natively.
+    This is a single-run entry point (Hydra compose API, not the multirun
+    launcher). For sweeps, loop over ``tack train`` invocations from the
+    shell — see ``configs/train.yaml``'s header comment for an example.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
 
@@ -126,9 +127,11 @@ def train(argv: Optional[List[str]] = None) -> None:
             "  batch_size=64 seed=42 num_proc=1\n"
             "  tune_hyperparameters=true n_tuning_trials=20\n"
             "  checkpoint_dir=./checkpoints predictions_dir=./predictions\n\n"
-            "Inspect the merged config or run sweeps with the Hydra launcher:\n"
-            "  python scripts/train_models.py --cfg job\n"
-            "  python scripts/train_models.py -m model=xgboost,mlp data=fp,simple\n"
+            "This uses the Hydra compose API directly, not the multirun launcher.\n"
+            "For sweeps, loop over `tack train` from the shell, e.g.:\n"
+            "  for enc in minmax onehot embedding; do\n"
+            "      tack train model=xgboost data=fp task=dmax data.categorical_encoding=$enc\n"
+            "  done\n"
         )
         return
 

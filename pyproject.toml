@@ -92,9 +92,9 @@ Repository = "https://github.com/ribesstefano/TACK"
 
 [project.scripts]
 tack = "tackai.cli:main"
-# Hydra multirun sweep launcher (supports `-m model=a,b data=c,d task=...`).
-# `tack train` remains the single-run convenience path (Hydra compose API).
-tack-sweep = "tackai.train_app:main_hydra"
+# No `tack-sweep` multirun launcher yet — `tackai/train_app.py` doesn't
+# exist. For sweeps, loop over `tack train` from the shell (see
+# `configs/train.yaml`'s header comment).
 
 [tool.hatch.build.targets.wheel]
 packages = ["tackai", "tack_dataset"]

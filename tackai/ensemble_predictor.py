@@ -603,7 +603,7 @@ class EnsemblePredictor:
                 name = model_file.stem
                 paths = cls._find_dm_paths(model_file)
                 if paths is None:
-                    print(f"  Warning: no datamodule found for {name} — skipping.")
+                    warnings.warn(f"No datamodule found for {name} — skipping.")
                     continue
                 mtype = (
                     'xgboost'
@@ -829,7 +829,10 @@ class EnsemblePredictor:
             if 'dmax' in label:
                 return 'dmax'
 
-        m = re.search(r'model=\w+?_(\w+?)_protac', model_name, re.IGNORECASE)
+        # `(?:qr_|mve_)?` skips the quantile/MVE objective infix that
+        # cross_validation.py inserts before the task name (see model_name
+        # construction there), so the capture group lands on the task itself.
+        m = re.search(r'model=\w+?_(?:qr_|mve_)?(\w+?)_protac', model_name, re.IGNORECASE)
         if m and m.group(1).lower() in KNOWN_TASKS:
             return m.group(1).lower()
 
@@ -1024,25 +1027,29 @@ class EnsemblePredictor:
         featurized: Dict[str, Any] = {}
         timings: Dict[str, list] = defaultdict(list)
 
-        for name, datamodule in self.datamodules.items():
-            filled_samples = []
-            for i, sample_dict in enumerate(samples):
-                t0 = time.time()
-                filled, missing = self._validate_and_fill_defaults(
-                    sample_dict, datamodule, verbose=(i == 0),
-                )
-                timings['fill_defaults'].append(time.time() - t0)
-                if missing:
-                    raise ValueError(
-                        f"Sample {i} is missing required input(s) for model '{name}': "
-                        f"{', '.join(missing)}."
+        for name in self._iter_model_names():
+            datamodule = self._get_dm(name)
+            try:
+                filled_samples = []
+                for i, sample_dict in enumerate(samples):
+                    t0 = time.time()
+                    filled, missing = self._validate_and_fill_defaults(
+                        sample_dict, datamodule, verbose=(i == 0),
                     )
-                filled_samples.append(filled)
+                    timings['fill_defaults'].append(time.time() - t0)
+                    if missing:
+                        raise ValueError(
+                            f"Sample {i} is missing required input(s) for model '{name}': "
+                            f"{', '.join(missing)}."
+                        )
+                    filled_samples.append(filled)
 
-            ret = 'xgb' if self.model_types.get(name) == 'xgboost' else 'pt'
-            t0 = time.time()
-            featurized[name] = datamodule.transform(filled_samples, return_tensor=ret)
-            timings['featurize_batch'].append(time.time() - t0)
+                ret = 'xgb' if self.model_types.get(name) == 'xgboost' else 'pt'
+                t0 = time.time()
+                featurized[name] = datamodule.transform(filled_samples, return_tensor=ret)
+                timings['featurize_batch'].append(time.time() - t0)
+            finally:
+                self._free_if_lazy(datamodule)
 
         if return_timings:
             return featurized, {k: float(np.mean(v)) for k, v in timings.items()}
@@ -1657,8 +1664,74 @@ class EnsemblePredictor:
     # Info
     # ------------------------------------------------------------------
 
+    def get_required_inputs(
+        self, model_name: Optional[str] = None
+    ) -> Tuple[set, Dict[str, List[str]]]:
+        """Determine which raw sample columns each loaded model's datamodule needs.
+
+        Loads (and, in lazy mode, immediately frees) each relevant datamodule
+        to inspect its feature configuration.
+
+        Args:
+            model_name: Specific model name, or None for all loaded models.
+
+        Returns:
+            ``(all_required_columns, {model_name: [required_columns]})``.
+        """
+        names = [model_name] if model_name is not None else list(self._iter_model_names())
+        required: Dict[str, List[str]] = {}
+        req_cols_set: set = set()
+
+        for name in names:
+            dm = self._get_dm(name)
+            try:
+                req_cols = {dm.smiles_col}
+
+                if dm.poi_features == 'sequence':
+                    req_cols.add(dm.poi_sequence_col)
+                elif dm.poi_features == 'precomputed':
+                    req_cols.add(
+                        dm.poi_sequence_col if dm.poi_embeddings_id_type == 'sequence' else 'POI_UniProt'
+                    )
+                elif dm.poi_features == 'name':
+                    req_cols.add(dm.poi_col)
+
+                if dm.ligase_features == 'precomputed':
+                    req_cols.add(
+                        dm.ligase_sequence_col if dm.ligase_embeddings_id_type == 'sequence' else 'Ligase_UniProt'
+                    )
+                elif dm.ligase_features == 'name':
+                    req_cols.add(dm.ligase_col)
+
+                if dm.cell_features in ('description', 'name'):
+                    req_cols.add(dm.cell_line_col)
+                if dm.use_treatment_time:
+                    req_cols.add(dm.treatment_time_col)
+                if dm.use_assay_type_encoding:
+                    req_cols.add(dm.assay_type_col)
+
+                required[name] = sorted(req_cols)
+                req_cols_set.update(req_cols)
+            finally:
+                self._free_if_lazy(dm)
+
+        return req_cols_set, required
+
     def get_categorical_choices(self) -> Dict[str, List[str]]:
-        """Collect known category values from all datamodule ordinal encoders."""
+        """Collect known category values from all datamodule ordinal encoders.
+
+        In lazy mode this returns ``{}`` without loading every datamodule
+        (that defeats the point of lazy loading) — call ``get_model_info()``,
+        which documents this, or load with ``lazy_loading=False`` if you need
+        the real vocabulary.
+        """
+        if self._lazy:
+            warnings.warn(
+                "get_categorical_choices() returns {} in lazy mode (loading every "
+                "datamodule to answer this would defeat lazy loading); use "
+                "lazy_loading=False to get real category vocabularies."
+            )
+            return {}
         merged: Dict[str, set] = {}
         for dm in self.datamodules.values():
             if dm is None:
@@ -1686,6 +1759,20 @@ class EnsemblePredictor:
             'device': self.device,
             'categorical_choices': {} if self._lazy else self.get_categorical_choices(),
         }
+
+    def update_weights(self, new_weights: Dict[str, float]) -> None:
+        """Update ensemble weights for one or more loaded models in place.
+
+        Args:
+            new_weights: Mapping of model name to weight. Names not in the
+                loaded ensemble raise a ``ValueError``; unmentioned models
+                keep their current weight.
+        """
+        known = set(self._model_paths if self._lazy else self.models)
+        unknown = set(new_weights) - known
+        if unknown:
+            raise ValueError(f"Unknown model name(s) in new_weights: {sorted(unknown)}")
+        self.weights.update(new_weights)
 
     def __repr__(self) -> str:
         n = len(self._model_paths if self._lazy else self.models)

@@ -2193,7 +2193,7 @@ class DegradationComplexDataModule(pl.LightningDataModule):
         
     def cache_mol_descriptors(self):
         """ Precompute and cache molecular descriptors for all SMILES in the dataset."""
-        if not self.mol_features and "descriptors" in self.mol_features or self.desc_embedder is None:
+        if not self._is_feature_active("descriptors") or self.desc_embedder is None:
             return
         
         all_smiles = set()

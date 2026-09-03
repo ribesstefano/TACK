@@ -4,9 +4,13 @@
 # groups below, and override any field on the command line, e.g.:
 #
 #   tack train model=mlp data=fp task=dmax group=scaffold          # single run
-#   tack sweep -m model=xgboost,mlp data=fp,simple task=dmax,dc50  # multirun sweep
 #
-# Inspect the merged config without training:  tack sweep --cfg job
+# `tack train` uses the Hydra compose API directly, not the multirun
+# launcher, so for sweeps loop over `tack train` from the shell, e.g.:
+#
+#   for enc in minmax onehot embedding; do
+#       tack train model=xgboost data=fp task=dmax data.categorical_encoding=$enc
+#   done
 defaults:
   - data: fp        # any file stem under configs/data/
   - model: xgboost  # any file stem under configs/model/
