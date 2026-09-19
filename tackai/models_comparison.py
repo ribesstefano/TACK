@@ -4,12 +4,13 @@ Taken from: https://github.com/polaris-hub/polaris-method-comparison/blob/main/A
 """
 import math
 import warnings
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import pingouin as pg
 from scipy import stats
-from scipy.stats import spearmanr
+from scipy.stats import spearmanr, f_oneway
 from statsmodels.stats.anova import AnovaRM
 from statsmodels.stats.libqsturng import psturng, qsturng
 from statsmodels.stats.multicomp import pairwise_tukeyhsd
@@ -27,20 +28,28 @@ from sklearn.metrics import (
     r2_score,
     recall_score,
 )
-from matplotlib import cm
+from matplotlib.axes import Axes
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def calc_regression_metrics(df, cycle_col, val_col, pred_col, thresh):
-    """
-    Calculate regression metrics (MAE, MSE, R2, prec, recall) for each method and split
+def calc_regression_metrics(
+    df: pd.DataFrame,
+    cycle_col: str,
+    val_col: str,
+    pred_col: str,
+    thresh: float,
+) -> pd.DataFrame:
+    """ Calculate regression metrics (MAE, MSE, R2, prec, recall) for each method and split.
 
-    :param df: input dataframe must contain columns [method, split] as well the columns specified in the arguments
-    :param cycle_col: column indicating the cross-validation fold
-    :param val_col: column with the ground truth value
-    :param pred_col: column with predictions
-    :param thresh: threshold for binary classification
-    :return: a dataframe with [cv_cycle, method, split, mae, mse, r2, prec, recall]
+    Args:
+        df (pd.DataFrame): Input dataframe; must contain columns [method, split] as well as the columns specified in the other arguments.
+        cycle_col (str): Column indicating the cross-validation fold.
+        val_col (str): Column with the ground truth value.
+        pred_col (str): Column with predictions.
+        thresh (float): Threshold for binary classification.
+
+    Returns:
+        pd.DataFrame: A dataframe with columns [cv_cycle, method, split, mae, mse, r2, rho, prec, recall, roc_auc].
     """
     df_in = df.copy()
     metric_ls = ["mae", "mse", "r2", "rho", "prec", "recall", "roc_auc"]
@@ -64,23 +73,30 @@ def calc_regression_metrics(df, cycle_col, val_col, pred_col, thresh):
     return metric_df
 
 
-def rm_tukey_hsd(df, metric, group_col, alpha=0.05, sort = False, direction_dict=None):
-    """
-    Perform repeated measures Tukey HSD test on the given dataframe.
+def rm_tukey_hsd(
+    df: pd.DataFrame,
+    metric: str,
+    group_col: str,
+    alpha: float = 0.05,
+    sort: bool = False,
+    direction_dict: Optional[Dict[str, str]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """ Perform repeated measures Tukey HSD test on the given dataframe.
 
-    Parameters:
-    df (pd.DataFrame): Input dataframe containing the data.
-    metric (str): The metric column name to perform the test on.
-    group_col (str): The column name indicating the groups.
-    alpha (float): Significance level for the test. Default is 0.05.
-    sort (bool): Whether to sort the output tables. Default is False.
+    Args:
+        df (pd.DataFrame): Input dataframe containing the data.
+        metric (str): The metric column name to perform the test on.
+        group_col (str): The column name indicating the groups.
+        alpha (float): Significance level for the test. Default is 0.05.
+        sort (bool): Whether to sort the output tables. Default is False.
+        direction_dict (Optional[Dict[str, str]]): Maps metric name to 'maximize' or 'minimize', used when `sort` is True. Default is None.
 
     Returns:
-    tuple: A tuple containing:
-        - result_tab (pd.DataFrame): DataFrame with pairwise comparisons and adjusted p-values.
-        - df_means (pd.DataFrame): DataFrame with mean values for each group.
-        - df_means_diff (pd.DataFrame): DataFrame with mean differences between groups.
-        - pc (pd.DataFrame): DataFrame with adjusted p-values for pairwise comparisons.
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]: A tuple containing:
+            - result_tab: DataFrame with pairwise comparisons and adjusted p-values.
+            - df_means: DataFrame with mean values for each group.
+            - df_means_diff: DataFrame with mean differences between groups.
+            - pc: DataFrame with adjusted p-values for pairwise comparisons.
     """
     if sort and direction_dict and metric in direction_dict:
         if direction_dict[metric] == 'maximize':
@@ -144,41 +160,35 @@ def rm_tukey_hsd(df, metric, group_col, alpha=0.05, sort = False, direction_dict
     return result_tab, df_means, df_means_diff, pc
 
 
-def recall_at_precision(y_true, y_score, precision_threshold=0.5, direction='greater'):
+def recall_at_precision(
+    y_true: Union[np.ndarray, pd.Series],
+    y_score: Union[np.ndarray, pd.Series],
+    precision_threshold: float = 0.5,
+    direction: str = 'greater',
+) -> Tuple[float, Optional[float]]:
+    """ Find the best recall achieved at or beyond a target precision.
+
+    Args:
+        y_true (Union[np.ndarray, pd.Series]): Ground truth binary labels.
+        y_score (Union[np.ndarray, pd.Series]): Predicted scores or probabilities.
+        precision_threshold (float): Minimum (if `direction='greater'`) or maximum (if `direction='lesser'`) precision to satisfy. Default is 0.5.
+        direction (str): One of 'greater' or 'lesser'; selects whether `precision_threshold` is a lower or upper bound. Default is 'greater'.
+
+    Returns:
+        tuple[float, Optional[float]]: A tuple of (recall, threshold). If no threshold satisfies `precision_threshold`, the recall at the best achieved precision is returned with a `None` threshold.
+    """
     if direction not in ['greater', 'lesser']:
         raise ValueError("Invalid direction. Expected one of: ['greater', 'lesser']")
 
-    # y_true = np.array(y_true)
-    # y_score = np.array(y_score)
-    # thresholds = np.unique(y_score)
-    # thresholds = np.sort(thresholds)
-
-    # if direction == 'greater':
-    #     thresholds = np.sort(thresholds)
-    # else:  
-    #     thresholds = np.sort(thresholds)[::-1]
-
-    # for threshold in thresholds:
-    #     if direction == 'greater':
-    #         y_pred = y_score >= threshold
-    #     else:  
-    #         y_pred = y_score <= threshold
-
-    #     precision = precision_score(y_true, y_pred)
-    #     if precision >= precision_threshold:
-    #         recall = recall_score(y_true, y_pred)
-    #         return recall, threshold
-    # return np.nan, None
-
     # This handles the "greater" logic automatically
     precisions, recalls, thresholds = precision_recall_curve(y_true, y_score)
-    
+
     # Filter for where precision meets your threshold
     if direction == 'greater':
         valid_indices = np.where(precisions >= precision_threshold)[0]
     else:  # direction == 'lesser'
         valid_indices = np.where(precisions <= precision_threshold)[0]
-    
+
     if len(valid_indices) == 0:
         # Option A: Return 0 instead of NaN if that makes sense for your report
         # Option B: Return the recall at the maximum precision achieved
@@ -187,26 +197,46 @@ def recall_at_precision(y_true, y_score, precision_threshold=0.5, direction='gre
         else:
             idx_prec = np.argmin(precisions)
         return recalls[idx_prec], None
-    
+
     # Take the first index where precision is met
     # (Usually you want the maximum recall at that precision)
     best_idx = valid_indices[0]
     return recalls[best_idx], thresholds[min(best_idx, len(thresholds)-1)]
 
 
-def calc_classification_metrics(df_in, cycle_col, val_col, prob_col, pred_col, precision_threshold=0.8):
+def calc_classification_metrics(
+    df_in: pd.DataFrame,
+    cycle_col: str,
+    val_col: str,
+    prob_col: str,
+    pred_col: str,
+    precision_threshold: float = 0.8,
+) -> pd.DataFrame:
+    """ Calculate classification metrics (ROC-AUC, PR-AUC, MCC, recall/TNR at precision) for each method and split.
+
+    Args:
+        df_in (pd.DataFrame): Input dataframe; must contain columns [method, split] as well as the columns specified in the other arguments.
+        cycle_col (str): Column indicating the cross-validation fold.
+        val_col (str): Column with the ground truth binary label.
+        prob_col (str): Column with predicted probabilities/scores.
+        pred_col (str): Column with predicted binary class.
+        precision_threshold (float): Precision threshold used for the recall/TNR-at-precision metrics. Default is 0.8.
+
+    Returns:
+        pd.DataFrame: A dataframe with columns [cv_cycle, method, split, roc_auc, pr_auc, mcc, recall, tnr].
+    """
     metric_list = []
     for k, v in df_in.groupby([cycle_col, "method", "split"]):
         cycle, method, split = k
         roc_auc = roc_auc_score(v[val_col], v[prob_col])
         pr_auc = average_precision_score(v[val_col], v[prob_col])
         mcc = matthews_corrcoef(v[val_col], v[pred_col])
-        
+
         recall, _ = recall_at_precision(v[val_col].astype(bool), v[prob_col], precision_threshold, direction='greater')
         tnr, _ = recall_at_precision(~v[val_col].astype(bool), v[prob_col], precision_threshold, direction='lesser')
 
         metric_list.append([cycle, method, split, roc_auc, pr_auc, mcc, recall, tnr])
-        
+
     metric_df = pd.DataFrame(metric_list, columns=["cv_cycle", "method", "split",
                                                     "roc_auc", "pr_auc", "mcc", "recall", "tnr"])
     return metric_df
@@ -214,21 +244,25 @@ def calc_classification_metrics(df_in, cycle_col, val_col, prob_col, pred_col, p
 # -------------- Plotting routines -------------------#
 
 
-def make_boxplots_parametric(df, metric_ls, precision_threshold=0.5):
-    """
-    Create boxplots for each metric using repeated measures ANOVA.
+def make_boxplots_parametric(
+    df: pd.DataFrame,
+    metric_ls: List[str],
+    precision_threshold: float = 0.5,
+) -> None:
+    """ Create boxplots for each metric using repeated measures ANOVA.
 
-    Parameters:
-    df (pd.DataFrame): Input dataframe containing the data.
-    metric_ls (list of str): List of metric column names to create boxplots for.
+    Args:
+        df (pd.DataFrame): Input dataframe containing the data.
+        metric_ls (List[str]): List of metric column names to create boxplots for.
+        precision_threshold (float): Precision threshold used in axis labels for precision-conditioned metrics. Default is 0.5.
 
     Returns:
-    None
+        None
     """
     sns.set_context('notebook')
     sns.set(rc={'figure.figsize': (4, 3)}, font_scale=1.5)
     sns.set_style('whitegrid')
-    figure, axes = plt.subplots(1, len(metric_ls), sharex=False, sharey=False, figsize=(45, 8))
+    _, axes = plt.subplots(1, len(metric_ls), sharex=False, sharey=False, figsize=(45, 8))
     # figure, axes = plt.subplots(1, 3, sharex=False, sharey=False, figsize=(16, 8))
 
     metric2name = {
@@ -260,11 +294,25 @@ def make_boxplots_parametric(df, metric_ls, precision_threshold=0.5):
     # plt.tight_layout()
 
 
-def make_boxplots_nonparametric(df, metric_ls, precision_threshold=0.5):
+def make_boxplots_nonparametric(
+    df: pd.DataFrame,
+    metric_ls: List[str],
+    precision_threshold: float = 0.5,
+) -> None:
+    """ Create boxplots for each metric using the Friedman test.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing the data.
+        metric_ls (List[str]): List of metric column names to create boxplots for.
+        precision_threshold (float): Precision threshold used in axis labels for precision-conditioned metrics. Default is 0.5.
+
+    Returns:
+        None
+    """
     sns.set_context('notebook')
     sns.set(rc={'figure.figsize': (4, 3)}, font_scale=1.5)
     sns.set_style('whitegrid')
-    figure, axes = plt.subplots(1, len(metric_ls), sharex=False, sharey=False, figsize=(45, 8))
+    _, axes = plt.subplots(1, len(metric_ls), sharex=False, sharey=False, figsize=(45, 8))
 
     metric2name = {
         'mae': 'MAE',
@@ -280,7 +328,7 @@ def make_boxplots_nonparametric(df, metric_ls, precision_threshold=0.5):
     }
 
     for i, metric in enumerate(metric_ls):
-        friedman = pg.friedman(df, dv=metric, within="method", subject="cv_cycle")['p-unc'].values[0]
+        friedman = pg.friedman(df, dv=metric, within="method", subject="cv_cycle")['p_unc'].values[0]
         ax = sns.boxplot(y=metric, x="method", hue="method", ax=axes[i], data=df, palette="Set2", legend=False)
         ax.set_title(f"Friedman p={friedman:.1e}")
         ax.set_xlabel("")
@@ -293,7 +341,16 @@ def make_boxplots_nonparametric(df, metric_ls, precision_threshold=0.5):
         ax.tick_params(axis='x', rotation=90)
     # plt.tight_layout()
 
-def make_sign_plots_nonparametric(df, metric_ls):
+def make_sign_plots_nonparametric(df: pd.DataFrame, metric_ls: List[str]) -> None:
+    """ Create significance heatmaps for each metric using the Conover-Friedman post-hoc test.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing the data.
+        metric_ls (List[str]): List of metric column names to create sign plots for.
+
+    Returns:
+        None
+    """
     heatmap_args = {'linewidths': 0.25, 'linecolor': '0.1', 'clip_on': True, 'square': True}
     cmap = {
         'diag': 'white',
@@ -306,16 +363,25 @@ def make_sign_plots_nonparametric(df, metric_ls):
     # which the categories are defined (see documentation for more details)
     cmap = list(cmap.values())
     sns.set_theme(rc={'figure.figsize': (4, 3)}, font_scale=1.5)
-    figure, axes = plt.subplots(1, len(metric_ls), sharex=False, sharey=True, figsize=(26, 8))
+    _, axes = plt.subplots(1, len(metric_ls), sharex=False, sharey=True, figsize=(26, 8))
 
     for i, stat in enumerate(metric_ls):
         pivot_df = df.pivot(index='cv_cycle', columns='method', values=stat)
         pc = sp.posthoc_conover_friedman(pivot_df, p_adjust="holm")
-        sub_ax, sub_c = sp.sign_plot(pc, **heatmap_args, ax=axes[i], xticklabels=True, cmap=cmap)  # Update xticklabels parameter
+        sub_ax, _ = sp.sign_plot(pc, **heatmap_args, ax=axes[i], xticklabels=True, cmap=cmap)  # Update xticklabels parameter
         sub_ax.set_title(stat.upper())
 
-def make_critical_difference_diagrams(df, metric_ls):
-    figure, axes = plt.subplots(6, 1, sharex=True, sharey=False, figsize=(16, 10))
+def make_critical_difference_diagrams(df: pd.DataFrame, metric_ls: List[str]) -> None:
+    """ Create critical difference diagrams for each metric using the Conover-Friedman post-hoc test.
+
+    Args:
+        df (pd.DataFrame): Input dataframe containing the data.
+        metric_ls (List[str]): List of metric column names to create diagrams for.
+
+    Returns:
+        None
+    """
+    _, axes = plt.subplots(6, 1, sharex=True, sharey=False, figsize=(16, 10))
     for i, stat in enumerate(metric_ls):
         pivot_df = df.pivot(index='cv_cycle', columns='method', values=stat)
         pc = sp.posthoc_conover_friedman(pivot_df, p_adjust="holm")
@@ -324,19 +390,23 @@ def make_critical_difference_diagrams(df, metric_ls):
         axes[i].set_title(stat.upper())
     plt.tight_layout()
 
-def make_normality_diagnostic(df, metric_ls, precision_threshold=0.5):
-    """
-    Create a normality diagnostic plot grid with histograms and QQ plots for the given metrics.
+def make_normality_diagnostic(
+    df: pd.DataFrame,
+    metric_ls: List[str],
+    precision_threshold: float = 0.5,
+) -> None:
+    """ Create a normality diagnostic plot grid with histograms and QQ plots for the given metrics.
 
-    Parameters:
-    df (pd.DataFrame): Input dataframe containing the data.
-    metric_ls (list of str): List of metrics to create plots for.
+    Args:
+        df (pd.DataFrame): Input dataframe containing the data.
+        metric_ls (List[str]): List of metrics to create plots for.
+        precision_threshold (float): Precision threshold used in axis labels for precision-conditioned metrics. Default is 0.5.
 
     Returns:
-    None
+        None
     """
     df_norm = df.copy()
-    
+
     for metric in metric_ls:
         df_norm[metric] = df_norm[metric] - df_norm.groupby("method")[metric].transform("mean")
 
@@ -347,12 +417,12 @@ def make_normality_diagnostic(df, metric_ls, precision_threshold=0.5):
 
     sns.set_context('notebook', font_scale=1.5)
     sns.set_style('whitegrid')
-    
+
     metrics = df_norm['metric'].unique()
     n_metrics = len(metrics)
-    
-    fig, axes = plt.subplots(2, n_metrics, figsize=(20, 10))
-    
+
+    _, axes = plt.subplots(2, n_metrics, figsize=(20, 10))
+
     # metric2name = {
     #     'mae': 'MAE',
     #     'mse': 'MSE',
@@ -373,13 +443,12 @@ def make_normality_diagnostic(df, metric_ls, precision_threshold=0.5):
         'rho': "Spearman's ρ",
         'roc_auc': 'ROC-AUC',
         'pr_auc': 'PR-AUC',
-        'tnr':'TNR',
         'mcc': 'MCC',
         'prec': 'Precision',
         'recall': f'Recall (Prec. ≥ {precision_threshold})',
         'tnr': f'TNR (Prec. ≥ {precision_threshold})',
     }
-    
+
     colors = {
         'blue': '#4B9ECE',
         'orange': '#FFAA6E',
@@ -388,7 +457,7 @@ def make_normality_diagnostic(df, metric_ls, precision_threshold=0.5):
         'green': '#9DCE9C',
         'purple': '#C8ABDA',
     }
-    
+
     for i, metric in enumerate(metrics):
         ax = axes[0, i]
         sns.histplot(df_norm[df_norm['metric'] == metric]['value'], kde=True, ax=ax, color=colors['blue'])
@@ -399,7 +468,7 @@ def make_normality_diagnostic(df, metric_ls, precision_threshold=0.5):
         if i != 0:
             ax.set_ylabel('')
         ax.grid(alpha=0.5)
-    
+
     for i, metric in enumerate(metrics):
         ax = axes[1, i]
         metric_data = df_norm[df_norm['metric'] == metric]['value']
@@ -409,34 +478,46 @@ def make_normality_diagnostic(df, metric_ls, precision_threshold=0.5):
         if i != 0:
             ax.set_ylabel('')
         ax.grid(alpha=0.5)
-    
+
     plt.tight_layout()
 
 
-def mcs_plot(pc, effect_size, means, labels=True, cmap=None, cbar_ax_bbox=None,
-             ax=None, show_diff=True, cell_text_size=16, axis_text_size=12,
-             show_cbar=True, reverse_cmap=False, vlim=None, **kwargs):
-    """
-    Create a multiple comparison of means plot using a heatmap.
+def mcs_plot(
+    pc: pd.DataFrame,
+    effect_size: pd.DataFrame,
+    means: pd.Series,
+    labels: bool = True,
+    cmap: Optional[str] = None,
+    cbar_ax_bbox: Optional[Tuple[float, float, float, float]] = None,
+    ax: Optional[Axes] = None,
+    show_diff: bool = True,
+    cell_text_size: int = 16,
+    axis_text_size: int = 12,
+    show_cbar: bool = True,
+    reverse_cmap: bool = False,
+    vlim: Optional[float] = None,
+    **kwargs: Any,
+) -> Axes:
+    """ Create a multiple comparison of means plot using a heatmap.
 
-    Parameters:
-    pc (pd.DataFrame): DataFrame containing p-values for pairwise comparisons.
-    effect_size (pd.DataFrame): DataFrame containing effect sizes for pairwise comparisons.
-    means (pd.Series): Series containing mean values for each group.
-    labels (bool): Whether to show labels on the axes. Default is True.
-    cmap (str): Colormap to use for the heatmap. Default is None.
-    cbar_ax_bbox (tuple): Bounding box for the colorbar axis. Default is None.
-    ax (matplotlib.axes.Axes): The axes on which to plot the heatmap. Default is None.
-    show_diff (bool): Whether to show the mean differences in the plot. Default is True.
-    cell_text_size (int): Font size for the cell text. Default is 16.
-    axis_text_size (int): Font size for the axis text. Default is 12.
-    show_cbar (bool): Whether to show the colorbar. Default is True.
-    reverse_cmap (bool): Whether to reverse the colormap. Default is False.
-    vlim (float): Limit for the colormap. Default is None.
-    **kwargs: Additional keyword arguments for the heatmap.
+    Args:
+        pc (pd.DataFrame): DataFrame containing p-values for pairwise comparisons.
+        effect_size (pd.DataFrame): DataFrame containing effect sizes for pairwise comparisons.
+        means (pd.Series): Series containing mean values for each group.
+        labels (bool): Whether to show labels on the axes. Default is True.
+        cmap (Optional[str]): Colormap to use for the heatmap. Default is None.
+        cbar_ax_bbox (Optional[Tuple[float, float, float, float]]): Bounding box for the colorbar axis. Default is None.
+        ax (Optional[matplotlib.axes.Axes]): The axes on which to plot the heatmap. Default is None.
+        show_diff (bool): Whether to show the mean differences in the plot. Default is True.
+        cell_text_size (int): Font size for the cell text. Default is 16.
+        axis_text_size (int): Font size for the axis text. Default is 12.
+        show_cbar (bool): Whether to show the colorbar. Default is True.
+        reverse_cmap (bool): Whether to reverse the colormap. Default is False.
+        vlim (Optional[float]): Limit for the colormap. Default is None.
+        **kwargs (Any): Additional keyword arguments for the heatmap.
 
     Returns:
-    matplotlib.axes.Axes: The axes with the heatmap.
+        matplotlib.axes.Axes: The axes with the heatmap.
     """
     for key in ['cbar', 'vmin', 'vmax', 'center']:
         if key in kwargs:
@@ -480,30 +561,43 @@ def mcs_plot(pc, effect_size, means, labels=True, cmap=None, cbar_ax_bbox=None,
     return hax
 
 
-def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
-                       figsize=(20, 10), direction_dict={}, effect_dict={}, show_diff=True,
-                       cell_text_size=16, axis_text_size=12, title_text_size=16, sort_axes=False,
-                       precision_threshold=0.5, metrics_per_row=3):
-    """
-    Create a grid of multiple comparison of means plots using Tukey HSD test results.
+def make_mcs_plot_grid(
+    df: pd.DataFrame,
+    metric_ls: List[str],
+    group_col: str,
+    alpha: float = .05,
+    figsize: Tuple[float, float] = (20, 10),
+    direction_dict: Optional[Dict[str, str]] = None,
+    effect_dict: Optional[Dict[str, float]] = None,
+    show_diff: bool = True,
+    cell_text_size: int = 16,
+    axis_text_size: int = 12,
+    title_text_size: int = 16,
+    sort_axes: bool = False,
+    precision_threshold: float = 0.5,
+    metrics_per_row: int = 3,
+) -> None:
+    """ Create a grid of multiple comparison of means plots using Tukey HSD test results.
 
-    Parameters:
+    Args:
         df (pd.DataFrame): Input dataframe containing the data.
-        stats (list of str): List of statistical metrics to create plots for.
+        metric_ls (List[str]): List of statistical metrics to create plots for.
         group_col (str): The column name indicating the groups.
         alpha (float): Significance level for the Tukey HSD test. Default is 0.05.
-        figsize (tuple): Size of the figure. Default is (20, 10).
-        direction_dict (dict): Dictionary indicating whether to minimize or maximize each metric.
-        effect_dict (dict): Dictionary with effect size limits for each metric.
+        figsize (Tuple[float, float]): Size of the figure. Default is (20, 10).
+        direction_dict (Optional[Dict[str, str]]): Dictionary indicating whether to minimize or maximize each metric. Default is None.
+        effect_dict (Optional[Dict[str, float]]): Dictionary with effect size limits for each metric. Default is None.
         show_diff (bool): Whether to show the mean differences in the plot. Default is True.
         cell_text_size (int): Font size for the cell text. Default is 16.
         axis_text_size (int): Font size for the axis text. Default is 12.
         title_text_size (int): Font size for the title text. Default is 16.
-        sort (bool): Whether to sort the axes. Default is False.
+        sort_axes (bool): Whether to sort the axes. Default is False.
+        precision_threshold (float): Precision threshold used in metric display names. Default is 0.5.
+        metrics_per_row (int): Number of subplot columns per row. Default is 3.
 
     Returns:
-    None
-    """    
+        None
+    """
     metric2name = {
         'mae': 'MAE',
         'mse': 'MSE',
@@ -512,15 +606,18 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
         'rho': "Spearman's ρ",
         'roc_auc': 'ROC-AUC',
         'pr_auc': 'PR-AUC',
-        'tnr':'TNR',
         'mcc': 'MCC',
         'prec': 'Precision',
         'recall': f'Recall (Prec. ≥ {precision_threshold})',
         'tnr': f'TNR (Prec. ≥ {precision_threshold})',
     }
-    
-    nrow = math.ceil(len(stats) / metrics_per_row)
-    fig, ax = plt.subplots(nrow, metrics_per_row, figsize=figsize)
+
+    # Avoid mutable default arguments (dicts are shared across calls otherwise).
+    direction_dict = dict(direction_dict) if direction_dict else {}
+    effect_dict = dict(effect_dict) if effect_dict else {}
+
+    nrow = math.ceil(len(metric_ls) / metrics_per_row)
+    _, ax = plt.subplots(nrow, metrics_per_row, figsize=figsize)
 
     # Set defaults
     for key in ['r2', 'rho', 'prec', 'recall', 'mae', 'mse', 'roc_auc']:
@@ -532,7 +629,7 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
     direction_dict = {k.lower(): v for k, v in direction_dict.items()}
     effect_dict = {k.lower(): v for k, v in effect_dict.items()}
 
-    for i, stat in enumerate(stats):
+    for i, stat in enumerate(metric_ls):
         stat = stat.lower()
 
         row = i // int(metrics_per_row)
@@ -557,8 +654,8 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
         hax.set_title(metric2name[stat], fontsize=title_text_size, fontweight='bold')
 
     # If there are less plots than cells in the grid, hide the remaining cells
-    if (len(stats) % metrics_per_row) != 0:
-        for i in range(len(stats), nrow * metrics_per_row):
+    if (len(metric_ls) % metrics_per_row) != 0:
+        for i in range(len(metric_ls), nrow * metrics_per_row):
             row = i // metrics_per_row
             col = i % metrics_per_row
             ax[row, col].set_visible(False)
@@ -566,26 +663,32 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
     plt.tight_layout()
 
 
-def make_scatterplot(df, val_col, pred_col, thresh, cycle_col="cv_cycle", group_col="method"):
-    """
-    Create scatter plots for each method showing the relationship between predicted and measured values.
+def make_scatterplot(
+    df: pd.DataFrame,
+    val_col: str,
+    pred_col: str,
+    thresh: float,
+    cycle_col: str = "cv_cycle",
+    group_col: str = "method",
+) -> None:
+    """ Create scatter plots for each method showing the relationship between predicted and measured values.
 
-    Parameters:
-    df (pd.DataFrame): Input dataframe containing the data.
-    val_col (str): The column name for the ground truth values.
-    pred_col (str): The column name for the predicted values.
-    thresh (float): Threshold for binary classification.
-    cycle_col (str): The column name indicating the cross-validation fold. Default is "cv_cycle".
-    group_col (str): The column name indicating the groups/methods. Default is "method".
+    Args:
+        df (pd.DataFrame): Input dataframe containing the data.
+        val_col (str): The column name for the ground truth values.
+        pred_col (str): The column name for the predicted values.
+        thresh (float): Threshold for binary classification.
+        cycle_col (str): The column name indicating the cross-validation fold. Default is "cv_cycle".
+        group_col (str): The column name indicating the groups/methods. Default is "method".
 
     Returns:
-    None
+        None
     """
     df_split_metrics = calc_regression_metrics(df, cycle_col=cycle_col, val_col=val_col, pred_col=pred_col,
                                                thresh=thresh)
     methods = sorted(df[group_col].unique())
 
-    fig, axs = plt.subplots(nrows=1, ncols=len(methods), figsize=(6 * len(methods), 6))
+    _, axs = plt.subplots(nrows=1, ncols=len(methods), figsize=(6 * len(methods), 6))
 
     for i, (ax, method) in enumerate(zip(axs, methods)):
         df_method = df.query(f"{group_col} == @method")
@@ -613,9 +716,9 @@ def make_scatterplot(df, val_col, pred_col, thresh, cycle_col="cv_cycle", group_
                         f"ROC-AUC: {roc_auc:.2f}")
         ax.text(0.05, .5, metrics_text, transform=ax.transAxes,
                 verticalalignment='top', fontsize=12,
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+                bbox={"boxstyle": 'round', "facecolor": 'white', "alpha": 0.8},
         )
-        
+
         ax.set_xlabel('Predicted')
         if i == 0:
             ax.set_ylabel('Measured')
@@ -623,23 +726,22 @@ def make_scatterplot(df, val_col, pred_col, thresh, cycle_col="cv_cycle", group_
             # Remove y-axis ticks for other plots
             # ax.set_yticks([])
             ax.set_ylabel('')
-        
+
         ax.grid(axis='both', alpha=0.5)
 
     plt.tight_layout()
 
 
-def ci_plot(result_tab, ax_in, name):
-    """
-    Create a confidence interval plot for the given result table.
+def ci_plot(result_tab: pd.DataFrame, ax_in: Axes, name: str) -> None:
+    """ Create a confidence interval plot for the given result table.
 
-    Parameters:
-    result_tab (pd.DataFrame): DataFrame containing the results with columns 'meandiff', 'lower', and 'upper'.
-    ax_in (matplotlib.axes.Axes): The axes on which to plot the confidence intervals.
-    name (str): The title of the plot.
+    Args:
+        result_tab (pd.DataFrame): DataFrame containing the results with columns 'meandiff', 'lower', and 'upper'.
+        ax_in (matplotlib.axes.Axes): The axes on which to plot the confidence intervals.
+        name (str): The title of the plot.
 
     Returns:
-    None
+        None
     """
     result_err = np.array([result_tab['meandiff'] - result_tab['lower'],
                            result_tab['upper'] - result_tab['meandiff']])
@@ -652,21 +754,20 @@ def ci_plot(result_tab, ax_in, name):
     ax.set_xlabel("Mean Difference")
     ax.set_ylabel("")
     ax.set_title(name)
-    ax.set_xlim(-0.2, 0.2) 
+    ax.set_xlim(-0.2, 0.2)
 
 
-def make_ci_plot_grid(df_in, metric_list, group_col="method"):
+def make_ci_plot_grid(df_in: pd.DataFrame, metric_list: List[str], group_col: str = "method") -> None:
+    """ Create a grid of confidence interval plots for multiple metrics using Tukey HSD test results.
+
+    Args:
+        df_in (pd.DataFrame): Input dataframe containing the data.
+        metric_list (List[str]): List of metric column names to create confidence interval plots for.
+        group_col (str): The column name indicating the groups. Default is "method".
+
+    Returns:
+        None
     """
-     Create a grid of confidence interval plots for multiple metrics using Tukey HSD test results.
-
-     Parameters:
-     df_in (pd.DataFrame): Input dataframe containing the data.
-     metric_list (list of str): List of metric column names to create confidence interval plots for.
-     group_col (str): The column name indicating the groups. Default is "method".
-
-     Returns:
-     None
-     """
     figure, axes = plt.subplots(len(metric_list), 1, figsize=(8, 3 * len(metric_list)), sharex=False)
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
@@ -677,7 +778,23 @@ def make_ci_plot_grid(df_in, metric_list, group_col="method"):
     plt.tight_layout()
 
 
-def make_curve_plots(df_plot, val_col, prob_col, precision_threshold=0.8):
+def make_curve_plots(
+    df_plot: pd.DataFrame,
+    val_col: str,
+    prob_col: str,
+    precision_threshold: float = 0.8,
+) -> None:
+    """ Create ROC and precision-recall curve plots for each method.
+
+    Args:
+        df_plot (pd.DataFrame): Input dataframe containing a 'method' column plus `val_col` and `prob_col`.
+        val_col (str): The column name for the ground truth binary label.
+        prob_col (str): The column name for the predicted probability/score.
+        precision_threshold (float): Precision threshold at which to mark the recall/TNR operating point. Default is 0.8.
+
+    Returns:
+        None
+    """
     color_map = plt.get_cmap('tab10')
     # Sort df_plot by method names
     df_plot = df_plot.sort_values(by='method')
@@ -685,7 +802,7 @@ def make_curve_plots(df_plot, val_col, prob_col, precision_threshold=0.8):
     df_plot['color'] = le.fit_transform(df_plot['method'])
     colors = color_map(df_plot['color'].unique())
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 8))
+    _, axes = plt.subplots(1, 2, figsize=(12, 8))
     for (k, v), color in zip(df_plot.groupby("method"), colors):
         roc_auc = roc_auc_score(v[val_col], v[prob_col])
         pr_auc = average_precision_score(v[val_col], v[prob_col])
@@ -724,27 +841,44 @@ def make_curve_plots(df_plot, val_col, prob_col, precision_threshold=0.8):
     plt.tight_layout()
 
 
-def run_anova(df_in, col, group_var="method"):
+def run_anova(df_in: pd.DataFrame, col: str, group_var: str = "method") -> float:
+    """ Run a one-way ANOVA on `col`, grouped by `group_var`.
+
+    Args:
+        df_in (pd.DataFrame): Input dataframe containing the data.
+        col (str): The column name to test.
+        group_var (str): The column name indicating the groups. Default is "method".
+
+    Returns:
+        float: The p-value of the one-way ANOVA.
+    """
     res_list = []
-    for k,v in df_in.groupby(group_var):
+    for _, v in df_in.groupby(group_var):
         res_list.append(v[col].values)
     return f_oneway(*res_list)[1]
 
 
-def make_simultaneous_ci_plot(df_in, metric_list, group_col="method", alpha=0.05, direction_dict=None):
-    """
-    Create simultaneous confidence interval plots for multiple metrics using Tukey HSD test results.
+def make_simultaneous_ci_plot(
+    df_in: pd.DataFrame,
+    metric_list: List[str],
+    group_col: str = "method",
+    alpha: float = 0.05,
+    direction_dict: Optional[Dict[str, str]] = None,
+) -> None:
+    """ Create simultaneous confidence interval plots for multiple metrics using Tukey HSD test results.
 
-    Parameters:
-    df_in (pd.DataFrame): Input dataframe containing the data.
-    metric_list (list of str): List of metric column names to create confidence interval plots for.
-    group_col (str): The column name indicating the groups. Default is "method".
+    Args:
+        df_in (pd.DataFrame): Input dataframe containing the data.
+        metric_list (List[str]): List of metric column names to create confidence interval plots for.
+        group_col (str): The column name indicating the groups. Default is "method".
+        alpha (float): Significance level for the Tukey HSD test. Default is 0.05.
+        direction_dict (Optional[Dict[str, str]]): Dictionary indicating whether to minimize or maximize each metric, used to pick the reference method per plot. Default is None.
 
     Returns:
-    None
+        None
     """
     tuckey_metrics = {}
-    for i, metric in enumerate(metric_list):        
+    for i, metric in enumerate(metric_list):
         # If any NaN values are present, skip plotting
         if df_in[metric].isna().any():
             print(f"WARNING: Metric {metric} contains NaN values, skipping...")
@@ -755,7 +889,7 @@ def make_simultaneous_ci_plot(df_in, metric_list, group_col="method", alpha=0.05
                                           alpha=alpha)
         # print(tuckey_metric)
         tuckey_metrics[metric] = tuckey_metric
-        
+
     metric2name = {
         'mae': 'Mean Absolute Error (MAE)',
         'mse': 'Mean Squared Error (MSE)',
@@ -767,21 +901,21 @@ def make_simultaneous_ci_plot(df_in, metric_list, group_col="method", alpha=0.05
         'recall': 'Recall (Sensitivity)',
         'tnr': 'True Negative Rate (Specificity)',
     }
-        
+
     # Change the axes dimensions to be a bigger square
-    fig, axes = plt.subplots(1, len(tuckey_metrics), figsize=(10 * len(tuckey_metrics), 5), sharey=True)
-    
+    _, axes = plt.subplots(1, len(tuckey_metrics), figsize=(10 * len(tuckey_metrics), 5), sharey=True)
+
     for i, (metric, tuckey_metric) in enumerate(tuckey_metrics.items()):
         if direction_dict and metric in direction_dict:
-            best_method = df_in.groupby(group_col)[metric].mean().reset_index().sort_values(by=metric, ascending=(direction_dict[metric]=='minimize')).iloc[0][group_col]
+            best_method = df_in.groupby(group_col)[metric].mean().reset_index().sort_values(by=metric, ascending=direction_dict[metric]=='minimize').iloc[0][group_col]
             tuckey_metric.plot_simultaneous(comparison_name=best_method, ax=axes[i], figsize=(20, 5))
             metric_anova = run_anova(df_in, metric, group_var=group_col)
             axes[i].set_xlabel(metric2name.get(metric, metric), fontsize=14)
             axes[i].set_title(f"p = {metric_anova:.2e}", fontsize=14)
-            
+
             best_method = best_method.replace('\n', ' ')
             print(f"- Best method for {metric}: {best_method}")
-    
+
     # Change the font size of the y-axis labels
     for ax in axes:
         ax.tick_params(axis='y', labelsize=14)

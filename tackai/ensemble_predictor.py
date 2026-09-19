@@ -3,8 +3,10 @@ Ensemble Predictor for TACK Models
 Handles loading and prediction from multiple model types (XGBoost, Lightning)
 with weighted averaging and uncertainty quantification.
 """
+import gc
 import os
 import re
+import json
 import time
 import pickle
 import warnings
@@ -13,14 +15,26 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any, Literal
 from dataclasses import dataclass, field
 
+# xgboost must be imported before torch to avoid an OpenMP runtime conflict on
+# macOS: torch's libtorch sets up Intel OpenMP (libiomp5), and if xgb.Booster()
+# is first called afterwards it initialises a second OpenMP runtime → SIGSEGV.
+import xgboost as xgb
 import torch
 import numpy as np
 import pandas as pd
-import xgboost as xgb
 from tqdm import tqdm
 
-from tackai.data.datamodule import load_datamodule
-from tackai.models.tack_model import TACKModel
+from tackai.config import load_config_from_yaml
+from tackai.data.datamodule import DegradationComplexDataModule, load_datamodule
+# TACKModel is imported lazily inside _load_lightning_model so that XGBoost-only
+# ensembles never trigger the PyTorch/OpenMP initialisation that conflicts with
+# XGBoost's own OpenMP runtime on macOS.
+
+# Default HF Hub repo holding the shared cache assets (Cellosaurus lookup
+# tables, cell/Morgan-FP embeddings, precomputed POI/ligase embeddings) that
+# from_pretrained() wires up via TACKAI_CACHE. See README's "Pre-trained
+# Models & Cache Files" section.
+DEFAULT_CACHE_REPO_ID = "ailab-bio/TACK-cache"
 
 warnings.filterwarnings('ignore')
 
@@ -33,44 +47,33 @@ class EnsemblePrediction:
     Two kinds of 95% confidence intervals are provided:
 
     * **Percentile CI** – non-parametric, based on the 2.5th and 97.5th
-      percentiles of the individual model predictions.  Interpretation:
-      "most models predict within this range."
+      percentiles of the individual model predictions.
     * **SEM CI** – parametric, based on the standard error of the mean
-      (assumes approximate normality).  Interpretation: "the true average
-      prediction is likely in this range."  Shrinks towards zero as the
-      number of models increases.
+      (assumes approximate normality).
     """
-    # Core predictions (denormalized / original scale)
     weighted_mean: np.ndarray
     uncertainty_std: np.ndarray
 
-    # Individual model info (all denormalized)
     individual_predictions: Dict[str, np.ndarray]
     weights: Dict[str, float]
     model_names: List[str]
 
-    # Task and label info
     task: str = 'dmax'
     label_name: Optional[str] = None
 
-    # Additional uncertainty metrics (computed from denormalized predictions)
     prediction_variance: np.ndarray = field(default=None)
     prediction_range: np.ndarray = field(default=None)
     prediction_iqr: np.ndarray = field(default=None)
 
-    # For binary classification
     predictive_entropy: Optional[np.ndarray] = None
 
-    # Percentile-based 95% CI (non-parametric)
     ci_percentile_lower_95: Optional[np.ndarray] = None
     ci_percentile_upper_95: Optional[np.ndarray] = None
 
-    # Standard Error Method (SEM)-based 95% CI (parametric, normal assumption)
     ci_sem_lower_95: Optional[np.ndarray] = None
     ci_sem_upper_95: Optional[np.ndarray] = None
 
     def __post_init__(self):
-        """Compute additional uncertainty metrics from denormalized predictions."""
         if not self.individual_predictions:
             return
 
@@ -79,31 +82,18 @@ class EnsemblePrediction:
 
         self.prediction_variance = np.var(preds, axis=0)
         self.prediction_range = np.max(preds, axis=0) - np.min(preds, axis=0)
+        self.prediction_iqr = np.percentile(preds, 75, axis=0) - np.percentile(preds, 25, axis=0)
 
-        q75 = np.percentile(preds, 75, axis=0)
-        q25 = np.percentile(preds, 25, axis=0)
-        self.prediction_iqr = q75 - q25
-
-        # --- Percentile-based 95% CI (non-parametric) ---
         self.ci_percentile_lower_95 = np.percentile(preds, 2.5, axis=0)
         self.ci_percentile_upper_95 = np.percentile(preds, 97.5, axis=0)
 
-        # --- SEM-based 95% CI (parametric) ---
-        if n_models > 1:
-            sem = np.std(preds, ddof=1, axis=0) / np.sqrt(n_models)
-        else:
-            sem = np.zeros_like(self.weighted_mean)
+        sem = np.std(preds, ddof=1, axis=0) / np.sqrt(n_models) if n_models > 1 else np.zeros_like(self.weighted_mean)
         self.ci_sem_lower_95 = self.weighted_mean - 1.96 * sem
         self.ci_sem_upper_95 = self.weighted_mean + 1.96 * sem
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary for serialization."""
         def to_list(arr):
-            if arr is None:
-                return None
-            if isinstance(arr, np.ndarray):
-                return arr.tolist()
-            return arr
+            return arr.tolist() if isinstance(arr, np.ndarray) else arr
 
         return {
             'weighted_mean': to_list(self.weighted_mean),
@@ -124,16 +114,14 @@ class EnsemblePrediction:
         }
 
     def summary(self) -> str:
-        """Return a formatted summary string."""
-        lines = [
+        return "\n".join([
             f"Task: {self.task.upper()}",
             f"Label: {self.label_name or 'N/A'}",
             f"Number of models: {len(self.model_names)}",
             f"Prediction: {self.weighted_mean[0]:.4f} ± {self.uncertainty_std[0]:.4f}",
             f"95% CI (percentile): [{self.ci_percentile_lower_95[0]:.4f}, {self.ci_percentile_upper_95[0]:.4f}]",
             f"95% CI (SEM):        [{self.ci_sem_lower_95[0]:.4f}, {self.ci_sem_upper_95[0]:.4f}]",
-        ]
-        return "\n".join(lines)
+        ])
 
 
 @dataclass
@@ -148,10 +136,9 @@ class SampleInput:
     assay_type: Optional[str] = None
     treatment_time: Optional[float] = None
     degrader_type: Optional[str] = None
-    
-    # For precomputed features
+
     precomputed_features: Optional[np.ndarray] = None
-    
+
     def to_datamodule_dict(
         self,
         smiles_col: str = "SMILES",
@@ -164,7 +151,6 @@ class SampleInput:
         treatment_time_col: str = "Assay_Time",
         degrader_type_col: str = "Degrader_Type",
     ) -> Dict[str, Any]:
-        """Convert to dictionary format expected by datamodule."""
         return {
             smiles_col: self.smiles,
             poi_col: self.poi_name,
@@ -178,111 +164,101 @@ class SampleInput:
         }
 
 
-# Feature-key prefixes treated as SMILES-dependent in the context /
-# SMILES split used by preprocess_context + predict_smiles_batch.
+# Feature-key prefixes treated as SMILES-dependent in the SMILES/context split.
 SMILES_FEATURE_PREFIXES: Tuple[str, ...] = (
     'Feature_Fingerprint',
     'Feature_Descriptor_',
 )
+
+# Default values for optional inputs.
+DEFAULT_VALUES = {
+    'Cell_Line_ID': 'Unknown cell line.',
+    'Assay': 'Unknown',
+    'Assay_Time': 24.0,
+    'Degrader_Type': 'PROTAC',
+}
+
+KNOWN_TASKS = {'dmax', 'dc50', 'bin', 'dmax_bin', 'dc50_bin', 'multitask'}
 
 
 @dataclass
 class PreprocessedContext:
     """Per-model encoded context for fast repeated SMILES screening.
 
-    Produced by :meth:`EnsemblePredictor.preprocess_context`; consumed by
-    :meth:`EnsemblePredictor.predict_smiles_batch`.
-
-    Memory footprint is O(M * D_context) — one 1-D vector per context
-    feature per model, plus one ``(1, total_dim)`` float32 template per
-    XGBoost model. No replication to batch size up front.
+    Produced by :meth:`EnsemblePredictor.transform_context`; pass to
+    :meth:`EnsemblePredictor.predict` as the ``context`` argument together
+    with a list of SMILES strings to score them against a fixed biological
+    context without re-encoding protein / cell-line embeddings.
     """
-    # Per-model, per-feature-key → 1-D ndarray (context features only)
     context_features: Dict[str, Dict[str, np.ndarray]]
-    # Per-model XGBoost row layout: [(key, offset, width), ...]
     xgb_layouts: Dict[str, List[Tuple[str, int, int]]]
-    # Per-model total XGBoost row width
     xgb_total_dims: Dict[str, int]
-    # Per-model prefilled XGBoost row template (shape (1, total_dim),
-    # float32). SMILES slices are zero; context slices are filled in.
     xgb_row_template: Dict[str, np.ndarray]
-    # Per-model cached expected feature_names for DMatrix alignment
     xgb_feature_names: Dict[str, List[str]]
-    # Tag identifying the predictor that produced this context — guards
-    # against accidentally mixing contexts across predictors.
     predictor_id: int = 0
-    # The filled context dict (for debugging / inspection)
     source_context: Dict[str, Any] = field(default_factory=dict)
 
 
-# Default values for optional inputs based on common training data.
-# NOTE: SMILES, POI (name/sequence), and E3 ligase (name/sequence) are
-# considered *required* — no defaults are supplied for them.
-DEFAULT_VALUES = {
-    'Cell_Line_ID': 'Unknown cell line.',
-    'Assay': 'Unknown',
-    'Assay_Time': 24.0,  # Default 24 hours
-    'Degrader_Type': 'PROTAC',
-}
-
-# Task labels recognised in model filenames
-KNOWN_TASKS = {'dmax', 'dc50', 'bin', 'dmax_bin', 'dc50_bin', 'multitask'}
-
-
 class EnsemblePredictor:
-    """
-    Ensemble predictor that loads and combines predictions from multiple models.
-    
-    Supports:
-    - XGBoost models (.json, .ubj, .pkl)
-    - PyTorch Lightning models (.ckpt)
-    - Weighted averaging with uncertainty quantification
-    - Proper denormalization using datamodule transformers
-    
-    Example:
-        >>> predictor = EnsemblePredictor.from_directory(
-        ...     model_dir='models/',
-        ...     weights={'model1': 0.5, 'model2': 0.5}
+    """Ensemble predictor that loads and combines predictions from multiple models.
+
+    Supports XGBoost and PyTorch Lightning models with weighted averaging and
+    uncertainty quantification. Use :meth:`from_pretrained` to instantiate,
+    either from a local directory or a Hugging Face Hub repo id.
+
+    Example (local directory):
+        >>> predictor = EnsemblePredictor.from_pretrained(
+        ...     'outputs/tack2_dmax_scaffold/ensemble_caruana/checkpoints',
+        ...     weights_file='ensemble_weights_dmax_caruana_all_models.json',
         ... )
-        >>> sample = SampleInput(
-        ...     smiles='CCO',
-        ...     poi_name='BRD4',
-        ...     poi_sequence='MKTAYIA...',
-        ...     ligase_name='CRBN',
-        ...     cell_line='HEK293',
+        >>> result = predictor.predict({
+        ...     'SMILES': 'CCO', 'POI_Name': 'BRD4', ...
+        ... })
+
+    Example (Hugging Face Hub):
+        >>> predictor = EnsemblePredictor.from_pretrained(
+        ...     'ailab-bio/TACK-ensembles', subfolder='dmax_caruana',
         ... )
-        >>> result = predictor.predict(sample)
-        >>> print(f"Prediction: {result.weighted_mean} ± {result.uncertainty_std}")
+        >>> result = predictor.predict({
+        ...     'SMILES': 'CCO', 'POI_Name': 'BRD4', ...
+        ... })
     """
-    
+
+    TASK_LABELS = {
+        'dmax': 'Dmax (%)',
+        'dc50': 'DC50 (nM)',
+        'bin': 'Binary Activity',
+    }
+
     def __init__(
         self,
         models: Dict[str, Any],
         datamodules: Dict[str, Any],
-        weights: Optional[Dict[str, float]] = None,
+        weights: Dict[str, float],
         device: str = 'cpu',
         n_jobs: Optional[int] = None,
     ) -> None:
-        """
-        Initialize the ensemble predictor.
+        """Private constructor. Use :meth:`from_directory` instead.
 
         Args:
-            models: Dictionary mapping model names to model objects
-            datamodules: Dictionary mapping model names to their datamodules
-            weights: Optional weights for each model (uniform if None)
-            device: Device to use for inference ('cpu' or 'cuda')
-            n_jobs: Number of threads for XGBoost inference (None = all cores)
+            models: Mapping of model name → model object.
+            datamodules: Mapping of model name → fitted DegradationComplexDataModule.
+            weights: Mapping of model name → ensemble weight.
+            device: Inference device ('cpu' or 'cuda').
+            n_jobs: XGBoost thread count (None = all cores).
         """
         self.models = models
         self.datamodules = datamodules
-        # Normalize device string: PyTorch uses "cuda", not "gpu"
+        self.weights = weights
         self.device = 'cuda' if device == 'gpu' else device
         self.n_jobs = n_jobs
 
-        # XGBoost uses OpenMP; if OMP_NUM_THREADS was set (e.g. to 1 by SLURM
-        # or a parent shell) it will clamp thread count regardless of
-        # `set_param('nthread', N)`. Align it with n_jobs here so set_param
-        # can take effect at predict time.
+        # Lazy-loading state — populated by from_directory(lazy_loading=True)
+        self._lazy: bool = False
+        self._model_paths: Dict[str, Path] = {}
+        self._dm_paths: Dict[str, Tuple[Optional[Path], Path]] = {}
+        self._hparam_overrides: Optional[Dict[str, Any]] = None
+
         if n_jobs is not None and n_jobs > 1:
             omp = os.environ.get('OMP_NUM_THREADS')
             if omp is None or int(omp) < n_jobs:
@@ -290,592 +266,647 @@ class EnsemblePredictor:
                 if omp is not None:
                     warnings.warn(
                         f"OMP_NUM_THREADS was {omp}, overriding to {n_jobs} "
-                        "so XGBoost can use the requested threads. Set this "
-                        "in the environment before launching Python to avoid "
-                        "OpenMP being pre-initialized with fewer threads.",
+                        "so XGBoost can use the requested threads.",
                         UserWarning, stacklevel=2,
                     )
             try:
                 xgb.set_config(nthread=n_jobs)
             except (TypeError, AttributeError):
                 pass
-        
-        # Per-model task inferred from filenames / datamodule label names
-        self.model_tasks: Dict[str, str] = {}
-        for name in models:
-            self.model_tasks[name] = self._infer_model_task(name, datamodules.get(name))
-        
-        # Set up weights, if not provided, use uniform weights per task,
-        # creating a dict mapping model name → weight
-        self.weights = {}
-        if weights is None:
-            task2name = {}
-            for name, task in self.model_tasks.items():
-                if task not in task2name:
-                    task2name[task] = []
-                task2name[task].append(name)
-            # Convert to model_name → weight
-            for task, names in task2name.items():
-                n = len(names)
-                for name in names:
-                    self.weights[name] = 1.0 / n
-        
-        # Validate weights
-        for name in self.weights.keys():
-            if name not in self.models:
-                raise ValueError(f"Weight specified for unknown model: {name}")
-        
-        # Model type tracking
-        self.model_types = {}
-        for name, model in self.models.items():
-            self.model_types[name] = self._get_model_type(model)
-        
-        # Validate that every model has a corresponding datamodule
-        missing_dm = [name for name in self.models if self.datamodules.get(name) is None]
+
+        self.model_tasks = {
+            name: self._infer_model_task(name, datamodules.get(name))
+            for name in models
+        }
+        self.model_types = {name: self._get_model_type(model) for name, model in models.items()}
+
+        missing_dm = [name for name in models if datamodules.get(name) is None]
         if missing_dm:
             raise ValueError(
                 f"The following models have no associated datamodule: {missing_dm}. "
                 "Each model must have a corresponding datamodule for featurization "
                 "and denormalization."
             )
-    
+
     # ------------------------------------------------------------------
-    # Task inference
+    # Construction
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _infer_model_task(model_name: str, datamodule: Optional[Any] = None) -> str:
-        """Infer the prediction task for a single model.
-
-        The task is determined by:
-        1. The label names stored in the datamodule (most reliable).
-        2. Parsing the model filename (``model=<arch>_<task>_protac-...``).
-        3. Falling back to ``'dmax'`` if nothing else works.
-        """
-        # 1. From datamodule label names
-        if datamodule is not None and hasattr(datamodule, 'labels') and datamodule.labels:
-            label = datamodule.labels[0].lower()
-            if 'binary' in label or 'activity' in label:
-                return 'bin'
-            elif 'pdc50' in label or 'dc50' in label:
-                return 'dc50'
-            elif 'dmax' in label:
-                return 'dmax'
-
-        # 2. From model filename convention:
-        #    model=<arch>_<task>_protac-data=...
-        #    e.g. model=mlp_dmax_protac-data=...
-        m = re.search(r'model=\w+?_(\w+?)_protac', model_name, re.IGNORECASE)
-        if m:
-            task_str = m.group(1).lower()
-            if task_str in KNOWN_TASKS:
-                return task_str
-
-        return 'dmax'
-
-    def get_categorical_choices(self) -> Dict[str, List[str]]:
-        """Collect unique category values from all datamodule ordinal encoders.
-
-        Returns a dict mapping column names (e.g. ``'Ligase_Name'``,
-        ``'Cell_Line_ID'``, ``'Assay'``) to sorted lists of known
-        categories seen during training (across **all** folds / configs).
-        """
-        merged = {}
-        for dm in self.datamodules.values():
-            if dm is None:
-                continue
-            pipeline = getattr(dm, 'category_pipeline', None)
-            if pipeline is None:
-                continue
-            for _, transformer, cols in pipeline.transformers_:
-                ordinal = transformer.named_steps.get('ordinal') if hasattr(transformer, 'named_steps') else None
-                if ordinal is None or not hasattr(ordinal, 'categories_'):
-                    continue
-                for col, cats in zip(cols, ordinal.categories_):
-                    if col not in merged:
-                        merged[col] = set()
-                    merged[col].update(c for c in cats if c is not None)
-        # Convert to sorted lists
-        return {col: sorted(vals) for col, vals in merged.items()}
-
-    @property
-    def available_tasks(self) -> List[str]:
-        """Return the distinct set of tasks present in the loaded models."""
-        return sorted(set(self.model_tasks.values()))
-    
-    def get_required_inputs(self, model_name: Optional[str] = None) -> Dict[str, List[str]]:
-        """
-        Get the required inputs for each model/datamodule.
-        
-        Args:
-            model_name: Specific model name, or None for all models
-            
-        Returns:
-            Dictionary mapping model names to lists of required column names
-        """
-        required = {}
-        
-        datamodules = self.datamodules
-        if model_name is not None:
-            datamodules = {model_name: self.datamodules.get(model_name)}
-        
-        req_cols_set = set()
-        
-        for name, dm in datamodules.items():
-            req_cols = [dm.smiles_col]  # Always need SMILES
-            
-            # Check which features this datamodule needs
-            if getattr(dm, 'use_poi_sequence_embedding', False):
-                req_cols.append(dm.poi_sequence_col)
-            if getattr(dm, 'use_poi_name_embedding', False):
-                req_cols.append(dm.poi_col)
-            if getattr(dm, 'use_poi_precomputed_embedding', False):
-                # Depends on embedding ID type
-                if getattr(dm, 'poi_embeddings_id_type', 'sequence') == 'sequence':
-                    req_cols.append(dm.poi_sequence_col)
-                else:
-                    req_cols.append(dm.poi_col)
-            if getattr(dm, 'use_ligase_name_embedding', False):
-                req_cols.append(dm.ligase_col)
-            if getattr(dm, 'use_ligase_precomputed_embedding', False):
-                req_cols.append(dm.ligase_sequence_col)
-            if getattr(dm, 'use_cell_description_embedding', False) or getattr(dm, 'use_cell_name_embedding', False):
-                req_cols.append(dm.cell_line_col)
-            if getattr(dm, 'use_treatment_time', False):
-                req_cols.append(dm.treatment_time_col)
-            if getattr(dm, 'use_assay_type_encoding', False):
-                req_cols.append(dm.assay_type_col)
-            
-            required[name] = list(set(req_cols))  # Remove duplicates
-            req_cols_set.update(required[name])
-        
-        return req_cols_set, required
-    
-    @staticmethod
-    def _get_model_type(model: Any) -> str:
-        """Determine the type of model."""
-        model_class = type(model).__name__
-        
-        if 'XGB' in model_class or 'Booster' in model_class:
-            return 'xgboost'
-        elif hasattr(model, 'forward') and hasattr(model, 'eval'):
-            return 'lightning'
-        else:
-            return 'unknown'
-    
     @classmethod
-    def from_directory(
+    def from_pretrained(
         cls,
-        model_dir: Union[str, Path],
-        datamodule_dir: Optional[Union[str, Path]] = None,
-        weights: Optional[Dict[str, float]] = None,
+        model_id: Union[str, Path],
+        *,
+        subfolder: Optional[str] = None,
+        revision: Optional[str] = None,
+        cache_repo_id: Optional[str] = DEFAULT_CACHE_REPO_ID,
+        cache_revision: Optional[str] = None,
+        token: Optional[str] = None,
+        weights_file: Optional[Union[str, Path]] = None,
         device: str = 'cpu',
         n_jobs: Optional[int] = None,
         pattern: Optional[str] = None,
+        hparam_overrides: Optional[Dict[str, Any]] = None,
+        lazy_loading: bool = True,
     ) -> 'EnsemblePredictor':
-        """
-        Load models from a directory.
-        
+        """Load an ensemble from a local directory or a Hugging Face Hub repo.
+
+        If ``model_id`` is an existing local path, this behaves exactly like
+        the old ``from_directory`` (no network access). Otherwise ``model_id``
+        is treated as a HF Hub repo id: the checkpoints are downloaded via
+        :func:`huggingface_hub.snapshot_download` (respecting ``HF_HOME`` /
+        ``HF_HUB_CACHE`` like any other HF download), the shared cache assets
+        (``poi_embeddings_file`` / ``ligase_embeddings_file`` Boltz archives,
+        and — only if actually needed — the ~370 MB Cellosaurus lookup tables)
+        are downloaded from ``cache_repo_id``, and ``TACKAI_CACHE`` is pointed
+        at that download for the rest of the process — **overriding** any
+        ``TACKAI_CACHE`` already set (e.g. via ``.env``), since that value is
+        otherwise picked up first by ``load_dotenv()`` and would silently
+        shadow the freshly downloaded, known-complete snapshot. Pass
+        ``cache_repo_id=None`` to opt out and keep using your own
+        ``TACKAI_CACHE`` untouched.
+
         Args:
-            model_dir: Directory containing model files
-            datamodule_dir: Directory containing datamodule state dicts (optional)
-            weights: Optional weights for each model
-            task: Task type
-            label_name: Label column name for denormalization
-            device: Device for inference
-            n_jobs: Number of threads for running XGBoost models
-            pattern: Optional regex pattern to filter model files
-            
+            model_id: Local directory, or a HF Hub repo id such as
+                ``'ailab-bio/TACK-ensembles'``.
+            subfolder: Subdirectory within the Hub repo holding one ensemble's
+                checkpoints (e.g. ``'dmax_caruana'``). Ignored for local paths
+                — pass the checkpoints directory directly instead.
+            revision: Hub revision (branch/tag/commit) for ``model_id``.
+            cache_repo_id: HF Hub dataset repo holding the shared cache assets
+                (precomputed POI/ligase embeddings, Cellosaurus tables, Morgan
+                fingerprint/cell-embedding caches). Defaults to
+                ``'ailab-bio/TACK-cache'``. When set (the default), any
+                existing ``TACKAI_CACHE`` is overridden to point at the
+                downloaded snapshot for the rest of the process. Pass
+                ``None`` to skip downloading cache assets entirely and leave
+                your own ``TACKAI_CACHE`` in charge (only safe if every
+                referenced precomputed-embedding file is already reachable
+                there).
+            cache_revision: Hub revision for ``cache_repo_id``.
+            token: HF Hub auth token, for private repos. Defaults to whatever
+                ``huggingface_hub`` resolves from the environment/CLI login.
+            weights_file: Optional JSON file with per-model weights. If not
+                given and ``model_id`` resolves to a Hub repo, a single
+                ``ensemble_weights_*.json`` found alongside the checkpoints is
+                used automatically.
+            device: Inference device (``'cpu'`` or ``'cuda'``).
+            n_jobs: XGBoost thread count (``None`` = all cores).
+            pattern: Optional regex to filter model file paths.
+            hparam_overrides: Optional hparam key/value pairs applied to every
+                datamodule before it is instantiated; caller-supplied values
+                win over anything this method infers (e.g. the resolved
+                ``poi_embeddings_file`` path). See :meth:`_from_local_directory`.
+            lazy_loading: If ``True`` (default), models/datamodules are loaded
+                one at a time during inference and freed immediately after.
+
         Returns:
-            Initialized EnsemblePredictor
+            Initialized :class:`EnsemblePredictor`.
+        """
+        local_dir = Path(model_id)
+        if local_dir.exists():
+            return cls._from_local_directory(
+                local_dir,
+                weights_file=weights_file,
+                device=device,
+                n_jobs=n_jobs,
+                pattern=pattern,
+                hparam_overrides=hparam_overrides,
+                lazy_loading=lazy_loading,
+            )
+
+        try:
+            from huggingface_hub import snapshot_download
+        except ImportError as e:
+            raise ImportError(
+                "huggingface_hub is required to load an EnsemblePredictor from "
+                "the Hugging Face Hub. Install it with `pip install huggingface_hub` "
+                "or pass a local directory to from_pretrained() instead."
+            ) from e
+
+        repo_id = str(model_id)
+        print(f"Downloading ensemble checkpoints from '{repo_id}'"
+              + (f" (subfolder={subfolder})" if subfolder else "") + " ...")
+        snapshot_root = Path(snapshot_download(
+            repo_id=repo_id,
+            revision=revision,
+            token=token,
+            allow_patterns=[f"{subfolder}/**"] if subfolder else None,
+        ))
+        resolved_dir = snapshot_root / subfolder if subfolder else snapshot_root
+
+        # --- Auto-discover the weights file, if not given explicitly --------
+        if weights_file is None:
+            candidates = list(resolved_dir.glob('ensemble_weights_*.json'))
+            if len(candidates) == 1:
+                weights_file = candidates[0]
+                print(f"Auto-discovered weights file: {weights_file.name}")
+            elif len(candidates) > 1:
+                print(
+                    f"  Warning: {len(candidates)} ensemble_weights_*.json files found "
+                    f"under {resolved_dir}; pass weights_file= explicitly to disambiguate. "
+                    "Falling back to uniform per-task weights."
+                )
+
+        # --- Inspect hparams to know which cache assets are actually needed -
+        embeddings_basenames, needs_cellosaurus = cls._scan_hparams_for_cache_needs(resolved_dir)
+
+        resolved_overrides: Dict[str, Any] = {}
+        if cache_repo_id is not None and (embeddings_basenames or needs_cellosaurus):
+            cache_allow_patterns = [
+                'morgan_fp_*.npz', 'cell_embeddings_*.npz', 'rdkit_descriptors*.npz',
+            ] + [f'{name}' for name in embeddings_basenames]
+            if needs_cellosaurus:
+                cache_allow_patterns += ['cell2*.json', 'cellosaurus.txt']
+
+            print(f"Downloading shared cache assets from '{cache_repo_id}' ...")
+            cache_root = Path(snapshot_download(
+                repo_id=cache_repo_id,
+                repo_type='dataset',
+                revision=cache_revision,
+                token=token,
+                allow_patterns=cache_allow_patterns,
+            ))
+            # Override (not setdefault): TACKAI_CACHE is almost always already
+            # set via .env's load_dotenv() at import time, which would
+            # otherwise silently shadow this known-complete downloaded
+            # snapshot with a stale/incomplete local cache. Opt out via
+            # cache_repo_id=None to keep an existing TACKAI_CACHE untouched.
+            prev_cache = os.environ.get('TACKAI_CACHE')
+            if prev_cache and prev_cache != str(cache_root):
+                print(f"  Overriding TACKAI_CACHE ({prev_cache} -> {cache_root}) "
+                      "for this from_pretrained() session.")
+            os.environ['TACKAI_CACHE'] = str(cache_root)
+
+            for name in embeddings_basenames:
+                candidate = cache_root / name
+                if candidate.exists():
+                    resolved_overrides['poi_embeddings_file'] = str(candidate)
+                    resolved_overrides['ligase_embeddings_file'] = str(candidate)
+
+        if hparam_overrides:
+            resolved_overrides.update(hparam_overrides)
+
+        return cls._from_local_directory(
+            resolved_dir,
+            weights_file=weights_file,
+            device=device,
+            n_jobs=n_jobs,
+            pattern=pattern,
+            hparam_overrides=resolved_overrides or None,
+            lazy_loading=lazy_loading,
+        )
+
+    @staticmethod
+    def _scan_hparams_for_cache_needs(model_dir: Path) -> Tuple[List[str], bool]:
+        """Cheaply scan every ``*_hparams.yaml`` under *model_dir* (no torch/
+        datamodule construction) to find which cache assets from_pretrained()
+        needs to fetch: the basenames of any referenced precomputed
+        ``poi_embeddings_file`` / ``ligase_embeddings_file``, and whether any
+        datamodule uses ``cell_features: description`` (which requires the
+        large Cellosaurus lookup tables).
+        """
+        embeddings_basenames: set = set()
+        needs_cellosaurus = False
+        for yaml_path in model_dir.glob('**/*_hparams.yaml'):
+            try:
+                hparams = load_config_from_yaml(yaml_path)
+            except Exception:
+                continue
+            for key in ('poi_embeddings_file', 'ligase_embeddings_file'):
+                value = hparams.get(key)
+                if value:
+                    embeddings_basenames.add(Path(value).name)
+            if hparams.get('cell_features') == 'description':
+                needs_cellosaurus = True
+        return sorted(embeddings_basenames), needs_cellosaurus
+
+    @classmethod
+    def from_directory(cls, model_dir: Union[str, Path], **kwargs) -> 'EnsemblePredictor':
+        """Deprecated alias for :meth:`from_pretrained`.
+
+        Kept for backwards compatibility with existing callers. New code
+        should call :meth:`from_pretrained` directly — it accepts both local
+        directories and Hugging Face Hub repo ids.
+        """
+        warnings.warn(
+            "EnsemblePredictor.from_directory is deprecated; use from_pretrained "
+            "instead (it accepts both local directories and HF Hub repo ids).",
+            DeprecationWarning, stacklevel=2,
+        )
+        return cls.from_pretrained(model_dir, **kwargs)
+
+    @classmethod
+    def _from_local_directory(
+        cls,
+        model_dir: Union[str, Path],
+        weights_file: Optional[Union[str, Path]] = None,
+        device: str = 'cpu',
+        n_jobs: Optional[int] = None,
+        pattern: Optional[str] = None,
+        hparam_overrides: Optional[Dict[str, Any]] = None,
+        lazy_loading: bool = True,
+    ) -> 'EnsemblePredictor':
+        """Load ensemble from a local directory containing models and datamodules.
+
+        This is the shared implementation behind :meth:`from_pretrained` (once
+        it has resolved a HF Hub repo id to a local snapshot directory) and the
+        deprecated :meth:`from_directory` alias.
+
+        Args:
+            model_dir: Directory containing model files and paired datamodule
+                state dicts (``*_state.pt`` / ``*_hparams.yaml``).
+            weights_file: Optional JSON file with per-model weights. Only the
+                models listed in the file are loaded; their weights are used for
+                the ensemble average. See module docstring for file format.
+            device: Inference device (``'cpu'`` or ``'cuda'``).
+            n_jobs: XGBoost thread count (``None`` = all cores).
+            pattern: Optional regex to filter model file paths.
+            hparam_overrides: Optional hparam key/value pairs applied to every
+                datamodule before it is instantiated. Useful for fixing stale
+                paths stored in old checkpoints, e.g.::
+
+                    EnsemblePredictor.from_pretrained(
+                        'ensembles/dc50',
+                        hparam_overrides={
+                            'poi_embeddings_file': '/new/embeddings.npz',
+                            'ligase_embeddings_file': '/new/embeddings.npz',
+                        },
+                    )
+            lazy_loading: If ``True`` (default), models and datamodules are
+                loaded one at a time during inference and immediately freed
+                afterwards. This keeps peak memory proportional to a single
+                model rather than the whole ensemble. Set to ``False`` to
+                load everything eagerly upfront (old behaviour).
+
+        Returns:
+            Initialized :class:`EnsemblePredictor`.
         """
         model_dir = Path(model_dir)
-        device = 'cuda' if device == 'gpu' else device
-
         if not model_dir.exists():
             raise FileNotFoundError(f"Model directory not found: {model_dir}")
 
-        models = {}
-        datamodules = {}
-        
-        # Find model files
-        model_files = []
+        device = 'cuda' if device == 'gpu' else device
+
+        # --- Parse weights file -------------------------------------------
+        weights = None
+        wanted_stems: Optional[set] = None
+        if weights_file is not None:
+            weights_file = Path(weights_file)
+            if not weights_file.exists():
+                raise FileNotFoundError(f"Weights file not found: {weights_file}")
+            with open(weights_file) as f:
+                weights_doc = json.load(f)
+            weights = weights_doc.get("weights", {})
+            if not weights:
+                raise ValueError(f"No 'weights' key found in {weights_file}")
+            wanted_stems = set(weights)
+            print(
+                f"Loaded weights from {weights_file.name} "
+                f"(task={weights_doc.get('task', 'unknown')}, "
+                f"method={weights_doc.get('method', 'unknown')}, "
+                f"{len(weights)} models)"
+            )
+
+        # --- Discover model files -----------------------------------------
+        model_files: List[Path] = []
         for ext in ['*.ckpt', '*.json', '*.ubj', '*.pkl']:
             model_files.extend(model_dir.glob(f'**/{ext}'))
-        
-        # Filter by pattern if provided
+
         if pattern:
             regex = re.compile(pattern)
             model_files = [f for f in model_files if regex.search(str(f))]
-        
-        print(f"Found {len(model_files)} model files in {model_dir}")
-        
-        for i, model_file in enumerate(model_files):
-            model_name = model_file.stem
-            
-            try:
-                model, datamodule = cls._load_model_and_datamodule(
-                    model_file, device, datamodule_dir, n_jobs
+
+        # --- Validate weights against found files -------------------------
+        if wanted_stems is not None:
+            found_stems = {f.stem for f in model_files}
+            missing = wanted_stems - found_stems
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} model(s) from weights file not found in {model_dir}: "
+                    + ", ".join(sorted(missing))
                 )
-                models[model_name] = model
-                datamodules[model_name] = datamodule
-                print(f"  Loaded ({i+1}/{len(model_files)}): {model_name} ({cls._get_model_type(model)})")
+            model_files = [f for f in model_files if f.stem in wanted_stems]
+
+        print(f"{'Registering' if lazy_loading else 'Loading'} {len(model_files)} model(s) from {model_dir}")
+
+        # ------------------------------------------------------------------ #
+        # LAZY PATH — store paths, infer metadata from filenames/extensions  #
+        # ------------------------------------------------------------------ #
+        if lazy_loading:
+            model_tasks: Dict[str, str] = {}
+            model_types: Dict[str, str] = {}
+            model_paths: Dict[str, Path] = {}
+            dm_paths: Dict[str, Tuple[Optional[Path], Path]] = {}
+
+            for model_file in model_files:
+                name = model_file.stem
+                paths = cls._find_dm_paths(model_file)
+                if paths is None:
+                    warnings.warn(f"No datamodule found for {name} — skipping.")
+                    continue
+                mtype = (
+                    'xgboost'
+                    if model_file.suffix.lower() in ('.json', '.ubj', '.pkl')
+                    else 'lightning'
+                )
+                model_paths[name] = model_file
+                dm_paths[name] = paths
+                model_tasks[name] = cls._infer_model_task(name, None)
+                model_types[name] = mtype
+                print(f"  Registered ({len(model_paths)}/{len(model_files)}): {name} ({mtype})")
+
+            if not model_paths:
+                raise ValueError(f"No models with matching datamodules found in {model_dir}")
+
+            if weights is None:
+                task_to_names: Dict[str, List[str]] = defaultdict(list)
+                for name, task in model_tasks.items():
+                    task_to_names[task].append(name)
+                weights = {
+                    name: 1.0 / len(names)
+                    for names in task_to_names.values()
+                    for name in names
+                }
+            else:
+                weights = {k: v for k, v in weights.items() if k in model_paths}
+
+            predictor = cls(models={}, datamodules={}, weights=weights, device=device, n_jobs=n_jobs)
+            predictor._lazy = True
+            predictor._model_paths = model_paths
+            predictor._dm_paths = dm_paths
+            predictor._hparam_overrides = hparam_overrides
+            predictor.model_tasks = model_tasks
+            predictor.model_types = model_types
+            return predictor
+
+        # ------------------------------------------------------------------ #
+        # EAGER PATH — load everything upfront                               #
+        # ------------------------------------------------------------------ #
+        models: Dict[str, Any] = {}
+        datamodules: Dict[str, Any] = {}
+
+        for i, model_file in enumerate(model_files):
+            name = model_file.stem
+            try:
+                model = cls._load_model(model_file, device, n_jobs)
+                dm = cls._load_datamodule(model_file, hparam_overrides=hparam_overrides)
+                models[name] = model
+                datamodules[name] = dm
+                print(f"  Loaded ({i+1}/{len(model_files)}): {name} ({cls._get_model_type(model)})")
             except Exception as e:
-                print(f"  Failed to load {model_name}: {e}")
-                continue
-        
+                print(f"  Failed to load {name}: {e}")
+
         if not models:
             raise ValueError(f"No models could be loaded from {model_dir}")
 
-        return cls(models, datamodules, weights, device, n_jobs=n_jobs)
-    
-    @classmethod
-    def from_weights_file(
-        cls,
-        weights_file: Union[str, Path],
-        model_dir: Union[str, Path],
-        datamodule_dir: Optional[Union[str, Path]] = None,
-        device: str = 'cpu',
-    ) -> 'EnsemblePredictor':
-        """
-        Load an ensemble predictor from a weights JSON file.
-        
-        Only loads the models specified in the weights file.
-        
-        Args:
-            weights_file: Path to the JSON weights file
-            model_dir: Directory containing model checkpoints
-            datamodule_dir: Directory containing datamodule state dicts
-            device: Device for inference
-            
-        Returns:
-            Initialized EnsemblePredictor with only the specified models
-        """
-        import json
-
-        weights_file = Path(weights_file)
-        model_dir = Path(model_dir)
-        device = 'cuda' if device == 'gpu' else device
-        
-        if not weights_file.exists():
-            raise FileNotFoundError(f"Weights file not found: {weights_file}")
-        if not model_dir.exists():
-            raise FileNotFoundError(f"Model directory not found: {model_dir}")
-        
-        # Load weights file
-        with open(weights_file, 'r') as f:
-            weights_doc = json.load(f)
-        
-        weights = weights_doc.get("weights", {})
-        task = weights_doc.get("task", "dmax")
-        method = weights_doc.get("method", "unknown")
-        
-        print(f"Loading ensemble from weights file: {weights_file.name}")
-        print(f"  Task: {task}")
-        print(f"  Method: {method}")
-        print(f"  Models to load: {len(weights)}")
-        
-        if not weights:
-            raise ValueError("No weights found in weights file")
-        
-        # Find all model files in directory
-        model_files = []
-        for ext in ['*.ckpt', '*.json', '*.ubj', '*.pkl']:
-            model_files.extend(model_dir.glob(f'**/{ext}'))
-        
-        # Build a lookup of model_name -> model_file
-        model_lookup = {f.stem: f for f in model_files}
-        
-        models = {}
-        datamodules = {}
-        loaded_weights = {}
-        
-        for model_name, weight in weights.items():
-            if model_name not in model_lookup:
-                print(f"  ⚠️ Model not found: {model_name}")
-                continue
-            
-            model_file = model_lookup[model_name]
-            
-            try:
-                model, datamodule = cls._load_model_and_datamodule(
-                    model_file, task, device, datamodule_dir or model_dir
-                )
-                models[model_name] = model
-                datamodules[model_name] = datamodule
-                loaded_weights[model_name] = weight
-                print(f"  ✅ Loaded: {model_name[:60]}... (weight={weight:.4f})")
-            except Exception as e:
-                print(f"  ❌ Failed to load {model_name}: {e}")
-                continue
-        
-        if not models:
-            raise ValueError(f"No models could be loaded from weights file")
-        
-        print(f"\nSuccessfully loaded {len(models)} / {len(weights)} models")
-        
-        return cls(
-            models=models,
-            datamodules=datamodules,
-            weights=loaded_weights,
-            task=task,
-            device=device,
-        )
-    
-    @staticmethod
-    def _load_model_and_datamodule(
-        model_path: Path,
-        device: str,
-        datamodule_dir: Optional[Path] = None,
-        n_jobs: Optional[int] = None,
-    ) -> Tuple[Any, Any]:
-        """Load a model and its corresponding datamodule."""
-        suffix = model_path.suffix.lower()
-        
-        if suffix == '.ckpt':
-            return EnsemblePredictor._load_lightning_model(
-                model_path, device, datamodule_dir
-            )
-        elif suffix in ['.json', '.ubj', '.pkl']:
-            return EnsemblePredictor._load_xgboost_model(
-                model_path, datamodule_dir, n_jobs, device
-            )
+        if weights is None:
+            task_to_names = defaultdict(list)
+            for name in models:
+                task = cls._infer_model_task(name, datamodules.get(name))
+                task_to_names[task].append(name)
+            weights = {
+                name: 1.0 / len(names)
+                for names in task_to_names.values()
+                for name in names
+            }
         else:
-            raise ValueError(f"Unsupported model format: {suffix}")
-    
+            weights = {k: v for k, v in weights.items() if k in models}
+
+        return cls(models, datamodules, weights, device, n_jobs)
+
+    # ------------------------------------------------------------------
+    # Static loaders
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def _load_lightning_model(
+    def _find_dm_paths(
+        model_path: Path,
+    ) -> Optional[Tuple[Optional[Path], Path]]:
+        """Return the first existing ``(hparams_path_or_None, state_path)`` pair
+        for the datamodule paired with *model_path*, or ``None`` if nothing is found.
+        """
+        stem = model_path.stem
+        parent = model_path.parent
+
+        data_config = group = fold = None
+        for part in stem.split('-'):
+            if part.startswith('data='):
+                data_config = part[5:]
+            elif part.startswith('group='):
+                group = part[6:]
+            elif part.startswith('fold='):
+                fold = part[5:]
+
+        candidates: List[Tuple[Optional[Path], Path]] = []
+        if data_config:
+            dm_base = f"datamodule-data={data_config}-group={group}-fold={fold}"
+            candidates.append((None, parent / f"{dm_base}_state.pt"))
+            candidates.append((parent / f"{dm_base}_hparams.yaml", parent / f"{dm_base}_state.pt"))
+
+        candidates += [
+            (None, parent / f"{stem}_state.pt"),
+            (None, parent / "datamodule_state.pt"),
+            (parent / "datamodule_hparams.yaml", parent / "datamodule_state.pt"),
+        ]
+
+        for hparams_path, state_path in candidates:
+            yaml_ok = hparams_path is None or hparams_path.exists()
+            if yaml_ok and state_path.exists():
+                return (hparams_path, state_path)
+        return None
+
+    @staticmethod
+    def _load_datamodule(
+        model_path: Path,
+        hparam_overrides: Optional[Dict[str, Any]] = None,
+    ) -> Optional[DegradationComplexDataModule]:
+        """Load the datamodule paired with *model_path*.
+
+        Args:
+            model_path: Path to the model file whose sibling datamodule to load.
+            hparam_overrides: Optional hparam overrides forwarded to
+                :func:`load_datamodule` (e.g. to fix stale embedding paths).
+
+        Returns:
+            Loaded :class:`DegradationComplexDataModule`, or ``None`` if no
+            matching file is found.
+        """
+        paths = EnsemblePredictor._find_dm_paths(model_path)
+        if paths is None:
+            return None
+        hparams_path, state_path = paths
+        try:
+            return load_datamodule(
+                state_dict_path=state_path,
+                hparams_path=hparams_path,
+                hparam_overrides=hparam_overrides,
+            )
+        except Exception as e:
+            warnings.warn(f"Failed to load datamodule from {state_path}: {e}")
+            return None
+
+    @staticmethod
+    def _load_model(
         model_path: Path,
         device: str,
-        datamodule_dir: Optional[Path] = None,
-    ) -> Tuple[Any, Any]:
-        """Load a PyTorch Lightning model."""
-        datamodule = None
-        
-        # Extract data configuration from model path name
-        # Format: model=mlp_dmax_protac-data=XXX-group=YYY-fold=ZZZ.ckpt
-        model_name = model_path.stem
-        data_config = None
-        for part in model_name.split('-'):
-            if part.startswith('data='):
-                data_config = part.replace('data=', '')
-                break
-        
-        # Extract group and fold from model name
-        group = None
-        fold = None
-        for part in model_name.split('-'):
-            if part.startswith('group='):
-                group = part.replace('group=', '')
-            elif part.startswith('fold='):
-                fold = part.replace('fold=', '')
-        
-        # Try to load datamodule from various locations
-        dm_candidates = []
-        
-        # First, try the naming convention used in ensemble directory
-        # Format: datamodule-data=XXX-group=YYY-fold=ZZZ_hparams.yaml / _state.pt
-        if data_config and datamodule_dir:
-            dm_dir = Path(datamodule_dir)
-            dm_base = f"datamodule-data={data_config}-group={group}-fold={fold}"
-            dm_candidates.append((dm_dir / f"{dm_base}_hparams.yaml", dm_dir / f"{dm_base}_state.pt"))
-        
-        # Also try in model's parent directory
-        if data_config:
-            dm_dir = model_path.parent
-            dm_base = f"datamodule-data={data_config}-group={group}-fold={fold}"
-            dm_candidates.append((dm_dir / f"{dm_base}_hparams.yaml", dm_dir / f"{dm_base}_state.pt"))
-        
-        # Try legacy naming conventions as fallback
-        if datamodule_dir:
-            dm_dir = Path(datamodule_dir)
-            dm_candidates.append((dm_dir / f"{model_path.stem}_datamodule.pt", None))
-            dm_candidates.append((dm_dir / "datamodule_state.pt", None))
-        
-        dm_candidates.extend([
-            (model_path.parent / f"{model_path.stem}_datamodule.pt", None),
-            (model_path.parent / "datamodule_state.pt", None),
-            (model_path.parent / "datamodule_hparams.yaml", model_path.parent / "datamodule_state.pt"),
-        ])
-        
-        for candidate in dm_candidates:
-            # Handle tuple of (hparams_path, state_path) or (state_path, None)
-            if isinstance(candidate, tuple):
-                hparams_path, state_path = candidate
-            else:
-                hparams_path = candidate
-                state_path = None
-            
-            if not hparams_path.exists():
-                continue
-                
-            try:
-                if hparams_path.suffix == '.yaml' and state_path and state_path.exists():
-                    # Load from YAML + state dict using tackai's load_datamodule
-                    datamodule = load_datamodule(hparams_path, state_path)
-                    break
-                elif hparams_path.suffix == '.pt':
-                    # Load state dict directly
-                    from tackai.data.datamodule import DegradationComplexDataModule
-                    state_dict = torch.load(hparams_path, map_location='cpu')
-                    if 'hparams' in state_dict:
-                        datamodule = DegradationComplexDataModule(**state_dict['hparams'])
-                        datamodule.load_state_dict(state_dict)
-                        break
-            except Exception as e:
-                print(f"    Warning: Failed to load datamodule from {hparams_path}: {e}")
-        
+        n_jobs: Optional[int] = None,
+    ) -> Any:
+        """Load a model from file, dispatching on extension."""
+        suffix = model_path.suffix.lower()
+        if suffix == '.ckpt':
+            return EnsemblePredictor._load_lightning_model(model_path, device)
+        elif suffix in ('.json', '.ubj', '.pkl'):
+            return EnsemblePredictor._load_xgboost_model(model_path, n_jobs, device)
+        raise ValueError(f"Unsupported model format: {suffix}")
+
+    @staticmethod
+    def _load_lightning_model(model_path: Path, device: str) -> Any:
+        from tackai.models.tack_model import TACKModel  # lazy import: avoids loading PyTorch until needed
         try:
-            # Load Lightning model using TACKModel.load_from_checkpoint
-            model = TACKModel.load_from_checkpoint(
-                str(model_path), 
-                map_location=device,
-            )
-            model.to(device)
-            model.eval()
+            model = TACKModel.load_from_checkpoint(str(model_path), map_location=device)
         except Exception as e:
-            # Fallback: load directly with torch
             checkpoint = torch.load(model_path, map_location=device, weights_only=False)
             if 'state_dict' in checkpoint:
-                raise NotImplementedError(
-                    f"Cannot load Lightning model from checkpoint. Error: {e}"
-                )
+                raise NotImplementedError(f"Cannot load Lightning model from checkpoint: {e}")
             model = checkpoint
-        
-        return model, datamodule
-    
+        model.to(device)
+        model.eval()
+        return model
+
     @staticmethod
     def _load_xgboost_model(
         model_path: Path,
-        datamodule_dir: Optional[Path] = None,
-        n_jobs: Optional[int] = None,
+        n_jobs: Optional[int],
         device: Literal['cpu', 'cuda'] = 'cpu',
-    ) -> Tuple[Any, Any]:
-        """Load an XGBoost model."""        
+    ) -> Any:
         suffix = model_path.suffix.lower()
-        
-        if suffix in ['.json', '.ubj']:
+        if suffix in ('.json', '.ubj'):
             model = xgb.Booster()
             model.load_model(str(model_path))
+        else:
+            with open(model_path, 'rb') as f:
+                model = pickle.load(f)
+
+        if isinstance(model, xgb.Booster):
             if n_jobs is not None:
                 model.set_param('nthread', n_jobs)
             if device != 'cpu':
                 model.set_param('device', device)
-        elif suffix == '.pkl':
-            with open(model_path, 'rb') as f:
-                model = pickle.load(f)
-            if isinstance(model, xgb.Booster):
-                if n_jobs is not None:
-                    model.set_param('nthread', n_jobs)
-                if device != 'cpu':
-                    model.set_param('device', device)
-            elif hasattr(model, 'set_params'):
-                # sklearn wrapper (XGBClassifier / XGBRegressor)
-                kwargs = {}
-                if n_jobs is not None:
-                    kwargs['n_jobs'] = n_jobs
-                if device != 'cpu':
-                    kwargs['device'] = device
-                if kwargs:
-                    model.set_params(**kwargs)
+        elif hasattr(model, 'set_params'):
+            kwargs = {}
+            if n_jobs is not None:
+                kwargs['n_jobs'] = n_jobs
+            if device != 'cpu':
+                kwargs['device'] = device
+            if kwargs:
+                model.set_params(**kwargs)
 
-        # Extract data configuration from model path name
-        # Format: model=xgboost_dmax_protac-data=XXX-group=YYY-fold=ZZZ.json
-        model_name = model_path.stem
-        data_config = None
-        for part in model_name.split('-'):
-            if part.startswith('data='):
-                data_config = part.replace('data=', '')
-                break
-        
-        # Extract group and fold from model name
-        group = None
-        fold = None
-        for part in model_name.split('-'):
-            if part.startswith('group='):
-                group = part.replace('group=', '')
-            elif part.startswith('fold='):
-                fold = part.replace('fold=', '')
-        
-        # Try to load datamodule for XGBoost
-        datamodule = None
-        dm_candidates = []
-        
-        # First, try the naming convention used in ensemble directory
-        if data_config and datamodule_dir:
-            dm_dir = Path(datamodule_dir)
-            dm_base = f"datamodule-data={data_config}-group={group}-fold={fold}"
-            dm_candidates.append((dm_dir / f"{dm_base}_hparams.yaml", dm_dir / f"{dm_base}_state.pt"))
-        
-        # Also try in model's parent directory
-        if data_config:
-            dm_dir = model_path.parent
-            dm_base = f"datamodule-data={data_config}-group={group}-fold={fold}"
-            dm_candidates.append((dm_dir / f"{dm_base}_hparams.yaml", dm_dir / f"{dm_base}_state.pt"))
-        
-        # Legacy fallback
-        if datamodule_dir:
-            dm_candidates.append((Path(datamodule_dir) / f"{model_path.stem}_datamodule.pt", None))
-        dm_candidates.append((model_path.parent / f"{model_path.stem}_datamodule.pt", None))
-        dm_candidates.append((model_path.parent / "datamodule_state.pt", None))
-        
-        for candidate in dm_candidates:
-            if isinstance(candidate, tuple):
-                hparams_path, state_path = candidate
-            else:
-                hparams_path = candidate
-                state_path = None
-            
-            if not hparams_path.exists():
+        return model
+
+    # ------------------------------------------------------------------
+    # Task / type helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_model_type(model: Any) -> str:
+        cls_name = type(model).__name__
+        if 'XGB' in cls_name or 'Booster' in cls_name:
+            return 'xgboost'
+        if hasattr(model, 'forward') and hasattr(model, 'eval'):
+            return 'lightning'
+        return 'unknown'
+
+    @staticmethod
+    def _infer_model_task(model_name: str, datamodule: Optional[Any] = None) -> str:
+        """Infer the prediction task from the datamodule or model filename."""
+        if datamodule is not None and hasattr(datamodule, 'labels') and datamodule.labels:
+            label = datamodule.labels[0].lower()
+            if 'binary' in label or 'activity' in label:
+                return 'bin'
+            if 'pdc50' in label or 'dc50' in label:
+                return 'dc50'
+            if 'dmax' in label:
+                return 'dmax'
+
+        # `(?:qr_|mve_)?` skips the quantile/MVE objective infix that
+        # cross_validation.py inserts before the task name (see model_name
+        # construction there), so the capture group lands on the task itself.
+        m = re.search(r'model=\w+?_(?:qr_|mve_)?(\w+?)_protac', model_name, re.IGNORECASE)
+        if m and m.group(1).lower() in KNOWN_TASKS:
+            return m.group(1).lower()
+
+        return 'dmax'
+
+    @property
+    def available_tasks(self) -> List[str]:
+        return sorted(set(self.model_tasks.values()))
+
+    # ------------------------------------------------------------------
+    # Lazy-loading helpers
+    # ------------------------------------------------------------------
+
+    def _iter_model_names(
+        self, allowed_tasks: Optional[set] = None
+    ):
+        """Yield model names from either the lazy path registry or eager dict."""
+        names = list(self._model_paths if self._lazy else self.models)
+        for name in names:
+            if allowed_tasks and self.model_tasks.get(name) not in allowed_tasks:
                 continue
-                
-            try:
-                if hparams_path.suffix == '.yaml' and state_path and state_path.exists():
-                    from tackai.data.datamodule import load_datamodule
-                    datamodule = load_datamodule(hparams_path, state_path)
-                    break
-                elif hparams_path.suffix == '.pt':
-                    from tackai.data.datamodule import DegradationComplexDataModule
-                    state_dict = torch.load(hparams_path, map_location='cpu')
-                    if 'hparams' in state_dict:
-                        datamodule = DegradationComplexDataModule(**state_dict['hparams'])
-                        datamodule.load_state_dict(state_dict)
-                        break
-            except Exception as e:
-                print(f"    Warning: Failed to load datamodule from {hparams_path}: {e}")
-        
-        return model, datamodule
+            yield name
 
-    def validate_and_fill_defaults(
+    def _get_model_and_dm(
+        self, name: str
+    ) -> Tuple[Any, 'DegradationComplexDataModule']:
+        """Return (model, datamodule) — loading from disk in lazy mode."""
+        if self._lazy:
+            model = self._load_model(self._model_paths[name], self.device, self.n_jobs)
+            hparams_path, state_path = self._dm_paths[name]
+            dm = load_datamodule(state_path, hparams_path, self._hparam_overrides)
+            return model, dm
+        return self.models[name], self.datamodules[name]
+
+    def _get_dm(self, name: str) -> 'DegradationComplexDataModule':
+        """Return the datamodule only — avoids loading the model in lazy mode."""
+        if self._lazy:
+            hparams_path, state_path = self._dm_paths[name]
+            return load_datamodule(state_path, hparams_path, self._hparam_overrides)
+        return self.datamodules[name]
+
+    def _free_if_lazy(self, *objs: Any) -> None:
+        """Delete objects and collect garbage only when in lazy mode."""
+        if not self._lazy:
+            return
+        for obj in objs:
+            if obj is not None:
+                del obj
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Input validation / defaults
+    # ------------------------------------------------------------------
+
+    def _validate_and_fill_defaults(
         self,
         sample_dict: Dict[str, Any],
         datamodule: Any,
         verbose: bool = True,
     ) -> Tuple[Dict[str, Any], List[str]]:
-        """Validate inputs and fill in defaults for *optional* features.
-
-        **Required** inputs (SMILES, POI name/sequence, E3 ligase
-        name/sequence) will **not** be defaulted – a warning is emitted
-        instead and the caller can decide whether to skip the model.
-
-        The method also normalises user-supplied keys so that e.g. both
-        ``'Smiles'`` and ``'SMILES'`` are accepted.
+        """Validate inputs and fill defaults for optional fields.
 
         Args:
-            sample_dict: Dictionary of input values.
-            datamodule: Datamodule to check requirements against.
-            verbose: Whether to print warnings about missing inputs.
+            sample_dict: Raw input dict.
+            datamodule: Datamodule that determines required columns.
+            verbose: Emit warnings for missing/defaulted fields.
 
         Returns:
-            A tuple ``(filled_dict, missing_required)`` where
-            ``missing_required`` lists column names that are required by
-            the datamodule but were not provided by the user.
+            ``(filled_dict, missing_required)`` — filled dict with defaults
+            applied, and list of required columns that were not provided.
         """
-        dm = datamodule  # Just a shorter alias for convenience
-
-        # --- Normalise keys --------------------------------------------------
-        # Build a map from lower-cased key → datamodule column name so that
-        # user dicts with slightly different casing still match.
+        dm = datamodule
         dm_col_names = [
             dm.smiles_col, dm.poi_col, dm.poi_sequence_col,
             dm.ligase_col, dm.ligase_sequence_col, dm.cell_line_col,
@@ -883,57 +914,45 @@ class EnsemblePredictor:
         ]
         lower_to_dm = {c.lower(): c for c in dm_col_names if c}
 
-        filled = {}
-        for k, v in sample_dict.items():
-            canonical = lower_to_dm.get(k.lower(), k)
-            filled[canonical] = v
+        filled = {lower_to_dm.get(k.lower(), k): v for k, v in sample_dict.items()}
 
-        missing_required = []
-        default_warnings = []
-
-        # Columns that are *never* auto-filled – the user must provide them
         required_cols = {dm.smiles_col, dm.poi_col, dm.poi_sequence_col,
                          dm.ligase_col, dm.ligase_sequence_col}
 
-        # (dm_col, is_needed_check)
         col_checks = [
             (dm.smiles_col, lambda: True),
             (dm.poi_col, lambda: (
-                getattr(dm, 'use_poi_name_embedding', False)
+                dm.poi_features == "name"
                 or getattr(dm, 'poi_embeddings_id_type', '') != 'sequence'
             )),
-            (dm.poi_sequence_col, lambda: (
-                getattr(dm, 'use_poi_sequence_embedding', False)
-                or getattr(dm, 'use_poi_precomputed_embedding', False)
-            )),
-            (dm.ligase_col, lambda: getattr(dm, 'use_ligase_name_embedding', False)),
-            (dm.ligase_sequence_col, lambda: getattr(dm, 'use_ligase_precomputed_embedding', False)),
-            (dm.cell_line_col, lambda: (
-                getattr(dm, 'use_cell_description_embedding', False)
-                or getattr(dm, 'use_cell_name_embedding', False)
-            )),
+            (dm.poi_sequence_col, lambda: dm.poi_features in ("sequence", "precomputed")),
+            (dm.ligase_col, lambda: dm.ligase_features == "name"),
+            (dm.ligase_sequence_col, lambda: dm.ligase_features == "precomputed"),
+            (dm.cell_line_col, lambda: dm.cell_features in ("description", "name")),
             (dm.treatment_time_col, lambda: getattr(dm, 'use_treatment_time', False)),
             (dm.assay_type_col, lambda: getattr(dm, 'use_assay_type_encoding', False)),
         ]
 
+        missing_required = []
+        default_warnings = []
+
         for dm_col, is_needed_fn in col_checks:
             if not is_needed_fn():
                 continue
-
             current_val = filled.get(dm_col)
-            is_missing = current_val is None or (isinstance(current_val, str) and current_val.strip() == '')
-
+            is_missing = (
+                (isinstance(current_val, str) and not current_val.strip())
+                or (not isinstance(current_val, str) and pd.isna(current_val))
+            )
             if not is_missing:
                 continue
-
             if dm_col in required_cols:
                 missing_required.append(dm_col)
             else:
-                # Fill optional fields with defaults
                 default_val = DEFAULT_VALUES.get(dm_col)
                 if default_val is not None:
                     filled[dm_col] = default_val
-                    short = str(default_val) if len(str(default_val)) < 30 else str(default_val)[:30] + '...'
+                    short = str(default_val)[:30]
                     default_warnings.append(f"  - {dm_col}: using default '{short}'")
 
         if verbose:
@@ -941,8 +960,7 @@ class EnsemblePredictor:
                 warnings.warn(
                     f"Required input(s) missing: {', '.join(missing_required)}. "
                     "Models that need these features will be skipped.",
-                    UserWarning,
-                    stacklevel=2,
+                    UserWarning, stacklevel=3,
                 )
             if default_warnings:
                 print("Note: Some inputs were missing and filled with defaults:")
@@ -952,34 +970,20 @@ class EnsemblePredictor:
                     print(f"  ... and {len(default_warnings) - 5} more")
 
         return filled, missing_required
-    
-    def featurize_input(
+
+    def _prepare_sample_dicts(
         self,
-        sample: Union[SampleInput, Dict[str, Any]],
-        model_name: Optional[str] = None,
-        return_format: Literal['dict', 'xgb', 'pt'] = 'dict',
-    ) -> Dict[str, Any]:
+        samples: List[Union[SampleInput, Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """Convert SampleInput / raw dicts to datamodule-compatible dicts.
+
+        In lazy mode ``self.datamodules`` is empty so we fall back to the
+        default TACK column names (identical to ``DegradationComplexDataModule``
+        defaults), which ``_validate_and_fill_defaults`` normalises per-model.
         """
-        Featurize input for prediction.
-        
-        Args:
-            sample: SampleInput object or dictionary with input data
-            model_name: Specific model to use for featurization (if None, uses all)
-            return_format: Format for returned features ('dict', 'xgb', 'pt')
-            
-        Returns:
-            Dictionary mapping model names to featurized inputs
-        """
-        # Convert SampleInput to dict if needed
-        if isinstance(sample, SampleInput):
-            # Use the first available datamodule's column names for conversion
-            ref_dm = None
-            if model_name and model_name in self.datamodules:
-                ref_dm = self.datamodules[model_name]
-            else:
-                ref_dm = next(iter(self.datamodules.values()))
-            
-            sample_dict = sample.to_datamodule_dict(
+        if self.datamodules:
+            ref_dm = next(iter(self.datamodules.values()))
+            kwargs = dict(
                 smiles_col=ref_dm.smiles_col,
                 poi_col=ref_dm.poi_col,
                 poi_sequence_col=ref_dm.poi_sequence_col,
@@ -989,830 +993,122 @@ class EnsemblePredictor:
                 assay_type_col=ref_dm.assay_type_col,
                 treatment_time_col=ref_dm.treatment_time_col,
             )
-            precomputed = sample.precomputed_features
         else:
-            sample_dict = sample
-            precomputed = sample.get('precomputed_features')
-        
-        featurized = {}
-        
-        for i, (name, datamodule) in enumerate(self.datamodules.items()):
-            if model_name is not None and name != model_name:
-                continue
-            
-            model_type = self.model_types.get(name, 'unknown')
-            
-            if precomputed is not None:
-                featurized[name] = precomputed
-            else:
-                try:
-                    # Validate and fill defaults for this specific datamodule
-                    filled_sample, missing_required = self.validate_and_fill_defaults(
-                        sample_dict, datamodule, verbose=True
-                    )
-                    
-                    if missing_required:
-                        warnings.warn(
-                            f"Skipping model '{name}': missing required input(s) "
-                            f"{', '.join(missing_required)}.",
-                            UserWarning,
-                            stacklevel=2,
-                        )
-                        featurized[name] = None
-                        continue
-                    
-                    # Determine format based on model type
-                    if model_type == 'xgboost':
-                        features = datamodule.featurize_sample(filled_sample, return_tensor='xgb')
-                    elif model_type == 'lightning':
-                        features = datamodule.featurize_sample(filled_sample, return_tensor='pt')
-                    else:
-                        features = datamodule.featurize_sample(filled_sample, return_tensor=return_format)
-                    
-                    featurized[name] = features
-                except Exception as e:
-                    print(f"Warning: Featurization failed for {name}: {e}")
-                    featurized[name] = None
-        
-        return featurized
+            kwargs = {}  # SampleInput.to_datamodule_dict() defaults match DM defaults
 
-    def featurize_input_batch(
+        return [
+            s.to_datamodule_dict(**kwargs) if isinstance(s, SampleInput) else s
+            for s in samples
+        ]
+
+    # ------------------------------------------------------------------
+    # Featurization
+    # ------------------------------------------------------------------
+
+    def transform(
         self,
         samples: List[Dict[str, Any]],
         return_timings: bool = False,
-    ) -> Dict[str, List[Any]]:
-        """Batch-featurize multiple samples for all (or one) model(s).
+    ) -> Union[Dict[str, Any], Tuple[Dict[str, Any], Dict[str, float]]]:
+        """Featurize a batch of samples for every loaded model.
 
-        This method is much faster than calling ``featurize_input`` in a loop
-        because it:
-        1. Validates/fills defaults **once per datamodule** for the whole
-           batch (identical logic, but key-normalisation happens once).
-        2. Uses ``datamodule.featurize_samples_batch`` which runs sklearn
-           pipelines on one big DataFrame and deduplicates embedding lookups.
-        3. Passes a **shared embedding cache** across datamodules so that
-           two models that both need the same Morgan fingerprint or protein
-           embedding only compute it once.
+        Validates and fills defaults once per datamodule for the whole
+        batch, then calls ``datamodule.transform`` (shared embedding
+        lookups, one sklearn pass per model).
 
         Args:
             samples: List of sample dicts (column-name → value).
-            model_name: Restrict to a single model (default: all models).
+            return_timings: If True, return a ``(features, timings)`` pair.
 
         Returns:
-            ``{model_name: [features_sample_0, features_sample_1, ...]}``
-            where each ``features_sample_i`` has the format required by the
-            model type (xgb tuple, pt dict, etc.).
+            ``{model_name: features}`` where *features* is the format
+            expected by the model type (xgb tuple or pt dict).
         """
-        # Shared cache across all datamodules for this batch
-        shared_cache = {}
-        featurized = {}
-        timings = defaultdict(list)
+        featurized: Dict[str, Any] = {}
+        timings: Dict[str, list] = defaultdict(list)
 
-        for name, datamodule in self.datamodules.items():
-            # --- Validate & fill defaults once for this datamodule ----------
-            # We do this per-datamodule because different DMs may need
-            # different default columns, but we only validate once per DM
-            # for the entire batch (rather than once per sample).
-            filled_samples = []
-            avg_fill_time = 0.0
-            for i, sample_dict in enumerate(samples):
-                start = time.time()
-                filled, missing_required = self.validate_and_fill_defaults(
-                    sample_dict, datamodule, verbose=(i == 0),
-                )
-                stop = time.time()
-                avg_fill_time += stop - start
-                if missing_required:
-                    raise ValueError(
-                        f"Sample {i} is missing required input(s) for model '{name}': "
-                        f"{', '.join(missing_required)}. Cannot featurize batch."
+        for name in self._iter_model_names():
+            datamodule = self._get_dm(name)
+            try:
+                filled_samples = []
+                for i, sample_dict in enumerate(samples):
+                    t0 = time.time()
+                    filled, missing = self._validate_and_fill_defaults(
+                        sample_dict, datamodule, verbose=(i == 0),
                     )
-                filled_samples.append(filled)
-            avg_fill_time = avg_fill_time / len(samples) if samples else 0.0
-            timings['fill_defaults'].append(avg_fill_time)
+                    timings['fill_defaults'].append(time.time() - t0)
+                    if missing:
+                        raise ValueError(
+                            f"Sample {i} is missing required input(s) for model '{name}': "
+                            f"{', '.join(missing)}."
+                        )
+                    filled_samples.append(filled)
 
-            # --- Batch featurize using the datamodule -----------------------
-            model_type = self.model_types.get(name, 'unknown')
-            if model_type == 'xgboost':
-                ret = 'xgb'
-            elif model_type == 'lightning':
-                # 'pt' returns a single Dict[str, Tensor] with batch dim,
-                # skipping the per-sample dict loop and re-stacking in inference.
-                ret = 'pt'
-            else:
-                ret = 'np'
-            
-            start = time.time()
-            batch_feat = datamodule.featurize_samples_batch(
-                filled_samples,
-                return_tensor=ret,
-                shared_cache=shared_cache,
-            )
-            stop = time.time()
-            timings['featurize_batch'].append(stop - start)
-            featurized[name] = batch_feat
+                ret = 'xgb' if self.model_types.get(name) == 'xgboost' else 'pt'
+                t0 = time.time()
+                featurized[name] = datamodule.transform(filled_samples, return_tensor=ret)
+                timings['featurize_batch'].append(time.time() - t0)
+            finally:
+                self._free_if_lazy(datamodule)
 
         if return_timings:
-            for key in timings.keys():
-                timings[key] = np.mean(timings[key])
-            return featurized, timings
+            return featurized, {k: float(np.mean(v)) for k, v in timings.items()}
         return featurized
 
-    def _predict_single_model(
-        self,
-        model_name: str,
-        features: Any,
-    ) -> np.ndarray:
-        """Get prediction from a single model."""
-        model = self.models[model_name]
-        model_type = self.model_types[model_name]
+    # ------------------------------------------------------------------
+    # Per-model inference (private)
+    # ------------------------------------------------------------------
 
-        if model_type == 'xgboost':
-            return self._predict_xgboost(model, features)
-        elif model_type == 'lightning':
-            return self._predict_lightning(model, features)
-        else:
-            raise ValueError(f"Unknown model type for {model_name}")
-    
-    def _predict_xgboost(self, model: Any, features: Any) -> np.ndarray:
-        """Get prediction from XGBoost model.
-        
-        When *features* is a ``(array, feature_names)`` tuple the method
-        builds a ``pandas.DataFrame`` so that columns are aligned to the
-        model's expected feature order.  This avoids errors caused by the
-        inference code iterating feature keys in a different order than the
-        training code.
-        """        
-        # Handle tuple of (features, feature_names)
-        feature_names = None
-        if isinstance(features, tuple) and len(features) == 2:
-            features, feature_names = features
-        
-        if isinstance(features, np.ndarray):
-            if features.ndim == 1:
-                features = features.reshape(1, -1)
-            
-            # Try to get the model's expected feature names
-            model_feature_names = None
-            try:
-                model_feature_names = model.feature_names
-            except Exception:
-                pass
-            
-            if feature_names is not None and model_feature_names is not None:
-                if set(feature_names) == set(model_feature_names) and len(feature_names) == features.shape[1]:
-                    # Same features, possibly different order – build a
-                    # DataFrame and reorder columns to match the model.
-                    df = pd.DataFrame(features, columns=feature_names)
-                    df = df[model_feature_names]
-                    dmatrix = xgb.DMatrix(df)
-                elif len(feature_names) == features.shape[1]:
-                    dmatrix = xgb.DMatrix(features, feature_names=feature_names)
-                else:
-                    print(
-                        f"Warning: Feature count mismatch "
-                        f"({features.shape[1]} vs {len(feature_names)} names). "
-                        f"Using without feature names."
-                    )
-                    dmatrix = xgb.DMatrix(features)
-            elif feature_names is not None and len(feature_names) == features.shape[1]:
-                dmatrix = xgb.DMatrix(features, feature_names=feature_names)
-            else:
-                dmatrix = xgb.DMatrix(features)
-        elif isinstance(features, pd.DataFrame):
-            dmatrix = xgb.DMatrix(features)
-        elif isinstance(features, xgb.DMatrix):
-            dmatrix = features
-        else:
-            raise ValueError(f"Unsupported feature type for XGBoost: {type(features)}")
-        
+    def _predict_xgboost_batch(self, model: Any, feat_list: Any) -> np.ndarray:
+        """Run XGBoost prediction on pre-featurized batch output.
+
+        *feat_list* may be a ``(ndarray, feature_names)`` tuple (fast path
+        from ``transform``) or a list of per-sample tuples.
+        """
+        def _dmatrix_from_array(X: np.ndarray, feature_names: Optional[List[str]]) -> xgb.DMatrix:
+            model_fnames = getattr(model, 'feature_names', None)
+            if feature_names is not None and model_fnames is not None and set(feature_names) == set(model_fnames):
+                df = pd.DataFrame(X, columns=list(feature_names))[model_fnames]
+                return xgb.DMatrix(df)
+            if feature_names is not None and len(feature_names) == X.shape[1]:
+                return xgb.DMatrix(pd.DataFrame(X, columns=feature_names))
+            return xgb.DMatrix(X)
+
         if isinstance(model, xgb.Booster):
             if self.n_jobs is not None:
                 model.set_param('nthread', self.n_jobs)
             if self.device != 'cpu':
                 model.set_param('device', self.device)
-        pred = model.predict(dmatrix)
-        return np.atleast_1d(pred)
-    
-    def _predict_lightning(self, model: Any, features: Any) -> np.ndarray:
-        """Get prediction from Lightning model."""
-        model.eval()
-        
-        with torch.no_grad():
-            if isinstance(features, dict):
-                # Convert dict values to tensors and add batch dimension
-                batch = {}
-                for k, v in features.items():
-                    if isinstance(v, np.ndarray):
-                        tensor = torch.from_numpy(v).float()
-                        if tensor.ndim == 1:
-                            tensor = tensor.unsqueeze(0)
-                        batch[k] = tensor.to(self.device)
-                    elif isinstance(v, torch.Tensor):
-                        tensor = v.float()  # Ensure float32
-                        if tensor.ndim == 1:
-                            tensor = tensor.unsqueeze(0)
-                        batch[k] = tensor.to(self.device)
-                    else:
-                        batch[k] = v
-                
-                output = model(batch)
-            elif isinstance(features, np.ndarray):
-                tensor = torch.from_numpy(features).float().to(self.device)
-                if tensor.ndim == 1:
-                    tensor = tensor.unsqueeze(0)
-                output = model(tensor)
-            elif isinstance(features, torch.Tensor):
-                features = features.float()  # Ensure float32
-                if features.ndim == 1:
-                    features = features.unsqueeze(0)
-                output = model(features.to(self.device))
-            else:
-                output = model(features)
-            
-            # Extract prediction from output
-            if isinstance(output, torch.Tensor):
-                return output.cpu().numpy().flatten()
-            elif isinstance(output, dict):
-                # Try common keys for predictions
-                for key in ['prediction', 'pred', 'output', 'logits']:
-                    if key in output:
-                        return output[key].cpu().numpy().flatten()
-                # Fallback to first tensor value
-                for v in output.values():
-                    if isinstance(v, torch.Tensor):
-                        return v.cpu().numpy().flatten()
-            
-            return np.atleast_1d(output)
-    
-    def denormalize_prediction(
-        self,
-        prediction: np.ndarray,
-        datamodule: Any,
-    ) -> np.ndarray:
-        """
-        Denormalize prediction using datamodule's inverse transform.
-        
-        Args:
-            prediction: Normalized prediction array
-            datamodule: Datamodule to use for inverse transform
-            
-        Returns:
-            Denormalized prediction array
-        """
-        dm = datamodule  # Just a shorter alias for convenience
-        
-        # Check if datamodule has normalization enabled
-        if not (getattr(dm, 'normalize_labels', False) or getattr(dm, 'standardize_labels', False)):
-            return prediction
-        
-        # Determine the transformer key by inferring the label name from the
-        # datamodule, if possible
-        task_key = dm.labels if hasattr(dm, 'labels') else None
-        if isinstance(task_key, list) and len(task_key) == 1:
-            task_key = task_key[0]
-        else:
-            print(f"Warning: Multiple or no labels found in datamodule; cannot infer task key for denormalization. ")
-            return prediction
-        
-        try:
-            return dm.inverse_transform_labels(prediction, task_key)
-        except (ValueError, KeyError) as e:
-            raise ValueError(
-                f"Failed to denormalize prediction for task '{task_key}'. "
-                f"Error: {e}"
-            ) from e
-    
-    # ------------------------------------------------------------------
-    # Task label lookup
-    # ------------------------------------------------------------------
-    TASK_LABELS = {
-        'dmax': 'Dmax (%)',
-        'dc50': 'DC50 (nM)',
-        'bin': 'Binary Activity',
-    }
 
-    # ------------------------------------------------------------------
-    # Prediction helpers (private)
-    # ------------------------------------------------------------------
+        # Fast path: single (matrix, names) tuple
+        if (
+            isinstance(feat_list, tuple) and len(feat_list) == 2
+            and isinstance(feat_list[0], np.ndarray) and feat_list[0].ndim == 2
+        ):
+            X, feature_names = feat_list
+            return model.predict(_dmatrix_from_array(X, list(feature_names)))
 
-    def _prepare_sample_dicts(
-        self,
-        samples: List[Union[SampleInput, Dict[str, Any]]],
-    ) -> List[Dict[str, Any]]:
-        """Convert a list of SampleInput / raw dicts into datamodule dicts.
-
-        Uses the first loaded datamodule's column names for mapping
-        ``SampleInput`` fields to the expected column keys.
-        """
-        ref_dm = next(iter(self.datamodules.values()))
-        out = []
-        for s in samples:
-            if isinstance(s, SampleInput):
-                out.append(s.to_datamodule_dict(
-                    smiles_col=ref_dm.smiles_col,
-                    poi_col=ref_dm.poi_col,
-                    poi_sequence_col=ref_dm.poi_sequence_col,
-                    ligase_col=ref_dm.ligase_col,
-                    ligase_sequence_col=ref_dm.ligase_sequence_col,
-                    cell_line_col=ref_dm.cell_line_col,
-                    assay_type_col=ref_dm.assay_type_col,
-                    treatment_time_col=ref_dm.treatment_time_col,
-                ))
-            else:
-                out.append(s)
-        return out
-
-    def _infer_and_denormalize(
-        self,
-        model_name: str,
-        feat_list: List[Any],
-    ) -> np.ndarray:
-        """Run inference for one model on a batch and denormalize the result.
-
-        Returns an ndarray of shape ``(n_samples,)`` with denormalized
-        predictions.
-        """
-        model = self.models[model_name]
-        model_type = self.model_types[model_name]
-        dm = self.datamodules[model_name]
-
-        # --- raw prediction ------------------------------------------------
-        if model_type == 'xgboost':
-            preds = self._predict_xgboost_batch(model, feat_list)
-        else:
-            preds = self._predict_lightning_batch(model, feat_list)
-
-        # --- denormalize ---------------------------------------------------
-        preds_flat = preds.reshape(-1, 1) if preds.ndim == 1 else preds
-        denorm = np.empty_like(preds_flat, dtype=float)
-        for j in range(preds_flat.shape[0]):
-            denorm[j] = self.denormalize_prediction(preds_flat[j], dm)
-        return denorm.flatten() if preds.ndim == 1 else denorm
-
-    def _build_ensemble_prediction(
-        self,
-        preds_by_model: Dict[str, np.ndarray],
-        task_name: str,
-        return_individual: bool = True,
-    ) -> EnsemblePrediction:
-        """Build an ``EnsemblePrediction`` from per-model denormalized predictions.
-
-        This is the single place where weighted averaging, uncertainty, and
-        confidence intervals are computed.
-        """
-        # Weighted mean
-        weighted_sum = np.zeros_like(next(iter(preds_by_model.values())), dtype=float)
-        weight_sum = 0.0
-        for model_name, pred in preds_by_model.items():
-            w = self.weights.get(model_name, 0.0)
-            weighted_sum += pred * w
-            weight_sum += w
-        weighted_mean = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
-
-        # Uncertainty (std across models)
-        all_preds = np.array(list(preds_by_model.values()))
-        uncertainty_std = np.std(all_preds, axis=0)
-
-        # Binary classification entropy
-        predictive_entropy = None
-        if task_name == 'bin':
-            avg = np.clip(weighted_mean, 1e-7, 1 - 1e-7)
-            predictive_entropy = -(avg * np.log(avg) + (1 - avg) * np.log(1 - avg))
-
-        return EnsemblePrediction(
-            weighted_mean=weighted_mean,
-            uncertainty_std=uncertainty_std,
-            individual_predictions=preds_by_model if return_individual else {},
-            weights={k: v for k, v in self.weights.items() if k in preds_by_model},
-            model_names=list(preds_by_model.keys()),
-            task=task_name,
-            label_name=self.TASK_LABELS.get(task_name, 'Unknown label name'),
-            predictive_entropy=predictive_entropy,
-        )
-
-    def _assemble_batch_results(
-        self,
-        model_batch_preds: Dict[str, np.ndarray],
-        n_samples: int,
-        return_individual: bool = True,
-    ) -> List[Optional[Dict[str, EnsemblePrediction]]]:
-        """Assemble per-sample EnsemblePrediction dicts from model-level batch arrays.
-
-        Args:
-            model_batch_preds: ``{model_name: ndarray(n_samples,)}`` of
-                denormalized predictions.
-            n_samples: Number of samples in the batch.
-            return_individual: Include per-model predictions in the result.
-
-        Returns:
-            One ``{task: EnsemblePrediction}`` dict per sample
-        """
-        results = []
-
-        for i in range(n_samples):
-            # Group this sample's model predictions by task, so it's a
-            # dictionary of dictionaries: model_name → task → prediction.  This
-            # allows us to build one EnsemblePrediction per task, even if
-            # different models predict different tasks.
-            task_preds = {}
-            for model_name, batch_pred in model_batch_preds.items():
-                pred_i = batch_pred[i] if batch_pred.ndim > 1 else np.array([batch_pred[i]])
-                if np.any(np.isnan(pred_i)):
-                    raise ValueError(f"Prediction for model '{model_name}' is NaN for sample {i}; cannot include in ensemble.")
-                task = self.model_tasks.get(model_name)
-                task_preds.setdefault(task, {})[model_name] = np.atleast_1d(pred_i)
-
-            if not task_preds:
-                raise ValueError(f"No valid predictions for sample {i}; cannot build ensemble.")
-
-            sample_result = {
-                task_name: self._build_ensemble_prediction(preds, task_name, return_individual)
-                for task_name, preds in task_preds.items()
-            }
-            results.append(sample_result)
-
-        return results
-
-    # ------------------------------------------------------------------
-    # Public prediction API
-    # ------------------------------------------------------------------
-
-    def predict(
-        self,
-        sample: Union[SampleInput, Dict[str, Any]],
-        return_individual: bool = True,
-        tasks: Optional[List[str]] = None,
-    ) -> Dict[str, EnsemblePrediction]:
-        """Make ensemble prediction for a single sample.
-
-        Delegates to :meth:`predict_batch` for a consistent code path.
-        Each model's raw prediction is denormalized using its own datamodule
-        before the weighted ensemble average is computed.
-
-        Args:
-            sample: ``SampleInput`` object or dictionary with input data.
-            return_individual: Whether to return individual model predictions.
-            tasks: Optional subset of tasks to predict (``None`` = all).
-
-        Returns:
-            Dictionary mapping task name to ``EnsemblePrediction``.
-        """
-        return self.predict_batch([sample], return_individual, tasks)[0]
-
-    def predict_batch(
-        self,
-        samples: List[Union[SampleInput, Dict[str, Any]]],
-        return_individual: bool = True,
-        tasks: Optional[List[str]] = None,
-        verbose: bool = False,
-        return_timings: bool = False,
-    ) -> List[Dict[str, EnsemblePrediction]]:
-        """Make batch predictions with optimized featurization.
-
-        Workflow:
-        1. Convert inputs to datamodule-compatible dicts.
-        2. Batch-featurize all samples through each datamodule (shared
-           embedding cache across models).
-        3. Run XGBoost inference with a multi-row DMatrix (Lightning
-           models fall back to per-sample inference).
-        4. Denormalize and assemble weighted ensemble results per sample.
-
-        Args:
-            samples: List of ``SampleInput`` objects or dictionaries.
-            return_individual: Include per-model predictions in results.
-            tasks: Optional subset of tasks to predict (``None`` = all).
-            verbose: Show a progress bar over models.
-
-        Returns:
-            One ``{task: EnsemblePrediction}`` dict per sample.
-            ``None`` for samples where all models failed.
-        """
-        timings = {}
-        
-        n = len(samples)
-        if n == 0:
-            return []
-
-        # Check that any model is able to perform the requested tasks before
-        # starting inference
-        if tasks:
-            allowed_tasks = set(tasks)
-            model_tasks_set = set(self.model_tasks.values())
-            if not allowed_tasks.intersection(model_tasks_set):
-                raise ValueError(
-                    f"No models available for requested tasks: {allowed_tasks}. "
-                    f"Available tasks: {model_tasks_set}."
-                )
-
-        # 1. Normalise inputs
-        start = time.time()
-        sample_dicts = self._prepare_sample_dicts(samples)
-        stop = time.time()
-        timings['prepare_samples'] = stop - start
-
-        # 2. Batch featurize (shared cache across datamodules)
-        start = time.time()
-        batch_features, times = self.featurize_input_batch(sample_dicts, return_timings=True)
-        stop = time.time()
-        timings['featurize_batch'] = stop - start
-        timings.update(times)
-
-        # 3. Inference + denormalize per model
-        allowed_tasks = set(tasks) if tasks else None
-        model_batch_preds = {}        
-
-        start = time.time()
-        for model_name in tqdm(self.models, desc="Predicting", disable=not verbose):
-            if allowed_tasks and self.model_tasks.get(model_name) not in allowed_tasks:
+        # Per-sample list path
+        arrays, feature_names = [], None
+        for feat in feat_list:
+            if feat is None:
                 continue
-
-            feat_list = batch_features.get(model_name)
-
-            if feat_list is None or all(f is None for f in feat_list):
-                raise ValueError(f"No features available for model {model_name}; cannot run prediction.")
-
-            try:
-                model_batch_preds[model_name] = self._infer_and_denormalize(
-                    model_name, feat_list,
-                )
-            except Exception as e:
-                msg = str(e)
-                if 'feature_names mismatch' in msg:
-                    msg = "feature_names mismatch (training/inference encoding incompatible)"
-                raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
-        stop = time.time()
-        timings['inference'] = stop - start
-        timings['inference_per_model'] = (stop - start) / len(self.models)
-        
-        # 4. Assemble per-sample ensemble results
-        start = time.time()
-        ret = self._assemble_batch_results(model_batch_preds, n, return_individual)
-        stop = time.time()
-        timings['assemble_results'] = stop - start
-        
-        if return_timings:
-            return ret, timings
-        return ret
-
-    # ------------------------------------------------------------------
-    # Context / SMILES split API — fast path for screening many SMILES
-    # against a fixed context.
-    # ------------------------------------------------------------------
-
-    def preprocess_context(
-        self,
-        context: Union[SampleInput, Dict[str, Any]],
-        verbose: bool = False,
-    ) -> PreprocessedContext:
-        """Encode the non-SMILES (context) features once for every model.
-
-        Call once per context (POI / ligase / cell line / assay /
-        treatment_time). Pass the returned :class:`PreprocessedContext`
-        to :meth:`predict_smiles_batch` alongside a list of SMILES to
-        score.
-
-        Tokenizer-based models are rejected: the prompt contains the
-        SMILES, so the context cannot be encoded independently.
-
-        Args:
-            context: ``SampleInput`` or dict with the context columns.
-                ``SMILES`` is not required (and is ignored if present).
-            verbose: If True, forward the verbose flag to default-filling.
-
-        Returns:
-            :class:`PreprocessedContext` ready for
-            :meth:`predict_smiles_batch`.
-        """
-        # Convert SampleInput → dict using the first datamodule's columns.
-        if isinstance(context, SampleInput):
-            context_dict = self._prepare_sample_dicts([context])[0]
-        else:
-            context_dict = dict(context)  # shallow copy
-
-        context_features: Dict[str, Dict[str, np.ndarray]] = {}
-        xgb_layouts: Dict[str, List[Tuple[str, int, int]]] = {}
-        xgb_total_dims: Dict[str, int] = {}
-        xgb_row_template: Dict[str, np.ndarray] = {}
-        xgb_feature_names: Dict[str, List[str]] = {}
-        source_context: Dict[str, Any] = {}
-
-        for model_name, datamodule in self.datamodules.items():
-            if getattr(datamodule, 'use_tokenizer', False):
-                raise ValueError(
-                    f"Model '{model_name}' uses a tokenizer; tokenizer-based "
-                    "models are not supported by preprocess_context / "
-                    "predict_smiles_batch because the prompt contains the "
-                    "SMILES. Use predict_batch instead."
-                )
-
-            # Always pass verbose=False: validate_and_fill_defaults would
-            # otherwise warn that SMILES is missing, which is the whole
-            # point of the context-only preprocessing pass.
-            filled, missing_required = self.validate_and_fill_defaults(
-                context_dict, datamodule, verbose=False,
-            )
-            missing_required = [
-                c for c in missing_required if c != datamodule.smiles_col
-            ]
-            if missing_required:
-                raise ValueError(
-                    f"Model '{model_name}' is missing required context "
-                    f"field(s): {', '.join(missing_required)}."
-                )
-            if verbose:
-                print(f"  Preprocessed context for model '{model_name}'")
-
-            ctx_feats = datamodule.transform_context_features(filled)
-            context_features[model_name] = ctx_feats
-
-            if self.model_types[model_name] == 'xgboost':
-                layout = datamodule.get_feature_layout()
-                total_dim = sum(width for _, _, width in layout)
-                template = np.zeros((1, total_dim), dtype=np.float32)
-
-                for key, offset, width in layout:
-                    if key.startswith(SMILES_FEATURE_PREFIXES):
-                        continue
-                    if key not in ctx_feats:
-                        raise ValueError(
-                            f"Model '{model_name}' expects context feature "
-                            f"'{key}' in its XGBoost layout, but the "
-                            "datamodule did not produce it. Check feature "
-                            "toggles / fitted pipelines."
-                        )
-                    val = np.asarray(ctx_feats[key], dtype=np.float32).flatten()
-                    if val.shape[0] != width:
-                        raise ValueError(
-                            f"Context feature '{key}' for model '{model_name}' "
-                            f"has width {val.shape[0]} but layout expects "
-                            f"{width}."
-                        )
-                    template[0, offset:offset + width] = val
-
-                xgb_layouts[model_name] = layout
-                xgb_total_dims[model_name] = total_dim
-                xgb_row_template[model_name] = template
-                xgb_feature_names[model_name] = datamodule.get_xgboost_feature_names()
-
-            # Keep the first datamodule's filled view for debugging.
-            if not source_context:
-                source_context = {k: v for k, v in filled.items()}
-
-        return PreprocessedContext(
-            context_features=context_features,
-            xgb_layouts=xgb_layouts,
-            xgb_total_dims=xgb_total_dims,
-            xgb_row_template=xgb_row_template,
-            xgb_feature_names=xgb_feature_names,
-            predictor_id=id(self),
-            source_context=source_context,
-        )
-
-    def predict_smiles_batch(
-        self,
-        smiles_list: List[str],
-        context: PreprocessedContext,
-        return_individual: bool = True,
-        tasks: Optional[List[str]] = None,
-        verbose: bool = False,
-        return_timings: bool = False,
-    ) -> List[Dict[str, EnsemblePrediction]]:
-        """Predict for many SMILES against a preprocessed context.
-
-        Behaves like :meth:`predict_batch` but skips re-encoding the
-        context for every sample. For each model, only the SMILES-
-        dependent features (Morgan fingerprint, RDKit descriptors) are
-        computed per call; the context tensors/rows are broadcast /
-        tiled from the preprocessed vectors.
-
-        Args:
-            smiles_list: List of SMILES strings to score.
-            context: Output of :meth:`preprocess_context` for this
-                predictor.
-            return_individual: Include per-model predictions.
-            tasks: Optional subset of tasks to predict.
-            verbose: Show a progress bar over models.
-            return_timings: Return ``(results, timings)``.
-
-        Returns:
-            One ``{task: EnsemblePrediction}`` dict per SMILES.
-        """
-        if context.predictor_id != id(self):
-            raise ValueError(
-                "PreprocessedContext was not produced by this predictor; "
-                "call preprocess_context on the same EnsemblePredictor "
-                "instance you use to score."
-            )
-
-        n = len(smiles_list)
-        if n == 0:
-            return []
-
-        allowed_tasks = set(tasks) if tasks else None
-        if allowed_tasks:
-            model_tasks_set = set(self.model_tasks.values())
-            if not allowed_tasks.intersection(model_tasks_set):
-                raise ValueError(
-                    f"No models available for requested tasks: {allowed_tasks}. "
-                    f"Available tasks: {model_tasks_set}."
-                )
-
-        timings: Dict[str, float] = {}
-        model_batch_preds: Dict[str, np.ndarray] = {}
-
-        total_smiles = 0.0
-        total_assemble = 0.0
-        total_infer = 0.0
-
-        for model_name in tqdm(self.models, desc="Predicting", disable=not verbose):
-            if allowed_tasks and self.model_tasks.get(model_name) not in allowed_tasks:
-                continue
-
-            datamodule = self.datamodules[model_name]
-            model_type = self.model_types[model_name]
-            ctx_feats = context.context_features[model_name]
-
-            start = time.time()
-            smiles_feats = datamodule.transform_smiles_features(smiles_list)
-            total_smiles += time.time() - start
-
-            start = time.time()
-            if model_type == 'xgboost':
-                layout = context.xgb_layouts[model_name]
-                total_dim = context.xgb_total_dims[model_name]
-                template = context.xgb_row_template[model_name]
-                # One allocation; broadcast tiling of the prefilled
-                # context row, then overwrite the SMILES slices.
-                matrix = np.broadcast_to(template, (n, total_dim)).copy()
-                for key, offset, width in layout:
-                    if key in smiles_feats:
-                        matrix[:, offset:offset + width] = smiles_feats[key]
-                feat_arg = (matrix, context.xgb_feature_names[model_name])
-            elif model_type == 'lightning':
-                batch: Dict[str, torch.Tensor] = {}
-                for key, arr in ctx_feats.items():
-                    tensor = torch.from_numpy(
-                        np.ascontiguousarray(arr, dtype=np.float32)
-                    ).unsqueeze(0).expand(n, -1)
-                    batch[key] = tensor
-                for key, arr in smiles_feats.items():
-                    batch[key] = torch.from_numpy(
-                        np.ascontiguousarray(arr, dtype=np.float32)
-                    )
-                feat_arg = batch
+            if isinstance(feat, tuple) and len(feat) == 2:
+                arr, fnames = feat
+                if feature_names is None:
+                    feature_names = fnames
+                arrays.append(arr.reshape(1, -1) if arr.ndim == 1 else arr)
             else:
-                raise ValueError(
-                    f"Unsupported model type '{model_type}' for {model_name}"
-                )
-            total_assemble += time.time() - start
+                arr = np.array(feat)
+                arrays.append(arr.reshape(1, -1) if arr.ndim == 1 else arr)
 
-            start = time.time()
-            try:
-                model_batch_preds[model_name] = self._infer_and_denormalize(
-                    model_name, feat_arg,
-                )
-            except Exception as e:
-                msg = str(e)
-                if 'feature_names mismatch' in msg:
-                    msg = ("feature_names mismatch (training/inference "
-                           "encoding incompatible)")
-                raise ValueError(
-                    f"Prediction failed for model '{model_name}': {msg}"
-                ) from e
-            total_infer += time.time() - start
+        if not arrays:
+            return np.full(len(feat_list), np.nan)
 
-        timings['smiles_featurize'] = total_smiles
-        timings['assemble'] = total_assemble
-        timings['inference'] = total_infer
+        return model.predict(_dmatrix_from_array(np.vstack(arrays), feature_names))
 
-        start = time.time()
-        results = self._assemble_batch_results(model_batch_preds, n, return_individual)
-        timings['assemble_results'] = time.time() - start
-
-        if return_timings:
-            return results, timings
-        return results
-
-    def _predict_lightning_batch(
-        self,
-        model: Any,
-        feat_list: Any,
-    ) -> np.ndarray:
-        """Run a single batched forward pass for a Lightning/MLP model.
-
-        Accepts two input formats:
-
-        * **Dict[str, Tensor]** (fast path) — produced by
-          ``featurize_samples_batch(return_tensor='pt_batch')``.  All samples
-          are already stacked; tensors are moved to device and the model is
-          called once.  No per-sample loop, no re-stacking overhead.
-
-        * **List[Optional[Dict]]** (legacy path) — list of per-sample feature
-          dicts.  ``None`` entries produce NaN rows in the output.  Samples
-          are stacked internally before the single forward pass.
-
-        Returns an ndarray of shape ``(n_samples, output_dim)``.
-        """
+    def _predict_lightning_batch(self, model: Any, feat_list: Any) -> np.ndarray:
+        """Run a single batched forward pass for a Lightning/MLP model."""
         def _extract_output(output, n):
             if isinstance(output, torch.Tensor):
                 return output.cpu().numpy().reshape(n, -1)
@@ -1825,20 +1121,15 @@ class EnsemblePredictor:
                         return v.cpu().numpy().reshape(n, -1)
             return np.array(output).reshape(n, -1)
 
-        # ------------------------------------------------------------------
         # Fast path: feat_list is already a batched Dict[str, Tensor]
-        # ------------------------------------------------------------------
         if isinstance(feat_list, dict):
             n = next(iter(feat_list.values())).shape[0]
             model.eval()
             with torch.no_grad():
-                batch = {k: v.to(self.device) for k, v in feat_list.items()}
-                output = model(batch)
+                output = model.predict_step({k: v.to(self.device) for k, v in feat_list.items()})
             return _extract_output(output, n)
 
-        # ------------------------------------------------------------------
         # Legacy path: list of per-sample feature dicts
-        # ------------------------------------------------------------------
         n = len(feat_list)
         valid_indices = [i for i, f in enumerate(feat_list) if f is not None]
         valid_feats = [feat_list[i] for i in valid_indices]
@@ -1861,95 +1152,458 @@ class EnsemblePredictor:
                         t = torch.tensor(np.array(v), dtype=torch.float32)
                     tensors.append(t)
                 batch[k] = torch.stack(tensors, dim=0).to(self.device)
-            output = model(batch)
+            output = model.predict_step(batch)
 
-        B = len(valid_feats)
-        preds_valid = _extract_output(output, B)
+        preds_valid = _extract_output(output, len(valid_feats))
         result = np.full((n, preds_valid.shape[1]), np.nan, dtype=np.float64)
         for out_idx, orig_idx in enumerate(valid_indices):
             result[orig_idx] = preds_valid[out_idx]
         return result
 
-    def _predict_xgboost_batch(
-        self,
-        model: Any,
-        feat_list: Any,
-    ) -> np.ndarray:
-        """Run XGBoost prediction on a batch of pre-featurized samples.
+    def _denormalize(self, prediction: np.ndarray, datamodule: Any) -> np.ndarray:
+        """Inverse-transform normalized predictions to the original scale.
 
-        Stacks individual ``(array, feature_names)`` tuples into a single
-        DataFrame, aligns columns to the model's expected feature order
-        (if available), and calls ``model.predict`` once.
+        A no-op if the datamodule does not normalize labels.
 
-        Fast path (used by :meth:`predict_smiles_batch`): ``feat_list``
-        may already be a single ``(ndarray_of_shape_(N, D), feature_names)``
-        tuple. In that case the per-sample stacking loop is skipped.
+        Args:
+            prediction: Model output array.
+            datamodule: Datamodule with fitted label transformers.
+
+        Returns:
+            Denormalized array.
         """
-        # Fast path: pre-assembled (matrix, names) — skip the per-sample loop.
-        if (
-            isinstance(feat_list, tuple) and len(feat_list) == 2
-            and isinstance(feat_list[0], np.ndarray) and feat_list[0].ndim == 2
-            and isinstance(feat_list[1], (list, tuple))
-        ):
-            X, feature_names = feat_list
-            df = pd.DataFrame(X, columns=list(feature_names))
-            model_feature_names = getattr(model, 'feature_names', None)
-            if (
-                model_feature_names is not None
-                and set(feature_names) == set(model_feature_names)
-                and len(feature_names) == X.shape[1]
-            ):
-                df = df[model_feature_names]
-            dmatrix = xgb.DMatrix(df)
-            if isinstance(model, xgb.Booster):
-                if self.n_jobs is not None:
-                    model.set_param('nthread', self.n_jobs)
-                if self.device != 'cpu':
-                    model.set_param('device', self.device)
-            return model.predict(dmatrix)
+        dm = datamodule
+        if not (getattr(dm, 'normalize_labels', False) or getattr(dm, 'standardize_labels', False)):
+            return prediction
 
-        arrays = []
-        feature_names = None
-        for feat in feat_list:
-            if feat is None:
-                continue
-            if isinstance(feat, tuple) and len(feat) == 2:
-                arr, fnames = feat
-                if feature_names is None:
-                    feature_names = fnames
-                arrays.append(arr.reshape(1, -1) if arr.ndim == 1 else arr)
-            elif isinstance(feat, np.ndarray):
-                arrays.append(feat.reshape(1, -1) if feat.ndim == 1 else feat)
-            else:
-                arrays.append(np.array(feat).reshape(1, -1))
-
-        if not arrays:
-            return np.full(len(feat_list), np.nan)
-
-        X = np.vstack(arrays)
-
-        # Build DMatrix with feature-name alignment
-        if feature_names is not None:
-            df = pd.DataFrame(X, columns=feature_names)
-            # Re-order columns to match model's expected feature order
-            model_feature_names = getattr(model, 'feature_names', None)
-            if (
-                model_feature_names is not None
-                and set(feature_names) == set(model_feature_names)
-                and len(feature_names) == X.shape[1]
-            ):
-                df = df[model_feature_names]
-            dmatrix = xgb.DMatrix(df)
+        task_key = dm.labels if hasattr(dm, 'labels') else None
+        if isinstance(task_key, list) and len(task_key) == 1:
+            task_key = task_key[0]
         else:
-            dmatrix = xgb.DMatrix(X)
+            warnings.warn(
+                "Cannot denormalize: datamodule has multiple or no labels; "
+                "returning raw prediction.",
+                UserWarning, stacklevel=2,
+            )
+            return prediction
 
-        if isinstance(model, xgb.Booster):
-            if self.n_jobs is not None:
-                model.set_param('nthread', self.n_jobs)
-            if self.device != 'cpu':
-                model.set_param('device', self.device)
-        return model.predict(dmatrix)
-    
+        try:
+            return dm.inverse_transform_labels(prediction, task_key)
+        except (ValueError, KeyError) as e:
+            raise ValueError(
+                f"Failed to denormalize prediction for task '{task_key}': {e}"
+            ) from e
+
+    def _infer_and_denormalize(
+        self,
+        model_name: str,
+        feat_list: Any,
+        model: Any = None,
+        dm: Any = None,
+    ) -> np.ndarray:
+        """Run inference for one model and denormalize predictions.
+
+        *model* and *dm* may be passed explicitly (lazy path) to avoid
+        re-looking them up from ``self.models``/``self.datamodules``.
+
+        Returns an ndarray of shape ``(n_samples,)`` in the original scale.
+        """
+        if model is None:
+            model = self.models[model_name]
+        if dm is None:
+            dm = self.datamodules[model_name]
+
+        if self.model_types[model_name] == 'xgboost':
+            preds = self._predict_xgboost_batch(model, feat_list)
+        else:
+            preds = self._predict_lightning_batch(model, feat_list)
+
+        preds_flat = preds.reshape(-1, 1) if preds.ndim == 1 else preds
+        denorm = np.empty_like(preds_flat, dtype=float)
+        for j in range(preds_flat.shape[0]):
+            denorm[j] = self._denormalize(preds_flat[j], dm)
+        return denorm.flatten() if preds.ndim == 1 else denorm
+
+    # ------------------------------------------------------------------
+    # Ensemble assembly (private)
+    # ------------------------------------------------------------------
+
+    def _build_ensemble_prediction(
+        self,
+        preds_by_model: Dict[str, np.ndarray],
+        task_name: str,
+        return_individual: bool = True,
+    ) -> EnsemblePrediction:
+        """Build an EnsemblePrediction from per-model denormalized predictions."""
+        weighted_sum = np.zeros_like(next(iter(preds_by_model.values())), dtype=float)
+        weight_sum = 0.0
+        for model_name, pred in preds_by_model.items():
+            w = self.weights.get(model_name, 0.0)
+            weighted_sum += pred * w
+            weight_sum += w
+        weighted_mean = weighted_sum / weight_sum if weight_sum > 0 else weighted_sum
+
+        all_preds = np.array(list(preds_by_model.values()))
+        uncertainty_std = np.std(all_preds, axis=0)
+
+        predictive_entropy = None
+        if task_name == 'bin':
+            avg = np.clip(weighted_mean, 1e-7, 1 - 1e-7)
+            predictive_entropy = -(avg * np.log(avg) + (1 - avg) * np.log(1 - avg))
+
+        return EnsemblePrediction(
+            weighted_mean=weighted_mean,
+            uncertainty_std=uncertainty_std,
+            individual_predictions=preds_by_model if return_individual else {},
+            weights={k: v for k, v in self.weights.items() if k in preds_by_model},
+            model_names=list(preds_by_model.keys()),
+            task=task_name,
+            label_name=self.TASK_LABELS.get(task_name, 'Unknown'),
+            predictive_entropy=predictive_entropy,
+        )
+
+    def _assemble_batch_results(
+        self,
+        model_batch_preds: Dict[str, np.ndarray],
+        n_samples: int,
+        return_individual: bool = True,
+    ) -> List[Dict[str, EnsemblePrediction]]:
+        """Build per-sample EnsemblePrediction dicts from model-level batch arrays."""
+        results = []
+        for i in range(n_samples):
+            task_preds: Dict[str, Dict[str, np.ndarray]] = {}
+            for model_name, batch_pred in model_batch_preds.items():
+                pred_i = batch_pred[i] if batch_pred.ndim > 1 else np.array([batch_pred[i]])
+                if np.any(np.isnan(pred_i)):
+                    raise ValueError(
+                        f"Prediction for model '{model_name}' is NaN for sample {i}."
+                    )
+                task = self.model_tasks.get(model_name)
+                task_preds.setdefault(task, {})[model_name] = np.atleast_1d(pred_i)
+
+            if not task_preds:
+                raise ValueError(f"No valid predictions for sample {i}.")
+
+            results.append({
+                task_name: self._build_ensemble_prediction(preds, task_name, return_individual)
+                for task_name, preds in task_preds.items()
+            })
+        return results
+
+    # ------------------------------------------------------------------
+    # Public prediction API
+    # ------------------------------------------------------------------
+
+    def predict(
+        self,
+        samples: Union[
+            SampleInput, Dict[str, Any],
+            List[Union[SampleInput, Dict[str, Any]]],
+            str,
+            List[str],
+        ],
+        context: Optional[PreprocessedContext] = None,
+        return_individual: bool = True,
+        tasks: Optional[List[str]] = None,
+        verbose: bool = False,
+        return_timings: bool = False,
+    ) -> Union[
+        Dict[str, EnsemblePrediction],
+        List[Dict[str, EnsemblePrediction]],
+    ]:
+        """Make ensemble predictions for one or many samples.
+
+        Each model's raw output is always denormalized using its own
+        datamodule before the weighted ensemble average is computed.
+
+        When *context* is provided (a :class:`PreprocessedContext` from
+        :meth:`transform_context`), *samples* should be a SMILES string or a
+        list of SMILES strings. Context features (protein/cell embeddings,
+        categorical encodings) are reused as-is; only the SMILES-dependent
+        features are recomputed per call. This is the fast path for screening
+        many compounds against the same biological context.
+
+        Args:
+            samples: Single ``SampleInput``/dict or a list of them for the
+                normal path. A single SMILES string or list of SMILES strings
+                when *context* is given.
+            context: Pre-encoded context from :meth:`transform_context`.
+                When supplied, *samples* must be SMILES string(s).
+            return_individual: Include per-model predictions in the result.
+            tasks: Optional subset of tasks to predict (``None`` = all).
+            verbose: Show a progress bar over models.
+            return_timings: Return ``(result, timings)`` instead of just the result.
+
+        Returns:
+            If *samples* is a single item: ``Dict[task, EnsemblePrediction]``.
+            If *samples* is a list: ``List[Dict[task, EnsemblePrediction]]``.
+            When *return_timings* is ``True``, a ``(result, timings)`` tuple.
+        """
+        if context is not None:
+            return self._predict_with_context(
+                samples, context,
+                return_individual=return_individual,
+                tasks=tasks,
+                verbose=verbose,
+                return_timings=return_timings,
+            )
+
+        single = not isinstance(samples, list)
+        if single:
+            samples = [samples]
+
+        n = len(samples)
+        if n == 0:
+            return ([], {}) if return_timings else []
+
+        if tasks:
+            available = set(self.model_tasks.values())
+            if not set(tasks).intersection(available):
+                raise ValueError(
+                    f"No models for requested tasks: {set(tasks)}. Available: {available}."
+                )
+
+        timings: Dict[str, float] = {}
+
+        # 1. Normalise inputs
+        t0 = time.time()
+        sample_dicts = self._prepare_sample_dicts(samples)
+        timings['prepare'] = time.time() - t0
+
+        # 2+3. Per-model: (lazy) load → featurize → infer → denorm → (lazy) free
+        allowed_tasks = set(tasks) if tasks else None
+        model_batch_preds: Dict[str, np.ndarray] = {}
+        t_feat = t_infer = 0.0
+
+        for model_name in tqdm(
+            list(self._iter_model_names(allowed_tasks)), desc="Predicting", disable=not verbose
+        ):
+            model, dm = self._get_model_and_dm(model_name)
+            try:
+                filled_samples = []
+                for i, sd in enumerate(sample_dicts):
+                    filled, missing = self._validate_and_fill_defaults(sd, dm, verbose=(i == 0))
+                    if missing:
+                        raise ValueError(
+                            f"Sample {i} is missing required input(s) for model '{model_name}': "
+                            f"{', '.join(missing)}."
+                        )
+                    filled_samples.append(filled)
+
+                ret = 'xgb' if self.model_types[model_name] == 'xgboost' else 'pt'
+                t0 = time.time()
+                feat_list = dm.transform(filled_samples, return_tensor=ret)
+                t_feat += time.time() - t0
+
+                t0 = time.time()
+                try:
+                    model_batch_preds[model_name] = self._infer_and_denormalize(
+                        model_name, feat_list, model=model, dm=dm
+                    )
+                except Exception as e:
+                    msg = str(e)
+                    if 'feature_names mismatch' in msg:
+                        msg = "feature_names mismatch (training/inference encoding incompatible)"
+                    raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
+                t_infer += time.time() - t0
+            finally:
+                self._free_if_lazy(model, dm)
+
+        timings.update(featurize=t_feat, inference=t_infer)
+
+        # 4. Assemble per-sample results
+        t0 = time.time()
+        results = self._assemble_batch_results(model_batch_preds, n, return_individual)
+        timings['assemble'] = time.time() - t0
+
+        out = results[0] if single else results
+        return (out, timings) if return_timings else out
+
+    def _predict_with_context(
+        self,
+        smiles: Union[str, List[str]],
+        context: PreprocessedContext,
+        return_individual: bool = True,
+        tasks: Optional[List[str]] = None,
+        verbose: bool = False,
+        return_timings: bool = False,
+    ) -> Union[
+        List[Dict[str, EnsemblePrediction]],
+        Tuple[List[Dict[str, EnsemblePrediction]], Dict[str, float]],
+    ]:
+        """Fast screening path: score SMILES against a pre-encoded context."""
+        if context.predictor_id != id(self):
+            raise ValueError(
+                "PreprocessedContext was not produced by this predictor instance. "
+                "Call transform_context on the same EnsemblePredictor you use to score."
+            )
+
+        single = isinstance(smiles, str)
+        smiles_list: List[str] = [smiles] if single else smiles
+        n = len(smiles_list)
+        if n == 0:
+            return ([], {}) if return_timings else []
+
+        allowed_tasks = set(tasks) if tasks else None
+        if allowed_tasks:
+            available = set(self.model_tasks.values())
+            if not allowed_tasks.intersection(available):
+                raise ValueError(
+                    f"No models for requested tasks: {allowed_tasks}. Available: {available}."
+                )
+
+        timings: Dict[str, float] = {}
+        model_batch_preds: Dict[str, np.ndarray] = {}
+        t_smiles = t_infer = 0.0
+
+        for model_name in tqdm(
+            list(self._iter_model_names(allowed_tasks)), desc="Predicting", disable=not verbose
+        ):
+            model, dm = self._get_model_and_dm(model_name)
+            try:
+                ret = 'xgb' if self.model_types[model_name] == 'xgboost' else 'pt'
+
+                t0 = time.time()
+                feat_arg = dm.transform(
+                    smiles_list, context=context.context_features[model_name], return_tensor=ret
+                )
+                t_smiles += time.time() - t0
+
+                t0 = time.time()
+                try:
+                    model_batch_preds[model_name] = self._infer_and_denormalize(
+                        model_name, feat_arg, model=model, dm=dm
+                    )
+                except Exception as e:
+                    msg = str(e)
+                    if 'feature_names mismatch' in msg:
+                        msg = "feature_names mismatch (training/inference encoding incompatible)"
+                    raise ValueError(f"Prediction failed for model '{model_name}': {msg}") from e
+                t_infer += time.time() - t0
+            finally:
+                self._free_if_lazy(model, dm)
+
+        timings.update(smiles_featurize=t_smiles, inference=t_infer)
+
+        t0 = time.time()
+        results = self._assemble_batch_results(model_batch_preds, n, return_individual)
+        timings['assemble'] = time.time() - t0
+
+        out = results[0] if single else results
+        return (out, timings) if return_timings else out
+
+    # ------------------------------------------------------------------
+    # Context / SMILES split API — fast path for screening many SMILES
+    # ------------------------------------------------------------------
+
+    def transform_context(
+        self,
+        context: Union[SampleInput, Dict[str, Any]],
+        verbose: bool = False,
+    ) -> PreprocessedContext:
+        """Encode the non-SMILES (context) features once for every model.
+
+        Call once per biological context (POI / ligase / cell line / assay /
+        treatment time), then pass the result to :meth:`predict` via the
+        ``context`` argument alongside a list of SMILES strings to score.
+
+        Args:
+            context: ``SampleInput`` or dict with context columns.
+                SMILES is ignored.
+            verbose: Print progress per model.
+
+        Returns:
+            :class:`PreprocessedContext` ready for :meth:`predict`.
+        """
+        if isinstance(context, SampleInput):
+            context_dict = self._prepare_sample_dicts([context])[0]
+        else:
+            context_dict = dict(context)
+
+        context_features: Dict[str, Dict[str, np.ndarray]] = {}
+        xgb_layouts: Dict[str, List[Tuple[str, int, int]]] = {}
+        xgb_total_dims: Dict[str, int] = {}
+        xgb_row_template: Dict[str, np.ndarray] = {}
+        xgb_feature_names: Dict[str, List[str]] = {}
+        source_context: Dict[str, Any] = {}
+
+        for model_name in self._iter_model_names():
+            dm = self._get_dm(model_name)
+            try:
+                if getattr(dm, 'use_tokenizer', False):
+                    raise ValueError(
+                        f"Model '{model_name}' uses a tokenizer; use predict() directly instead of "
+                        "transform_context + predict(context=...)."
+                    )
+
+                filled, missing = self._validate_and_fill_defaults(
+                    context_dict, dm, verbose=False,
+                )
+                missing = [c for c in missing if c != dm.smiles_col]
+                if missing:
+                    raise ValueError(
+                        f"Model '{model_name}' is missing required context field(s): "
+                        f"{', '.join(missing)}."
+                    )
+                if verbose:
+                    print(f"  Preprocessed context for model '{model_name}'")
+
+                # Use dm.transform() — the same engine as predict — so that the
+                # same numeric_pipeline (properly pickled) handles treatment time.
+                # Supply a dummy SMILES so the molecular sub-pipeline runs
+                # without errors; those features are stripped immediately after.
+                dummy = dict(filled)
+                dummy[dm.smiles_col] = dummy.get(dm.smiles_col) or 'C'
+                all_feats = dm.transform([dummy], return_tensor='dict')  # {key: (1, dim)}
+                ctx_feats = {k: v[0] for k, v in all_feats.items()
+                             if not k.startswith(SMILES_FEATURE_PREFIXES)}
+                context_features[model_name] = ctx_feats
+
+                if self.model_types[model_name] == 'xgboost':
+                    layout = dm.get_feature_layout()
+                    total_dim = sum(width for _, _, width in layout)
+                    template = np.zeros((1, total_dim), dtype=np.float32)
+
+                    for key, offset, width in layout:
+                        if key.startswith(SMILES_FEATURE_PREFIXES):
+                            continue
+                        if key not in ctx_feats:
+                            raise ValueError(
+                                f"Model '{model_name}' expects context feature '{key}' "
+                                "in its XGBoost layout, but the datamodule did not produce it."
+                            )
+                        val = np.asarray(ctx_feats[key], dtype=np.float32).flatten()
+                        if val.shape[0] != width:
+                            raise ValueError(
+                                f"Context feature '{key}' for model '{model_name}' has width "
+                                f"{val.shape[0]} but layout expects {width}."
+                            )
+                        template[0, offset:offset + width] = val
+
+                    xgb_layouts[model_name] = layout
+                    xgb_total_dims[model_name] = total_dim
+                    xgb_row_template[model_name] = template
+                    xgb_feature_names[model_name] = dm.get_xgboost_feature_names()
+
+                if not source_context:
+                    source_context = dict(filled)
+            finally:
+                self._free_if_lazy(dm)
+
+        return PreprocessedContext(
+            context_features=context_features,
+            xgb_layouts=xgb_layouts,
+            xgb_total_dims=xgb_total_dims,
+            xgb_row_template=xgb_row_template,
+            xgb_feature_names=xgb_feature_names,
+            predictor_id=id(self),
+            source_context=source_context,
+        )
+
+    # ------------------------------------------------------------------
+    # DataFrame helper
+    # ------------------------------------------------------------------
+
     def predict_dataframe(
         self,
         df: pd.DataFrame,
@@ -1960,27 +1614,35 @@ class EnsemblePredictor:
         cell_line_col: Optional[str] = None,
         treatment_time_col: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Make predictions for a DataFrame.
+        """Make predictions for every row in a DataFrame.
 
-        Uses ``predict_batch`` for efficient batched featurization and
-        inference.  Adds one set of prediction columns per task present
-        in the ensemble.
+        Args:
+            df: Input DataFrame with at least a SMILES column.
+            smiles_col: Name of the SMILES column.
+            poi_col: POI name column (optional).
+            poi_sequence_col: POI sequence column (optional).
+            ligase_col: Ligase name column (optional).
+            cell_line_col: Cell line column (optional).
+            treatment_time_col: Treatment time column (optional).
+
+        Returns:
+            Input DataFrame with appended prediction columns.
         """
-        # Build SampleInput list
-        sample_list: List[SampleInput] = []
-        for _, row in df.iterrows():
-            sample_list.append(SampleInput(
+        samples = [
+            SampleInput(
                 smiles=row.get(smiles_col) if smiles_col in row.index else None,
                 poi_name=row.get(poi_col) if poi_col and poi_col in row.index else None,
                 poi_sequence=row.get(poi_sequence_col) if poi_sequence_col and poi_sequence_col in row.index else None,
                 ligase_name=row.get(ligase_col) if ligase_col and ligase_col in row.index else None,
                 cell_line=row.get(cell_line_col) if cell_line_col and cell_line_col in row.index else None,
                 treatment_time=row.get(treatment_time_col) if treatment_time_col and treatment_time_col in row.index else None,
-            ))
+            )
+            for _, row in df.iterrows()
+        ]
 
-        batch_results = self.predict_batch(sample_list, return_individual=True)
+        batch_results = self.predict(samples, return_individual=True)
 
-        all_row_results: List[Dict[str, Any]] = []
+        rows = []
         for task_results in batch_results:
             row_dict: Dict[str, Any] = {}
             if task_results is None:
@@ -1994,31 +1656,128 @@ class EnsemblePredictor:
                     row_dict[f'ci_pctl_upper{suffix}'] = result.ci_percentile_upper_95[0] if result.ci_percentile_upper_95 is not None else np.nan
                     row_dict[f'ci_sem_lower{suffix}'] = result.ci_sem_lower_95[0] if result.ci_sem_lower_95 is not None else np.nan
                     row_dict[f'ci_sem_upper{suffix}'] = result.ci_sem_upper_95[0] if result.ci_sem_upper_95 is not None else np.nan
-            all_row_results.append(row_dict)
+            rows.append(row_dict)
 
-        result_df = pd.DataFrame(all_row_results)
-        return pd.concat([df.reset_index(drop=True), result_df], axis=1)
+        return pd.concat([df.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
+
+    # ------------------------------------------------------------------
+    # Info
+    # ------------------------------------------------------------------
+
+    def get_required_inputs(
+        self, model_name: Optional[str] = None
+    ) -> Tuple[set, Dict[str, List[str]]]:
+        """Determine which raw sample columns each loaded model's datamodule needs.
+
+        Loads (and, in lazy mode, immediately frees) each relevant datamodule
+        to inspect its feature configuration.
+
+        Args:
+            model_name: Specific model name, or None for all loaded models.
+
+        Returns:
+            ``(all_required_columns, {model_name: [required_columns]})``.
+        """
+        names = [model_name] if model_name is not None else list(self._iter_model_names())
+        required: Dict[str, List[str]] = {}
+        req_cols_set: set = set()
+
+        for name in names:
+            dm = self._get_dm(name)
+            try:
+                req_cols = {dm.smiles_col}
+
+                if dm.poi_features == 'sequence':
+                    req_cols.add(dm.poi_sequence_col)
+                elif dm.poi_features == 'precomputed':
+                    req_cols.add(
+                        dm.poi_sequence_col if dm.poi_embeddings_id_type == 'sequence' else 'POI_UniProt'
+                    )
+                elif dm.poi_features == 'name':
+                    req_cols.add(dm.poi_col)
+
+                if dm.ligase_features == 'precomputed':
+                    req_cols.add(
+                        dm.ligase_sequence_col if dm.ligase_embeddings_id_type == 'sequence' else 'Ligase_UniProt'
+                    )
+                elif dm.ligase_features == 'name':
+                    req_cols.add(dm.ligase_col)
+
+                if dm.cell_features in ('description', 'name'):
+                    req_cols.add(dm.cell_line_col)
+                if dm.use_treatment_time:
+                    req_cols.add(dm.treatment_time_col)
+                if dm.use_assay_type_encoding:
+                    req_cols.add(dm.assay_type_col)
+
+                required[name] = sorted(req_cols)
+                req_cols_set.update(req_cols)
+            finally:
+                self._free_if_lazy(dm)
+
+        return req_cols_set, required
+
+    def get_categorical_choices(self) -> Dict[str, List[str]]:
+        """Collect known category values from all datamodule ordinal encoders.
+
+        In lazy mode this returns ``{}`` without loading every datamodule
+        (that defeats the point of lazy loading) — call ``get_model_info()``,
+        which documents this, or load with ``lazy_loading=False`` if you need
+        the real vocabulary.
+        """
+        if self._lazy:
+            warnings.warn(
+                "get_categorical_choices() returns {} in lazy mode (loading every "
+                "datamodule to answer this would defeat lazy loading); use "
+                "lazy_loading=False to get real category vocabularies."
+            )
+            return {}
+        merged: Dict[str, set] = {}
+        for dm in self.datamodules.values():
+            if dm is None:
+                continue
+            pipeline = getattr(dm, 'category_pipeline', None)
+            if pipeline is None:
+                continue
+            for _, transformer, cols in pipeline.transformers_:
+                ordinal = transformer.named_steps.get('ordinal') if hasattr(transformer, 'named_steps') else None
+                if ordinal is None or not hasattr(ordinal, 'categories_'):
+                    continue
+                for col, cats in zip(cols, ordinal.categories_):
+                    merged.setdefault(col, set()).update(c for c in cats if c is not None)
+        return {col: sorted(vals) for col, vals in merged.items()}
 
     def get_model_info(self) -> Dict[str, Any]:
-        """Get information about loaded models."""
+        names = list(self._model_paths if self._lazy else self.models)
         return {
-            'n_models': len(self.models),
-            'model_names': list(self.models.keys()),
+            'n_models': len(names),
+            'model_names': names,
             'model_types': self.model_types,
             'model_tasks': self.model_tasks,
             'weights': self.weights,
             'available_tasks': self.available_tasks,
             'device': self.device,
-            'categorical_choices': self.get_categorical_choices(),
+            'categorical_choices': {} if self._lazy else self.get_categorical_choices(),
         }
-    
+
     def update_weights(self, new_weights: Dict[str, float]) -> None:
-        """Update ensemble weights."""
-        total = sum(new_weights.values())
-        self.weights = {k: v / total for k, v in new_weights.items() if k in self.models}
-    
+        """Update ensemble weights for one or more loaded models in place.
+
+        Args:
+            new_weights: Mapping of model name to weight. Names not in the
+                loaded ensemble raise a ``ValueError``; unmentioned models
+                keep their current weight.
+        """
+        known = set(self._model_paths if self._lazy else self.models)
+        unknown = set(new_weights) - known
+        if unknown:
+            raise ValueError(f"Unknown model name(s) in new_weights: {sorted(unknown)}")
+        self.weights.update(new_weights)
+
     def __repr__(self) -> str:
+        n = len(self._model_paths if self._lazy else self.models)
+        mode = 'lazy' if self._lazy else 'eager'
         return (
-            f"EnsemblePredictor(n_models={len(self.models)}, "
-            f"device='{self.device}')"
+            f"EnsemblePredictor(n_models={n}, "
+            f"tasks={self.available_tasks}, device='{self.device}', mode='{mode}')"
         )

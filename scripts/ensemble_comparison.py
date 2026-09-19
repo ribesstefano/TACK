@@ -572,52 +572,93 @@ def load_predictions_data(
     val_predictions = defaultdict(lambda: defaultdict(dict))
     test_predictions = {}
     val_targets = defaultdict(dict)
-    test_targets = None
-    
+    test_row_ids: Dict[str, np.ndarray] = {}
+    row_id_to_target: Dict[str, float] = {}
+
     architectures = set()
     task_lower = task.lower()
-    
+
     for i, file in enumerate(files):
         if i % 50 == 0:
             print(f"  Processing {i+1}/{len(files)}")
-        
+
         # Match task in filename
         if f'task={task_lower}' not in file.stem.lower():
             continue
-        
+
         parts = file.stem.split('-')
         metadata = {}
         for part in parts:
             if '=' in part:
                 key, value = part.split('=', 1)
                 metadata[key] = value
-        
+
         arch = f"model={metadata.get('model', '')}-data={metadata.get('data', '')}-group={metadata.get('group', 'all')}"
         fold = int(metadata.get('fold', 0))
         split = metadata.get('split', '')
-        
+
         architectures.add(arch)
-        
+
         df = pd.read_csv(file)
+        # Different data configs can drop rows with missing values, so folds
+        # aren't guaranteed to share row count/order. `row_id` (a stable
+        # content hash, see tackai/data/ids.py) lets us realign by identity
+        # instead of assuming positional alignment across files.
+        if 'row_id' in df.columns:
+            df = df.drop_duplicates(subset='row_id', keep='first')
+
         preds = df['pred'].values
         targets = df['target'].values
-        
+
         # Transform for DC50 task (regression)
         if task_lower == 'dc50':
             preds = dc50_to_pdc50(preds)
             targets = dc50_to_pdc50(targets)
         # For 'bin' task, predictions are already probabilities
-        
+
         if split == 'val':
             val_predictions[arch][fold] = preds
             val_targets[arch][fold] = targets
         elif split == 'test':
             model_key = f"{arch}-fold={fold}"
             test_predictions[model_key] = preds
-            
-            if test_targets is None:
-                test_targets = targets
-    
+
+            if 'row_id' in df.columns:
+                row_ids = df['row_id'].values
+                test_row_ids[model_key] = row_ids
+                for rid, t in zip(row_ids, targets):
+                    row_id_to_target.setdefault(rid, t)
+
+    if test_row_ids:
+        # Restrict/realign the test set to the rows every model actually has
+        # predictions for, so downstream positional indexing (split_test_set)
+        # is safe even when data configs disagree on which rows survived
+        # missing-value filtering.
+        common_row_ids = set.intersection(
+            *(set(rids) for rids in test_row_ids.values())
+        )
+        common_row_ids = sorted(common_row_ids)
+        n_common = len(common_row_ids)
+        n_union = len(set.union(*(set(rids) for rids in test_row_ids.values())))
+        if n_common < n_union:
+            print(
+                f"\nWarning: test set row counts differ across model/fold "
+                f"combinations ({n_common} rows common to all of them, "
+                f"{n_union} rows total). Restricting comparison to the "
+                f"{n_common} common rows."
+            )
+
+        test_targets = np.array([row_id_to_target[rid] for rid in common_row_ids])
+        aligned_test_predictions = {}
+        for model_key, preds in test_predictions.items():
+            row_id_to_pred = dict(zip(test_row_ids[model_key], preds))
+            aligned_test_predictions[model_key] = np.array(
+                [row_id_to_pred[rid] for rid in common_row_ids]
+            )
+        test_predictions = aligned_test_predictions
+    else:
+        test_targets = None
+
     print(f"\nData loaded:")
     print(f"  Task: {task}")
     print(f"  Architectures: {len(architectures)}")
@@ -626,7 +667,7 @@ def load_predictions_data(
         print(f"  Test set size: {len(test_targets)}")
         if task_lower == 'bin':
             print(f"  Class distribution: {np.mean(test_targets):.2%} positive")
-    
+
     return val_predictions, val_targets, test_predictions, test_targets, list(architectures)
 
 
@@ -1232,7 +1273,20 @@ def main():
         best_arch = baselines['best_architecture_name']
         arch_models = [k for k in eval_data['predictions'].keys() if k.startswith(best_arch)]
         arch_weights = {k: 1.0/len(arch_models) for k in arch_models}
-        
+
+        save_ensemble_weights(
+            weights=arch_weights,
+            output_path=args.output_dir,
+            task=task,
+            method_name="best_architecture",
+            metric_value=baselines['best_architecture'],
+            metadata={
+                "eval_set_size": len(eval_data['targets']),
+                "architecture": best_arch,
+                "weight_type": "uniform_over_architecture_folds",
+            }
+        )
+
         unc_metrics, _ = analyze_uncertainty_quality(
             eval_data['predictions'], eval_data['targets'],
             arch_weights, 'Baseline: Best Architecture', task

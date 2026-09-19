@@ -93,6 +93,10 @@ def main():
         '--output', required=True,
         help="Name/path of the output directory to create."
     )
+    parser.add_argument(
+        '--overwrite', action='store_true',
+        help="Delete the output directory first if it already exists."
+    )
     args = parser.parse_args()
 
     weights_file = Path(args.weights)
@@ -107,8 +111,12 @@ def main():
         print(f"Error: checkpoints directory not found: {checkpoints_dir}")
         sys.exit(1)
     if output_dir.exists():
-        print(f"Error: output directory already exists: {output_dir}")
-        sys.exit(1)
+        if args.overwrite:
+            print(f"Overwriting existing output directory: {output_dir}")
+            shutil.rmtree(output_dir)
+        else:
+            print(f"Error: output directory already exists: {output_dir}")
+            sys.exit(1)
 
     # Load weights file
     with open(weights_file) as f:

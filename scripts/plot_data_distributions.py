@@ -37,6 +37,8 @@ else:
 # CONFIGURATION
 # ============================================================================
 
+OUTDIR = Path("plots")
+OUTDIR.mkdir(exist_ok=True)
 OUTDIR = Path("plots") / "data"
 OUTDIR.mkdir(exist_ok=True)
 

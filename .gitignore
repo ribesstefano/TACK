@@ -188,4 +188,11 @@ logs/
 /data/
 tackai_ensemble*/
 TPD-html-files.zip
+
+boltz_*
+outputs/
 cache/
+ensembles/
+hf_staging/
+**/*.npz
+**/*.zip

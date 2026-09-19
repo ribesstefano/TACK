@@ -1,14 +1,20 @@
+model_type: mlp
 model_config:
     learning_rate: 0.001
-    hidden_dim: 256
-    mlp_depth: 2
-    head_depth: 2
+    hidden_dim:
+        - 512
+        - 256
+    mlp_depth: 1
+    head_depth: 1
     dropout: 0.1
     head_dropout: 0.1
-    task_type: mve
+    activation: gelu
+    norm_type: batch
+    task_type: bin
     lr_scheduler_type: cosine
     warmup_ratio: 0.05
     num_cycles: 10
+    categorical_embedding_dim: 8
 training_config:
     max_epochs: 200
     patience: 5

@@ -1,0 +1,56 @@
+# Main Hydra config for training PROTAC degradation prediction models.
+#
+# Compose a run by selecting a data feature-set and a model from the config
+# groups below, and override any field on the command line, e.g.:
+#
+#   tack train model=mlp data=fp task=dmax group=scaffold          # single run
+#
+# `tack train` uses the Hydra compose API directly, not the multirun
+# launcher, so for sweeps loop over `tack train` from the shell, e.g.:
+#
+#   for enc in minmax onehot embedding; do
+#       tack train model=xgboost data=fp task=dmax data.categorical_encoding=$enc
+#   done
+defaults:
+  - data: fp        # any file stem under configs/data/
+  - model: xgboost  # any file stem under configs/model/
+  - _self_
+
+# Task to train on: dmax | dc50 | bin | dmax_bin | dc50_bin | multitask
+task: dmax
+# Data splitting strategy: random | scaffold | butina
+group: scaffold
+
+seed: 42
+batch_size: 64
+num_proc: 1
+
+checkpoint_dir: ./checkpoints
+predictions_dir: ./predictions
+
+# Hyperparameter tuning (Optuna)
+tune_hyperparameters: true
+# Number of tuning trials; null -> 20 (xgboost) / 100 (mlp, bert)
+n_tuning_trials: null
+
+# Optional CSV overriding the default TACK dataset. Regression labels may be a
+# generic 'Value' column or native 'Dmax'/'DC50' columns (as in TACK2.0).
+custom_dataset_csv: null
+
+# On-the-fly held-out isolation, applied only when the dataset lacks a
+# 'SMILES_Held_Out' column (e.g. a raw TACK2.0 CSV). A diverse subset is picked
+# with the RDKit MaxMin algorithm; the seed is fixed and independent of `seed`
+# so the held-out set is identical across every model/feature-set experiment.
+# The per-`group` cluster column is likewise derived when absent.
+held_out_frac: 0.10
+held_out_seed: 42
+
+hydra:
+  job:
+    # Keep the working directory at the launch location so relative paths
+    # (checkpoint_dir, predictions_dir) resolve as before.
+    chdir: false
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}

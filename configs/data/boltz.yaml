@@ -1,0 +1,35 @@
+# Molecule: Morgan fingerprint + RDKit descriptors
+mol_features: "fingerprint+descriptors"
+fp_size: 512
+radius: 16
+use_relevant_descriptors: false
+
+# POI (target protein): precomputed Boltz per-sequence embedding (s_mean, 384-d,
+# already pooled; archive keyed by amino-acid sequence). The "geneimputed" npz
+# adds same-gene ortholog embeddings for a few cross-species POIs (mouse Alk ->
+# human ALK, mouse Hdac3 -> human HDAC3); rows whose gene is not embedded are
+# dropped at setup time (see DegradationComplexDataModule).
+poi_features: "precomputed"
+poi_embeddings_file: "/proj/berzelius-2026-62/users/x_steri/TACK/boltz_embeddings_s_mean_geneimputed.npz"
+poi_embeddings_format: "npz"
+poi_embeddings_per_residue: false
+poi_embeddings_id_type: "sequence"
+
+# E3 ligase (recruiter): one-hot encoded name (see categorical_encoding below)
+ligase_features: "name"
+
+# Cell line: textual description embedding
+cell_features: "description"
+cell_line_col: "Cell_Line_ID"
+
+# Assay context: one-hot assay type + raw treatment time (imputed & scaled)
+use_assay_type_encoding: true
+use_treatment_time: true
+
+# Categorical encoding — E3 name and assay type are encoded one-hot
+categorical_encoding: "onehot"
+
+# Labels (regression defaults; overridden per-task by the launcher for bin tasks)
+normalize_labels: true
+standardize_labels: false
+impute_labels: true

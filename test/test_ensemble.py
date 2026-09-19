@@ -55,7 +55,7 @@ def test_ensemble_predictor():
         if not batch_samples:
             continue
 
-        batch_results = predictor.predict_batch(batch_samples, tasks=['dc50'])
+        batch_results = predictor.predict(batch_samples, tasks=['dc50'])
 
         # Compare predictions with true values
         for sample, true_dc50, result in zip(batch_samples, batch_true_values, batch_results):

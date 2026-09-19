@@ -1,4 +1,4 @@
-""" STAEDA Model with per-label losses and weighted loss aggregation. """
+""" TACK Model with per-label losses and weighted loss aggregation. """
 import math
 import logging
 from typing import Dict, List, Literal, Optional
