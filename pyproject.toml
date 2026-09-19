@@ -30,14 +30,14 @@ dependencies = [
     "rdkit>=2024.0.0",
     "useful-rdkit-utils>=0.90",
     # Classical ML
-    "scikit-learn>=1.5.0,<1.7.0",
+    "scikit-learn>=1.7.2,<1.8.0",
     "xgboost>=2.0.0",
     "optuna>=4.0.0",
     "optuna-integration>=4.0.0",
     "imbalanced-learn>=0.12.0",
     # Data / numerics
     "pandas>=2.0.0",
-    "numpy>=1.24.0,<2.0.0",
+    "numpy>=2.0.0,<3.0.0",
     "scipy>=1.12.0",
     "statsmodels>=0.14.0",
     "h5py>=3.10.0",
@@ -98,6 +98,16 @@ tack = "tackai.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["tackai", "tack_dataset"]
+
+[tool.uv]
+# curvlinops-for-pytorch==2.0.1 (pinned because laplace-torch==0.2.2.2 imports
+# its now-removed `curvlinops._base` module directly; curvlinops>=3.0 dropped
+# it) declares `numpy<2.0.0`, but that pin predates numpy 2's release and was
+# never re-verified — empirically, 2.0.1 loads and predicts correctly against
+# numpy>=2 (verified against every published TACK ensemble, including the
+# Lightning/Caruana ones that actually exercise this import path). Override
+# the stale declared bound rather than bump the package and break laplace-torch.
+override-dependencies = ["numpy>=2.0.0,<3.0.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
