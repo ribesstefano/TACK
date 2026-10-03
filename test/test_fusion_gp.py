@@ -168,3 +168,42 @@ def test_singular_kernel_with_vanishing_noise_still_fits(monkeypatch):
     gp = AdditiveProductGP(dims_of(Z), jitter=0.0)   # no jitter: only the floor can save it
     gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
     assert np.isfinite(gp.predict(Z)).all()
+
+
+def test_rbf_self_covariance_is_one_at_any_column_scale():
+    """RBF(x, x) must be exactly 1 however large the raw column values are.
+
+    The descriptor block is raw by design and Ipc reaches 1e20. Computing squared distances
+    as |a|^2 + |b|^2 - 2a.b then loses the diagonal: its true value is 0, but the absolute
+    error of the cancellation is ~1e19, so exp(-d2/2l^2) returns 0 where it must return 1.
+    On the real dmax data that gave rbf:descriptors a minimum eigenvalue of -3.7 and the
+    conditioning Cholesky failed outright.
+    """
+    import torch
+
+    for scale in (1.0, 1e9, 1e18):
+        Z, y = toy(n=50)
+        Z["descriptors"] = Z["descriptors"] * scale
+        gp = AdditiveProductGP(dims_of(Z))
+        gp.fit(Z, y, n_restarts=1, n_iter=5, seed=0)
+        Zt = gp._to_tensor(Z)
+        cached = gp._cache_distances(Zt, Zt)
+        with torch.no_grad():
+            for block in gp.rbf_blocks:
+                diag = gp._rbf(block, gp.params_, Zt, Zt, cached).diagonal().numpy()
+                assert np.allclose(diag, 1.0, atol=1e-12), (
+                    f"scale {scale:.0e}: RBF({block}, x, x) = {diag.min():.6f}, not 1")
+
+
+def test_raw_descriptor_scale_gives_a_positive_definite_kernel():
+    """The assembled kernel of a 1e18-scale block must still be factorisable."""
+    Z, y = toy(n=120)
+    Z["descriptors"] = Z["descriptors"] * 6e18
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
+    K = gp.kernel_matrix(Z, Z)
+    assert np.isfinite(K).all()
+    eigenvalues = np.linalg.eigvalsh(0.5 * (K + K.T))
+    assert eigenvalues.min() > -1e-8 * eigenvalues.max(), "kernel is indefinite"
+    mean, std = gp.predict(Z, return_std=True)
+    assert np.isfinite(mean).all() and np.isfinite(std).all()

@@ -100,6 +100,20 @@ class AdditiveProductGP:
         params["mean"] = torch.tensor(0.0, dtype=self.dtype, requires_grad=True)
         return params
 
+    def _column_scales(self, Z: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
+        """Per-column spread of every ARD block, used to anchor its lengthscales.
+
+        Measured once on the fit rows and carried in the fitted state, so a model reloaded or
+        re-conditioned on other rows keeps the parameterisation it was fitted with.
+        """
+        scales = {}
+        for block in self.ard_blocks:
+            column = np.asarray(Z[block], dtype=np.float64)
+            spread = column.std(axis=0)
+            spread = np.where(spread > 0, spread, 1.0)      # a constant column needs no scaling
+            scales[block] = torch.as_tensor(spread, dtype=self.dtype)
+        return scales
+
     @staticmethod
     def _noise(params: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Observation noise, never below :data:`NOISE_FLOOR`."""
@@ -111,36 +125,66 @@ class AdditiveProductGP:
         return {b: torch.as_tensor(np.asarray(Z[b]), dtype=self.dtype) for b in self.dims}
 
     @staticmethod
-    def _sq_dists(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
-        """Pairwise squared euclidean distances, clamped at zero for numerical safety."""
-        d2 = (A * A).sum(1)[:, None] + (B * B).sum(1)[None, :] - 2.0 * (A @ B.T)
-        return d2.clamp_min(0.0)
+    def _sq_dists(A: torch.Tensor, B: torch.Tensor, same: bool = False) -> torch.Tensor:
+        """Pairwise squared euclidean distances, clamped at zero for numerical safety.
 
-    def _cache_distances(self, Za: Dict[str, torch.Tensor],
-                         Zb: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        Args:
+            A: Left rows.
+            B: Right rows.
+            same: ``A`` and ``B`` are the same rows. The diagonal is then forced to exactly
+                zero and the matrix symmetrised: ``|a|^2 + |b|^2 - 2a.b`` cancels to absolute
+                error ``eps * |a|^2``, which for a raw descriptor column near 1e18 is ~1e19
+                instead of 0, and an RBF whose self-covariance is 0 rather than 1 is not a
+                valid kernel at all.
+
+        Returns:
+            Squared distance matrix.
+        """
+        d2 = (A * A).sum(1)[:, None] + (B * B).sum(1)[None, :] - 2.0 * (A @ B.T)
+        d2 = d2.clamp_min(0.0)
+        if same:
+            d2 = 0.5 * (d2 + d2.T)
+            d2 = d2 - torch.diag(d2.diagonal())
+        return d2
+
+    def _cache_distances(self, Za: Dict[str, torch.Tensor], Zb: Dict[str, torch.Tensor],
+                         same: bool = False) -> Dict[str, torch.Tensor]:
         """Squared distances of the isotropic RBF blocks, computed once per (Za, Zb) pair.
 
         ARD blocks are absent on purpose: their distances depend on the lengthscales and are
         recomputed per step in :meth:`_rbf`.
         """
-        return {b: self._sq_dists(Za[b], Zb[b])
+        return {b: self._sq_dists(Za[b], Zb[b], same=same)
                 for b in self.rbf_blocks if b not in self.ard_blocks}
 
     def _rbf(self, block: str, params: Dict[str, torch.Tensor],
              Za: Dict[str, torch.Tensor], Zb: Dict[str, torch.Tensor],
-             cached: Dict[str, torch.Tensor]) -> torch.Tensor:
+             cached: Dict[str, torch.Tensor], same: bool = False) -> torch.Tensor:
         """RBF kernel of one block, from the cached distances or recomputed for ARD."""
-        ls = torch.exp(params[f"ls:{block}"])
+        ls = self._lengthscale(block, params)
         if block in self.ard_blocks:
-            d2 = self._sq_dists(Za[block] / ls, Zb[block] / ls)
+            d2 = self._sq_dists(Za[block] / ls, Zb[block] / ls, same=same)
             return torch.exp(-0.5 * d2)
         return torch.exp(-0.5 * cached[block] / (ls[0] ** 2))
 
+    def _lengthscale(self, block: str, params: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Lengthscale of a block, anchored to the spread of its own columns.
+
+        For an ARD block the raw parameter multiplies the column spread measured at fit time,
+        so ``x / lengthscale`` starts out order 1 whatever the column's units are. Without
+        that anchor a raw descriptor column near 1e18 divided by a lengthscale near 1 makes
+        the squared-distance cancellation lose every bit of the result. The data itself is
+        never rescaled; only the parameterisation is.
+        """
+        raw = torch.exp(params[f"ls:{block}"])
+        scale = self.ls_scale_.get(block) if hasattr(self, "ls_scale_") else None
+        return raw if scale is None else raw * scale
+
     def _assemble(self, params: Dict[str, torch.Tensor],
                   Za: Dict[str, torch.Tensor], Zb: Dict[str, torch.Tensor],
-                  cached: Dict[str, torch.Tensor]) -> torch.Tensor:
+                  cached: Dict[str, torch.Tensor], same: bool = False) -> torch.Tensor:
         """The full covariance between two sets of rows (noise-free)."""
-        rbf = {b: self._rbf(b, params, Za, Zb, cached) for b in self.rbf_blocks}
+        rbf = {b: self._rbf(b, params, Za, Zb, cached, same=same) for b in self.rbf_blocks}
         total = None
         for b in self.rbf_blocks:
             term = torch.exp(params[f"sc:rbf:{b}"]) * rbf[b]
@@ -203,7 +247,7 @@ class AdditiveProductGP:
         """
         n = len(y)
         eye = torch.eye(n, dtype=self.dtype)
-        K = self._assemble(params, Z, Z, cached) + eye * self._noise(params)
+        K = self._assemble(params, Z, Z, cached, same=True) + eye * self._noise(params)
         L = None
         jitter = self.jitter
         while L is None:
@@ -241,13 +285,14 @@ class AdditiveProductGP:
         """
         y = np.asarray(y, dtype=float)
         if state is None:
+            self.ls_scale_ = self._column_scales(Z)
             rng = np.random.default_rng(seed)
             n = len(y)
             sub = (np.arange(n) if n <= max_hyper_points
                    else np.sort(rng.choice(n, max_hyper_points, replace=False)))
             Z_sub = self._to_tensor({b: np.asarray(Z[b])[sub] for b in self.dims})
             y_sub = torch.as_tensor(y[sub], dtype=self.dtype)
-            cached = self._cache_distances(Z_sub, Z_sub)
+            cached = self._cache_distances(Z_sub, Z_sub, same=True)
             best = (np.inf, None)
             for restart in range(n_restarts):
                 torch.manual_seed(seed * 1000 + restart)
@@ -266,7 +311,8 @@ class AdditiveProductGP:
                     best = (final, {k: v.detach().clone() for k, v in params.items()})
             if best[1] is None:
                 raise RuntimeError("GP marginal-likelihood optimisation diverged in every restart")
-            state = {"params": best[1], "neg_mll": best[0], "n_hyper": int(len(y_sub))}
+            state = {"params": best[1], "neg_mll": best[0], "n_hyper": int(len(y_sub)),
+                     "ls_scale": self.ls_scale_}
         self.load_state(state, Z, y)
         return state
 
@@ -280,6 +326,7 @@ class AdditiveProductGP:
         """
         y = np.asarray(y, dtype=float)
         self.state_ = state
+        self.ls_scale_ = state.get("ls_scale", {})
         self.params_ = {k: v.detach().clone() for k, v in state["params"].items()}
         self.Z_train_ = self._to_tensor(Z)
         self.y_train_ = torch.as_tensor(y, dtype=self.dtype)
@@ -287,8 +334,8 @@ class AdditiveProductGP:
         self.n_hyper_ = int(state.get("n_hyper", len(y)))
         self.noise_ = float(self._noise(self.params_))
         with torch.no_grad():
-            cached = self._cache_distances(self.Z_train_, self.Z_train_)
-            K = self._assemble(self.params_, self.Z_train_, self.Z_train_, cached)
+            cached = self._cache_distances(self.Z_train_, self.Z_train_, same=True)
+            K = self._assemble(self.params_, self.Z_train_, self.Z_train_, cached, same=True)
             K = K + torch.eye(self.n_train_, dtype=self.dtype) * self.noise_
             self.chol_ = self._cholesky(K)
             resid = (self.y_train_ - self.params_["mean"]).unsqueeze(1)
@@ -308,7 +355,10 @@ class AdditiveProductGP:
         """
         with torch.no_grad():
             ta, tb = self._to_tensor(Za), self._to_tensor(Zb)
-            return self._assemble(self.params_, ta, tb, self._cache_distances(ta, tb)).numpy()
+            same = Za is Zb or all(np.array_equal(np.asarray(Za[b]), np.asarray(Zb[b]))
+                                   for b in self.dims)
+            cached = self._cache_distances(ta, tb, same=same)
+            return self._assemble(self.params_, ta, tb, cached, same=same).numpy()
 
     def predict(self, Z: Dict[str, np.ndarray], return_std: bool = False):
         """Posterior mean, and optionally the posterior standard deviation.
@@ -344,8 +394,9 @@ class AdditiveProductGP:
         with torch.no_grad():
             n = min(self.n_train_, max_rows)
             Z = {b: a[:n] for b, a in self.Z_train_.items()}
-            cached = self._cache_distances(Z, Z)
-            rbf = {b: self._rbf(b, self.params_, Z, Z, cached) for b in self.rbf_blocks}
+            cached = self._cache_distances(Z, Z, same=True)
+            rbf = {b: self._rbf(b, self.params_, Z, Z, cached, same=True)
+                   for b in self.rbf_blocks}
             shares = {}
             for b in self.rbf_blocks:
                 shares[f"rbf:{b}"] = float((torch.exp(self.params_[f"sc:rbf:{b}"])
@@ -361,7 +412,7 @@ class AdditiveProductGP:
             total = sum(shares.values()) or 1.0
             lengthscale = {}
             for b in self.rbf_blocks:
-                ls = torch.exp(self.params_[f"ls:{b}"]).numpy()
+                ls = self._lengthscale(b, self.params_).numpy()
                 lengthscale[b] = ls if b in self.ard_blocks else ls[0]
             return {"lengthscale": lengthscale,
                     "weight": {k: v / total for k, v in shares.items()},
