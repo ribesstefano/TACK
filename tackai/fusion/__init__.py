@@ -7,7 +7,9 @@ inside this pipeline.
 """
 from tackai.fusion.blocks import (BLOCK_DIMS, BLOCK_ORDER, DENSE_BLOCKS, MOL_BLOCKS,
                                   SMALL_BLOCKS, BlockPreprocessor, block_index)
+from tackai.fusion.context import CONTEXT_FILES, ContextEncoder, normalize_assay
 from tackai.fusion.features import DESCRIPTOR_NAMES, MolFeaturizer
 
 __all__ = ["BLOCK_ORDER", "BLOCK_DIMS", "DENSE_BLOCKS", "SMALL_BLOCKS", "MOL_BLOCKS",
-           "BlockPreprocessor", "block_index", "MolFeaturizer", "DESCRIPTOR_NAMES"]
+           "BlockPreprocessor", "block_index", "MolFeaturizer", "DESCRIPTOR_NAMES",
+           "ContextEncoder", "CONTEXT_FILES", "normalize_assay"]
