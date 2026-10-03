@@ -10,10 +10,11 @@ from tackai.fusion.blocks import (BLOCK_DIMS, BLOCK_ORDER, DENSE_BLOCKS, MOL_BLO
 from tackai.fusion.context import CONTEXT_FILES, ContextEncoder, normalize_assay
 from tackai.fusion.data import (TASK_LABELS, TASK_TYPES, TASKS, FusionData, build_table,
                                 make_targets, scaffold_groups)
+from tackai.fusion.gp import AdditiveProductGP
 from tackai.fusion.features import DESCRIPTOR_NAMES, MolFeaturizer
 
 __all__ = ["BLOCK_ORDER", "BLOCK_DIMS", "DENSE_BLOCKS", "SMALL_BLOCKS", "MOL_BLOCKS",
            "BlockPreprocessor", "block_index", "MolFeaturizer", "DESCRIPTOR_NAMES",
            "ContextEncoder", "CONTEXT_FILES", "normalize_assay",
            "FusionData", "build_table", "make_targets", "scaffold_groups", "TASKS",
-           "TASK_TYPES", "TASK_LABELS"]
+           "TASK_TYPES", "TASK_LABELS", "AdditiveProductGP"]
