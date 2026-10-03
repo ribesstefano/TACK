@@ -199,3 +199,6 @@ hf_staging/
 # mkdocs: notebook copied into the docs tree by docs/hooks.py at build time
 # (notebooks/ stays the single source of truth, see mkdocs.yml `hooks:`)
 docs/tutorial/*.ipynb
+
+# Fitted fusion surrogate ensembles (regenerate with notebooks/fusion_surrogates.ipynb)
+ensembles/fusion_*/
