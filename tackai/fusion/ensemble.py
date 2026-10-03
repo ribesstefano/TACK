@@ -314,6 +314,34 @@ class FusionEnsemble:
             ok, scores = self._predict_from_records(records, return_std)
         return self._aggregate(scores, ok, smiles, return_individual)
 
+    def predict_matrix(self, X, return_individual: bool = True,
+                       return_std: bool = True) -> FusionPrediction:
+        """Score rows that are already encoded as a design matrix.
+
+        This is the path an evaluation takes: a held-out fold of a :class:`FusionData` is
+        already featurised, and re-encoding it from records would only repeat the work.
+
+        Args:
+            X: Design matrix with this ensemble's block layout.
+            return_individual: Keep the per-member predictions in the result.
+            return_std: Ask every member that can for a predictive standard deviation.
+
+        Returns:
+            A :class:`FusionPrediction` whose ``ok`` is all True (an encoded row is valid by
+            construction).
+        """
+        X = np.asarray(X)
+        n = len(X)
+        ok = np.ones(n, dtype=bool)
+        per_member = []
+        for member in self.members:
+            if n == 0:
+                per_member.append((np.empty(0), np.empty(0)))
+                continue
+            Z = member.pre_.transform(X)
+            per_member.append(self._member_scores(member, Z, return_std))
+        return self._aggregate(per_member, ok, [None] * n, return_individual)
+
     def _predict_with_context(self, smiles: List[str], context: FusionContext,
                               return_std: bool):
         """Fast path: featurise the molecules, reuse each member's transformed context."""

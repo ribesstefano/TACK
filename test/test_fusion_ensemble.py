@@ -140,3 +140,24 @@ def test_weights_can_be_given_explicitly(data):
     pred = ens.predict(SMILES[:2], context=ens.transform_context(CTX))
     members = np.array(list(pred.member_predictions.values()))
     assert np.allclose(pred.mean, 0.25 * members[0] + 0.75 * members[1])
+
+
+def test_predict_matrix_scores_an_encoded_design_matrix(data):
+    """Evaluating on a held-out fold needs the already-encoded rows, not records."""
+    ens = FusionEnsemble.fit(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
+    idx, X, y, groups = data.task_rows("pdc50")
+    pred = ens.predict_matrix(X[:5])
+    assert pred.mean.shape == (5,) and np.isfinite(pred.mean).all()
+    assert (pred.std > 0).all()
+
+
+def test_predict_matrix_agrees_with_the_record_path(data):
+    ens = FusionEnsemble.fit(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
+    row = data.table.iloc[0]
+    record = {"smiles": row["smiles"], "poi_seq": row["poi_seq"], "e3_seq": row["e3_seq"],
+              "cell_id": row["cell_key"], "assay": row["assay_raw"],
+              "assay_time": row["assay_time"]}
+    from_matrix = ens.predict_matrix(data.X[:1])
+    from_record = ens.predict([record])
+    assert np.allclose(from_matrix.mean, from_record.mean, rtol=0, atol=0)
+    assert np.allclose(from_matrix.std, from_record.std, rtol=0, atol=0)

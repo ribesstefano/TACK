@@ -74,3 +74,28 @@ def test_development_table_encodes_end_to_end():
         splits = data.splits(task, n_repeats=1, n_folds=5)
         for train, test in splits[0]:
             assert not set(groups[train]) & set(groups[test])
+
+
+@needs_cache
+@needs_csvs
+def test_gp_member_fits_the_real_dmax_fold():
+    """Regression: this exact fit raised "leading minor of order 1066 is not positive-definite".
+
+    The development table measures the same compound in the same context repeatedly, so the
+    kernel of the 1200-row hyper-parameter sample is singular; the fit only survives because
+    the likelihood noise has a floor.
+    """
+    from sklearn.metrics import r2_score
+
+    from tackai.fusion.data import FusionData
+    from tackai.fusion.models import GPInteraction
+
+    data = FusionData.from_csv(DEV_FILES)
+    _, X, y, groups = data.task_rows("dmax")
+    train, test = data.splits("dmax", n_repeats=1, n_folds=5)[0][0]
+
+    gp = GPInteraction(random_state=0).fit(X[train], y[train], groups[train])
+    mean, std = gp.predict(X[test], return_std=True)
+    assert np.isfinite(mean).all() and (std > 0).all()
+    assert gp.model_.noise_ >= 1e-3
+    assert r2_score(y[test], mean) > 0.2        # the published M4 reaches ~.47 over 25 folds

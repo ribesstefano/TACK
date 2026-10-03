@@ -28,6 +28,12 @@ import torch
 MOL_KERNEL_BLOCKS = ("fingerprint", "descriptors")
 DEFAULT_INTERACTIONS = ("mol*poi", "mol*cell", "poi*cell")
 
+#: Smallest observation noise the likelihood may use. The development table measures the same
+#: compound in the same context repeatedly, so K has exactly repeated rows and is singular;
+#: without a floor the optimiser shrinks the noise until the Cholesky fails outright. The
+#: GPyTorch original carried the same constraint (``GreaterThan(1e-3)``).
+NOISE_FLOOR = 1e-3
+
 
 class AdditiveProductGP:
     """Exact GP over processed blocks, with cached distances and exact posterior variance.
@@ -89,9 +95,15 @@ class AdditiveProductGP:
         for term in self.terms:
             params[f"sc:{term}"] = torch.tensor(rng.normal(0.0, 0.4) - offset,
                                                 dtype=self.dtype, requires_grad=True)
-        params["noise"] = torch.tensor(np.log(0.5), dtype=self.dtype, requires_grad=True)
+        params["noise"] = torch.tensor(np.log(0.5 - NOISE_FLOOR), dtype=self.dtype,
+                                       requires_grad=True)
         params["mean"] = torch.tensor(0.0, dtype=self.dtype, requires_grad=True)
         return params
+
+    @staticmethod
+    def _noise(params: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Observation noise, never below :data:`NOISE_FLOOR`."""
+        return NOISE_FLOOR + torch.exp(params["noise"])
 
     # ---------------------------------------------------------------- kernel pieces
 
@@ -183,11 +195,24 @@ class AdditiveProductGP:
     # ---------------------------------------------------------------- fitting
 
     def _neg_log_mll(self, params, Z, y, cached) -> torch.Tensor:
-        """Negative exact log marginal likelihood."""
+        """Negative exact log marginal likelihood.
+
+        Returns a non-finite value rather than raising when the kernel cannot be factorised
+        even with escalated jitter, so one bad step discards its restart instead of aborting
+        a whole ensemble fit.
+        """
         n = len(y)
-        K = self._assemble(params, Z, Z, cached) + torch.eye(n, dtype=self.dtype) * torch.exp(
-            params["noise"])
-        L = torch.linalg.cholesky(K + torch.eye(n, dtype=self.dtype) * self.jitter)
+        eye = torch.eye(n, dtype=self.dtype)
+        K = self._assemble(params, Z, Z, cached) + eye * self._noise(params)
+        L = None
+        jitter = self.jitter
+        while L is None:
+            try:
+                L = torch.linalg.cholesky(K + eye * jitter)
+            except Exception:
+                if jitter > 1e-2:
+                    return torch.tensor(float("inf"), dtype=self.dtype)
+                jitter = max(jitter * 10, 1e-8)
         resid = (y - params["mean"]).unsqueeze(1)
         alpha = torch.cholesky_solve(resid, L)
         return (0.5 * (resid * alpha).sum() + torch.log(torch.diagonal(L)).sum()
@@ -232,7 +257,7 @@ class AdditiveProductGP:
                     opt.zero_grad()
                     loss = self._neg_log_mll(params, Z_sub, y_sub, cached)
                     if not torch.isfinite(loss):
-                        break
+                        break          # this restart has wandered off; keep the best so far
                     loss.backward()
                     opt.step()
                 with torch.no_grad():
@@ -260,7 +285,7 @@ class AdditiveProductGP:
         self.y_train_ = torch.as_tensor(y, dtype=self.dtype)
         self.n_train_ = len(y)
         self.n_hyper_ = int(state.get("n_hyper", len(y)))
-        self.noise_ = float(torch.exp(self.params_["noise"]))
+        self.noise_ = float(self._noise(self.params_))
         with torch.no_grad():
             cached = self._cache_distances(self.Z_train_, self.Z_train_)
             K = self._assemble(self.params_, self.Z_train_, self.Z_train_, cached)

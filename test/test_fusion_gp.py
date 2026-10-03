@@ -119,3 +119,52 @@ def test_cholesky_recovers_from_an_ill_conditioned_kernel():
     gp = AdditiveProductGP(dims_of(Z), jitter=1e-10)
     gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
     assert np.isfinite(gp.predict(Z)).all()
+
+
+def test_fit_survives_many_duplicated_rows():
+    """Real data repeats measurements of one compound in one context: K is then singular.
+
+    Without a noise floor the Cholesky inside the marginal likelihood fails outright, which
+    is how this first showed up on the development table (leading minor of order 1066).
+    """
+    Z, y = toy(n=60)
+    for b in Z:                       # 20 distinct rows, each measured three times
+        Z[b] = np.repeat(Z[b][:20], 3, axis=0)
+    y = np.repeat(y[:20], 3) + 1e-9 * np.arange(60)
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=2, n_iter=30, seed=0)
+    assert np.isfinite(gp.predict(Z)).all()
+    assert gp.noise_ >= 1e-3
+
+
+def test_noise_has_a_floor():
+    Z, y = toy()
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=30, seed=0)
+    assert gp.noise_ >= 1e-3
+
+
+def test_singular_kernel_with_vanishing_noise_still_fits(monkeypatch):
+    """The real failure: a rank-deficient K while the noise parameter sits near zero.
+
+    On the development table the Cholesky inside the marginal likelihood gave
+    "leading minor of order 1066 is not positive-definite". A noise floor is what the
+    GPyTorch original had (GreaterThan(1e-3)) and what keeps K + noise.I factorisable.
+    """
+    import torch
+    Z, y = toy(n=60)
+    for b in Z:                       # 20 distinct rows, each measured three times
+        Z[b] = np.repeat(Z[b][:20], 3, axis=0)
+    y = np.repeat(y[:20], 3)
+
+    original = AdditiveProductGP._init_params
+
+    def near_zero_noise(self, rng):
+        params = original(self, rng)
+        params["noise"] = torch.tensor(-25.0, dtype=self.dtype, requires_grad=True)
+        return params
+
+    monkeypatch.setattr(AdditiveProductGP, "_init_params", near_zero_noise)
+    gp = AdditiveProductGP(dims_of(Z), jitter=0.0)   # no jitter: only the floor can save it
+    gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
+    assert np.isfinite(gp.predict(Z)).all()
