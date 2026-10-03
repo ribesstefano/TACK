@@ -1,0 +1,290 @@
+"""The two fusion estimators: M4 (interaction GP) and M7 (gradient-boosted trees).
+
+Both share :class:`FusionEstimator`, which owns everything that must happen *inside* a fold:
+the block preprocessing is fitted on the training rows only, the target is standardised, and
+a regression model used for the binary task is calibrated on scaffold-grouped out-of-fold
+scores. Subclasses only have to fit a model to processed blocks and score new ones.
+"""
+from typing import Dict, Optional, Sequence, Tuple
+
+import numpy as np
+import xgboost as xgb
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GroupKFold, GroupShuffleSplit
+
+from tackai.fusion.blocks import BlockPreprocessor
+from tackai.fusion.gp import DEFAULT_INTERACTIONS, AdditiveProductGP
+
+INNER_FOLDS = 3
+
+
+def inner_group_splits(groups, n_splits: int = INNER_FOLDS):
+    """Scaffold-grouped inner CV splits of a training fold.
+
+    Args:
+        groups: Group id per training row.
+        n_splits: Requested number of folds (reduced if there are fewer groups).
+
+    Returns:
+        List of ``(train_idx, test_idx)`` pairs.
+    """
+    n_splits = int(min(n_splits, len(np.unique(groups))))
+    if n_splits < 2:
+        idx = np.arange(len(groups))
+        return [(idx, idx)]
+    return list(GroupKFold(n_splits=n_splits).split(np.zeros(len(groups)), groups=groups))
+
+
+def slice_blocks(Z: Dict[str, np.ndarray], idx) -> Dict[str, np.ndarray]:
+    """Rows ``idx`` of every processed block."""
+    return {b: a[idx] for b, a in Z.items()}
+
+
+class FusionEstimator(BaseEstimator, RegressorMixin):
+    """Fold-internal preprocessing, target standardisation and binary handling.
+
+    Subclasses implement ``_fit_model(Z, ys, groups, y_raw, hyper=None) -> (model, hyper)``
+    and ``_predict_model(model, Z, return_std=False)``, both in standardised-target units.
+    ``fit`` must be given the *training rows only*; ``predict`` returns original units, or a
+    calibrated probability of the positive class when ``task_type="binary"``.
+
+    Args:
+        task_type: ``"regression"`` or ``"binary"``.
+        blocks: Block column indices (default: the standard contiguous layout).
+        random_state: Seed for every stochastic component.
+    """
+
+    native_binary = False      # True when the model itself outputs probabilities
+
+    def __init__(self, task_type: str = "regression",
+                 blocks: Optional[Dict[str, np.ndarray]] = None, random_state: int = 0):
+        self.task_type = task_type
+        self.blocks = blocks
+        self.random_state = random_state
+
+    @property
+    def supports_std(self) -> bool:
+        """Whether this estimator can report a predictive standard deviation."""
+        return False
+
+    def _make_preprocessor(self) -> BlockPreprocessor:
+        return BlockPreprocessor(blocks=self.blocks)
+
+    def fit(self, X, y, groups=None) -> "FusionEstimator":
+        """Fit on the training rows of one fold.
+
+        Args:
+            X: Design matrix of the training rows.
+            y: Targets in original units.
+            groups: Scaffold group ids, used for inner splits and early stopping.
+
+        Returns:
+            self
+        """
+        y = np.asarray(y, dtype=float)
+        groups = np.arange(len(y)) if groups is None else np.asarray(groups)
+        self.y_mean_ = float(y.mean())
+        self.y_std_ = float(y.std()) or 1.0        # a constant target must not divide by zero
+        self.pre_ = self._make_preprocessor().fit(X)
+        Z = self.pre_.transform(X)
+        ys = (y - self.y_mean_) / self.y_std_
+        self.model_, self.hyper_ = self._fit_model(Z, ys, groups, y)
+        if self.task_type == "binary" and not self.native_binary:
+            oof = self._oof_scores(Z, ys, groups)
+            self.platt_ = LogisticRegression(C=1e4).fit(oof[:, None], y.astype(int))
+        return self
+
+    def _oof_scores(self, Z, ys, groups) -> np.ndarray:
+        """Scaffold-grouped out-of-fold scores with frozen hyper-parameters, for calibration."""
+        oof = np.zeros(len(ys))
+        for train, test in inner_group_splits(groups):
+            model, _ = self._fit_model(slice_blocks(Z, train), ys[train], groups[train], None,
+                                       hyper=self.hyper_)
+            oof[test] = self._predict_model(model, slice_blocks(Z, test))
+        return oof
+
+    def predict(self, X, return_std: bool = False):
+        """Predict for new rows.
+
+        Args:
+            X: Design matrix.
+            return_std: Also return the predictive standard deviation; only available when
+                :attr:`supports_std` is True.
+
+        Returns:
+            Predictions in original units (a probability for ``task_type="binary"``), or
+            ``(prediction, std)`` when ``return_std`` is set.
+        """
+        if return_std and not self.supports_std:
+            raise NotImplementedError(
+                f"{type(self).__name__} has no predictive variance; use a GP member or read the "
+                "ensemble's member spread instead")
+        Z = self.pre_.transform(X)
+        if not return_std:
+            score = self._predict_model(self.model_, Z)
+            return self._to_original_units(score)
+
+        score, std = self._predict_model(self.model_, Z, return_std=True)
+        if self.task_type != "binary":
+            return score * self.y_std_ + self.y_mean_, std * self.y_std_
+        if self.native_binary:
+            return np.clip(score, 0.0, 1.0), std
+        # Push the latent interval through the calibrator: half the width of
+        # [platt(s - sigma), platt(s + sigma)] is the probability-scale uncertainty.
+        high = self._platt(score + std)
+        low = self._platt(score - std)
+        return self._platt(score), np.abs(high - low) / 2.0
+
+    def _to_original_units(self, score: np.ndarray) -> np.ndarray:
+        """Map a model score to the reported scale."""
+        if self.task_type != "binary":
+            return score * self.y_std_ + self.y_mean_
+        return np.clip(score, 0.0, 1.0) if self.native_binary else self._platt(score)
+
+    def _platt(self, score: np.ndarray) -> np.ndarray:
+        return self.platt_.predict_proba(np.asarray(score)[:, None])[:, 1]
+
+    # subclass hooks -----------------------------------------------------------
+
+    def _fit_model(self, Z, ys, groups, y_raw, hyper=None):
+        raise NotImplementedError
+
+    def _predict_model(self, model, Z, return_std: bool = False):
+        raise NotImplementedError
+
+
+class GPInteraction(FusionEstimator):
+    """M4: additive-kernel GP with cross-block product kernels.
+
+    The kernel is a sum of per-block RBFs, a linear term on the small blocks and the product
+    kernels named by ``interactions`` — the three benchmarked ones by default. ``mol*e3`` is
+    also expressible now that the ligase is an embedding rather than a one-hot, but stays off
+    by default so results remain comparable with the published comparison.
+
+    Args:
+        task_type: ``"regression"`` or ``"binary"``.
+        blocks: Block column indices.
+        random_state: Seed.
+        interactions: Product kernel terms.
+        ard_blocks: Blocks given one lengthscale per column. The descriptor block needs this:
+            its columns are raw and span ~20 orders of magnitude (``Ipc``), which no single
+            lengthscale can fit.
+        n_restarts: Random restarts of the marginal-likelihood optimisation.
+        n_iter: Adam steps per restart.
+        lr: Adam learning rate.
+        max_hyper_points: Rows used to fit the hyper-parameters; the exact GP that follows
+            conditions on every training row.
+    """
+
+    def __init__(self, task_type: str = "regression",
+                 blocks: Optional[Dict[str, np.ndarray]] = None, random_state: int = 0,
+                 interactions: Sequence[str] = DEFAULT_INTERACTIONS,
+                 ard_blocks: Sequence[str] = ("descriptors",), n_restarts: int = 3,
+                 n_iter: int = 60, lr: float = 0.1, max_hyper_points: int = 1200):
+        super().__init__(task_type=task_type, blocks=blocks, random_state=random_state)
+        self.interactions = interactions
+        self.ard_blocks = ard_blocks
+        self.n_restarts = n_restarts
+        self.n_iter = n_iter
+        self.lr = lr
+        self.max_hyper_points = max_hyper_points
+
+    @property
+    def supports_std(self) -> bool:
+        return True
+
+    def _fit_model(self, Z, ys, groups, y_raw, hyper=None):
+        gp = AdditiveProductGP(self.pre_.dims_, interactions=self.interactions,
+                               ard_blocks=self.ard_blocks)
+        state = gp.fit(Z, ys, n_restarts=self.n_restarts, n_iter=self.n_iter, lr=self.lr,
+                       seed=self.random_state, max_hyper_points=self.max_hyper_points,
+                       state=hyper)
+        self.kernel_report_ = gp.kernel_report()
+        return gp, state
+
+    def _predict_model(self, model, Z, return_std: bool = False):
+        return model.predict(Z, return_std=return_std)
+
+
+class XGBoostFusion(FusionEstimator):
+    """M7: regularised gradient-boosted trees on the concatenated blocks.
+
+    The molecular blocks reach the trees raw, which is the point of giving them no scaler: a
+    tree splits on an individual Morgan bit or descriptor, and any rotation or rescaling would
+    smear that signal across columns.
+
+    Args:
+        task_type: ``"regression"`` or ``"binary"``.
+        blocks: Block column indices.
+        random_state: Seed.
+        grid: Hyper-parameter grid (default: :attr:`GRID`); a single entry skips the search.
+        n_estimators: Boosting rounds before early stopping.
+        learning_rate: Boosting learning rate.
+        n_jobs: XGBoost threads.
+    """
+
+    native_binary = True
+    GRID = [{"max_depth": d, "reg_lambda": lam} for d in (3, 5) for lam in (5.0, 20.0)]
+
+    def __init__(self, task_type: str = "regression",
+                 blocks: Optional[Dict[str, np.ndarray]] = None, random_state: int = 0,
+                 grid: Optional[Sequence[dict]] = None, n_estimators: int = 400,
+                 learning_rate: float = 0.05, n_jobs: int = 1):
+        super().__init__(task_type=task_type, blocks=blocks, random_state=random_state)
+        self.grid = grid
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.n_jobs = n_jobs
+
+    def _new(self, cfg: dict):
+        kw = dict(n_estimators=self.n_estimators, learning_rate=self.learning_rate,
+                  max_depth=cfg["max_depth"], reg_lambda=cfg["reg_lambda"], min_child_weight=5,
+                  subsample=0.8, colsample_bytree=0.5, gamma=0.1, tree_method="hist",
+                  n_jobs=self.n_jobs, random_state=self.random_state,
+                  early_stopping_rounds=30, verbosity=0)
+        return xgb.XGBClassifier(**kw) if self.task_type == "binary" else xgb.XGBRegressor(**kw)
+
+    def _fit_cfg(self, A, target, groups, cfg):
+        """Fit one configuration, early-stopping on a scaffold-grouped 20% split."""
+        n_groups = len(np.unique(groups))
+        if n_groups < 2:
+            model = self._new(cfg)
+            model.fit(A, target, eval_set=[(A, target)], verbose=False)
+            return model
+        split = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=self.random_state)
+        train, val = next(split.split(A, groups=groups))
+        model = self._new(cfg)
+        model.fit(A[train], target[train], eval_set=[(A[val], target[val])], verbose=False)
+        return model
+
+    def _score(self, model, A) -> np.ndarray:
+        if self.task_type == "binary":
+            return model.predict_proba(A)[:, 1]
+        return model.predict(A)
+
+    def _fit_model(self, Z, ys, groups, y_raw, hyper=None):
+        A = self.pre_.concat(Z)
+        target = np.asarray(y_raw, float) if self.task_type == "binary" else ys
+        grid = list(self.grid) if self.grid else list(self.GRID)
+        if hyper is None:
+            if len(grid) > 1:
+                scores = []
+                for cfg in grid:
+                    fold_scores = [
+                        np.mean((self._score(self._fit_cfg(A[tr], target[tr], groups[tr], cfg),
+                                             A[te]) - target[te]) ** 2)
+                        for tr, te in inner_group_splits(groups)]
+                    scores.append(np.mean(fold_scores))
+                hyper = grid[int(np.argmin(scores))]
+            else:
+                hyper = grid[0]
+        model = self._fit_cfg(A, target, groups, hyper)
+        best = getattr(model, "best_iteration", None)
+        self.n_trees_ = int(best) + 1 if best is not None else self.n_estimators
+        return model, hyper
+
+    def _predict_model(self, model, Z, return_std: bool = False):
+        if return_std:
+            raise NotImplementedError("XGBoostFusion has no predictive variance")
+        return self._score(model, self.pre_.concat(Z))

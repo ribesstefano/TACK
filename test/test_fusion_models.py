@@ -1,0 +1,150 @@
+"""The two estimators behind one fit/predict interface: M4 (GP) and M7 (XGBoost)."""
+import numpy as np
+import pytest
+
+from tackai.fusion.blocks import BLOCK_DIMS, block_index
+from tackai.fusion.models import GPInteraction, XGBoostFusion
+
+
+def synth(n=90, seed=0, binary=False):
+    """A design matrix in the real block layout with a learnable signal."""
+    rng = np.random.default_rng(seed)
+    idx = block_index(BLOCK_DIMS)
+    X = np.zeros((n, sum(BLOCK_DIMS.values())), dtype=np.float64)
+    X[:, idx["fingerprint"]] = rng.integers(0, 2, (n, 1024))
+    X[:, idx["descriptors"]] = rng.normal(size=(n, 217))
+    X[:, idx["descriptors"][0]] *= 1e18                      # Ipc-scale column
+    for b in ("poi", "e3", "cell", "assay"):
+        X[:, idx[b]] = rng.normal(size=(n, BLOCK_DIMS[b]))
+    X[:, idx["assay_time"]] = rng.choice([6.0, 24.0], (n, 1))
+    signal = (X[:, idx["fingerprint"][:8]].sum(axis=1)
+              + 2.0 * X[:, idx["poi"][0]] * X[:, idx["fingerprint"][0]]
+              + X[:, idx["cell"][0]])
+    groups = rng.integers(0, 12, n)
+    if binary:
+        return X, (signal > np.median(signal)).astype(float), groups
+    return X, signal + 0.05 * rng.normal(size=n), groups
+
+
+def fast_gp(**kw):
+    return GPInteraction(n_restarts=1, n_iter=15, max_hyper_points=60, **kw)
+
+
+def fast_xgb(**kw):
+    return XGBoostFusion(n_estimators=40, grid=[{"max_depth": 3, "reg_lambda": 5.0}], **kw)
+
+
+FACTORIES = [fast_gp, fast_xgb]
+
+
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_fit_returns_self_and_predict_has_the_right_shape(factory):
+    X, y, g = synth()
+    est = factory(task_type="regression", random_state=0)
+    assert est.fit(X, y, g) is est
+    pred = est.predict(X)
+    assert pred.shape == (len(y),) and np.isfinite(pred).all()
+
+
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_predictions_are_in_original_target_units(factory):
+    X, y, g = synth()
+    y = y * 100.0 + 500.0
+    est = factory(random_state=0).fit(X, y, g)
+    pred = est.predict(X)
+    assert abs(pred.mean() - y.mean()) < 0.5 * y.std()
+
+
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_learns_better_than_predicting_the_mean(factory):
+    X, y, g = synth(n=120)
+    tr, te = np.arange(90), np.arange(90, 120)
+    est = factory(random_state=0).fit(X[tr], y[tr], g[tr])
+    pred = est.predict(X[te])
+    assert np.mean((pred - y[te]) ** 2) < np.mean((y[tr].mean() - y[te]) ** 2)
+
+
+def test_gp_reports_std_in_original_units():
+    X, y, g = synth()
+    est = fast_gp(random_state=0).fit(X, y * 100.0, g)
+    mean, std = est.predict(X, return_std=True)
+    assert est.supports_std and std.shape == mean.shape and (std > 0).all()
+    far = X.copy()
+    far[:, block_index(BLOCK_DIMS)["poi"]] += 40.0
+    _, std_far = est.predict(far, return_std=True)
+    assert std_far.mean() > std.mean()
+
+
+def test_xgboost_refuses_std():
+    X, y, g = synth()
+    est = fast_xgb(random_state=0).fit(X, y, g)
+    assert est.supports_std is False
+    with pytest.raises(NotImplementedError):
+        est.predict(X, return_std=True)
+
+
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_binary_task_returns_probabilities(factory):
+    from sklearn.metrics import roc_auc_score
+    X, y, g = synth(binary=True)
+    est = factory(task_type="binary", random_state=0).fit(X, y, g)
+    p = est.predict(X)
+    assert ((p >= 0) & (p <= 1)).all()
+    assert roc_auc_score(y, p) > 0.7
+
+
+def test_gp_binary_std_is_a_probability_interval():
+    X, y, g = synth(binary=True)
+    est = fast_gp(task_type="binary", random_state=0).fit(X, y, g)
+    p, std = est.predict(X, return_std=True)
+    assert ((p >= 0) & (p <= 1)).all() and (std >= 0).all() and (std <= 1).all()
+
+
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_constant_target_does_not_divide_by_zero(factory):  # Review Focus 3
+    X, _, g = synth()
+    y = np.full(len(X), 3.5)
+    est = factory(random_state=0).fit(X, y, g)
+    pred = est.predict(X)
+    assert np.isfinite(pred).all() and np.allclose(pred, 3.5, atol=1e-3)
+
+
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_the_fit_never_sees_the_test_rows(factory):
+    X, y, g = synth(n=120)
+    tr, te = np.arange(90), np.arange(90, 120)
+    est = factory(random_state=0).fit(X[tr], y[tr], g[tr])
+    baseline = est.predict(X[te])
+    again = factory(random_state=0).fit(X[tr], y[tr], g[tr])
+    assert np.allclose(again.predict(X[te]), baseline, rtol=1e-8, atol=1e-10)
+
+
+def test_xgboost_sees_raw_molecule_columns():
+    """Trees must receive unscaled Morgan bits: the design matrix reaches them undistorted."""
+    X, y, g = synth()
+    est = fast_xgb(random_state=0).fit(X, y, g)
+    Z = est.pre_.transform(X)
+    idx = block_index(BLOCK_DIMS)
+    assert np.allclose(Z["fingerprint"] * np.sqrt(1024), X[:, idx["fingerprint"]])
+
+
+def test_xgboost_selects_a_grid_configuration():
+    X, y, g = synth()
+    est = XGBoostFusion(n_estimators=40, random_state=0).fit(X, y, g)
+    assert set(est.hyper_) == {"max_depth", "reg_lambda"}
+    assert est.n_trees_ >= 1
+
+
+def test_gp_exposes_its_kernel_report():
+    X, y, g = synth()
+    est = fast_gp(random_state=0).fit(X, y, g)
+    rep = est.kernel_report_
+    assert "prod:mol*poi" in rep["weight"] and rep["noise"] > 0
+
+
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_same_seed_same_predictions(factory):
+    X, y, g = synth()
+    a = factory(random_state=3).fit(X, y, g).predict(X)
+    b = factory(random_state=3).fit(X, y, g).predict(X)
+    assert np.allclose(a, b, rtol=1e-8, atol=1e-10)
