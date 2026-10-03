@@ -1,0 +1,129 @@
+"""The data handler: targets, scaffold groups, splits, and one encoder for train and inference."""
+import numpy as np
+import pytest
+
+from fusion_fixtures import CELLS, SEQS, SMILES
+from tackai.fusion.blocks import BLOCK_DIMS, block_index
+from tackai.fusion.data import DMAX_THR, PDC50_THR, FusionData, make_targets, scaffold_groups
+
+N_COLS = sum(BLOCK_DIMS.values())
+
+
+def test_make_targets_scales_dmax_and_logs_dc50():
+    t = make_targets([95.0, 60.0, np.nan], [10.0, 1000.0, 100.0])
+    assert np.allclose(t["dmax"][:2], [0.95, 0.60])
+    assert np.isnan(t["dmax"][2])
+    assert np.allclose(t["pdc50"], [8.0, 6.0, 7.0])
+
+
+def test_make_targets_non_positive_dc50_is_undefined():
+    t = make_targets([50.0, 50.0], [0.0, -5.0])
+    assert np.isnan(t["pdc50"]).all()
+
+
+def test_activity_needs_both_or_a_decisive_one():
+    t = make_targets([95.0, 95.0, 60.0, np.nan, np.nan],
+                     [10.0, 10000.0, np.nan, 10.0, 10000.0])
+    assert t["activity"][0] == 1.0        # dmax > .8 and pdc50 > 6
+    assert t["activity"][1] == 0.0        # pdc50 = 5 -> inactive
+    assert t["activity"][2] == 0.0        # dmax .6 < .8 alone is decisive
+    assert np.isnan(t["activity"][3])     # pdc50 = 8 alone cannot decide active
+    assert t["activity"][4] == 0.0        # pdc50 = 5 alone is decisive
+
+
+def test_thresholds_are_the_documented_ones():
+    assert (DMAX_THR, PDC50_THR) == (0.80, 6.0)
+
+
+def test_scaffold_groups_share_a_group_for_one_scaffold():
+    g, info = scaffold_groups([SMILES[0], SMILES[0], SMILES[1]])
+    assert g[0] == g[1]
+    assert info["n_failed_rows"] == 0
+
+
+def test_acyclic_molecule_gets_its_own_group():
+    g, info = scaffold_groups(["CCCC", "CCCCC", SMILES[0]])
+    assert g[0] != g[1] and info["n_failed_rows"] == 2
+
+
+def test_from_csv_builds_the_design_matrix(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    assert data.X.shape == (24, N_COLS)
+    assert data.X.dtype == np.float32
+    assert len(data.groups) == 24 and len(data.smiles) == 24
+
+
+def test_blocks_land_in_their_columns(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    idx = block_index(BLOCK_DIMS)
+    fp = data.X[:, idx["fingerprint"]]
+    assert set(np.unique(fp)) <= {0.0, 1.0}
+    assert np.isfinite(data.X[:, idx["cell"]]).all()
+
+
+def test_task_rows_drops_undefined_targets(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    idx, X, y, g = data.task_rows("dmax")
+    assert np.isfinite(y).all() and len(idx) == len(y) == len(X) == len(g)
+    assert len(y) < 24     # the fixture has NaN Dmax rows
+
+
+def test_splits_never_split_a_scaffold_group(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    _, _, y, g = data.task_rows("pdc50")
+    splits = data.splits("pdc50", n_repeats=2, n_folds=3)
+    assert len(splits) == 2 and len(splits[0]) == 3
+    for repeat in splits:
+        covered = np.concatenate([te for _, te in repeat])
+        assert sorted(covered) == list(range(len(y)))
+        for tr, te in repeat:
+            assert not set(g[tr]) & set(g[te])
+            assert not set(tr) & set(te)
+
+
+def test_encode_reproduces_the_training_row_for_identical_inputs(fake_cache, tiny_csv):
+    """The inference path must agree with the training path, with mol features on the fly."""
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    row = data.table.iloc[0]
+    X_inf = data.encode([{"smiles": row["smiles"], "poi_seq": row["poi_seq"],
+                          "e3_seq": row["e3_seq"], "cell_id": row["cell_key"],
+                          "assay": row["assay_raw"], "assay_time": row["assay_time"]}])
+    assert np.allclose(X_inf[0], data.X[0], rtol=0, atol=0, equal_nan=True)
+
+
+def test_assemble_broadcasts_one_context_over_many_smiles(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    ctx = data.encode_context({"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
+                               "cell_id": CELLS[0], "assay": "western blot", "assay_time": 24.0})
+    X = data.assemble(ctx, SMILES[:4])
+    assert X.shape == (4, N_COLS)
+    assert np.array_equal(X[:, data.context_columns], np.repeat(ctx, 4, axis=0))
+    direct = data.encode([{"smiles": s, "poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
+                           "cell_id": CELLS[0], "assay": "western blot", "assay_time": 24.0}
+                          for s in SMILES[:4]])
+    assert np.allclose(X, direct, equal_nan=True)
+
+
+def test_encode_accepts_a_dataframe(fake_cache, tiny_csv, tiny_records):
+    import pandas as pd
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    assert np.allclose(data.encode(pd.DataFrame(tiny_records)), data.encode(tiny_records),
+                       equal_nan=True)
+
+
+def test_encode_empty_returns_empty_matrix(fake_cache, tiny_csv):  # Review Focus 5
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    assert data.encode([]).shape == (0, N_COLS)
+
+
+def test_context_and_mol_columns_partition_the_matrix(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    both = np.sort(np.concatenate([data.context_columns, data.mol_columns]))
+    assert np.array_equal(both, np.arange(N_COLS))
+
+
+def test_context_blocks_are_cached_between_constructions(fake_cache, tiny_csv):
+    first = FusionData.from_csv([tiny_csv], cache=True)
+    second = FusionData.from_csv([tiny_csv], cache=True)
+    assert np.allclose(first.X, second.X, equal_nan=True)
+    assert (fake_cache / "fusion_blocks").is_dir()
