@@ -207,3 +207,36 @@ def test_raw_descriptor_scale_gives_a_positive_definite_kernel():
     assert eigenvalues.min() > -1e-8 * eigenvalues.max(), "kernel is indefinite"
     mean, std = gp.predict(Z, return_std=True)
     assert np.isfinite(mean).all() and np.isfinite(std).all()
+
+
+def test_folded_context_matches_the_full_kernel():
+    """With a fixed context, the context-only kernel terms collapse to two vectors.
+
+    Six of the ten terms (four context RBFs, the linear block, and poi*cell) do not depend on
+    the molecule at all, and mol*poi / mol*cell are the molecular kernel times a per-training-
+    row scalar. Folding them means a batch only pays for the two molecular distance matrices.
+    """
+    Z, y = toy(n=80)
+    Z["e3"] = np.random.default_rng(1).normal(size=(80, 3))
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
+
+    context = {b: Z[b][:1] for b in ("e3", "poi", "cell", "assay_time")}
+    mols = {b: Z[b][:12] for b in ("fingerprint", "descriptors")}
+    fold = gp.fold_context(context)
+
+    folded_mean, folded_std = gp.predict_in_context(mols, fold, return_std=True)
+
+    full = {**{b: np.repeat(context[b], 12, axis=0) for b in context}, **mols}
+    mean, std = gp.predict(full, return_std=True)
+    assert np.allclose(folded_mean, mean, rtol=1e-10, atol=1e-12)
+    assert np.allclose(folded_std, std, rtol=1e-10, atol=1e-12)
+
+
+def test_folded_context_rejects_a_molecule_only_interaction():
+    """A product of two molecular kernels cannot be folded into a per-row scalar."""
+    Z, y = toy(n=40)
+    gp = AdditiveProductGP(dims_of(Z), interactions=("mol*mol",))
+    gp.fit(Z, y, n_restarts=1, n_iter=5, seed=0)
+    with pytest.raises(ValueError, match="mol"):
+        gp.fold_context({b: Z[b][:1] for b in ("poi", "cell", "assay_time")})

@@ -381,6 +381,124 @@ class AdditiveProductGP:
             var = self._diag(self.params_, Zt) - (v * v).sum(0)
             return mean, torch.sqrt(var.clamp_min(0.0)).numpy()
 
+    # ---------------------------------------------------------------- fixed-context fast path
+
+    def fold_context(self, context: Dict[str, np.ndarray]) -> dict:
+        """Collapse every context-only part of the kernel against the training rows.
+
+        With the context held fixed, the covariance between a test row and training row ``j``
+        is
+
+            K(i, j) = sum_(b in mol) s_b . RBF_b(i, j)  +  mol(i, j) . w_j  +  c_j
+
+        where ``mol`` is the unweighted molecular kernel ``RBF_fp + RBF_desc``, ``w_j`` gathers
+        the product terms with one molecular side, and ``c_j`` gathers the four context RBFs,
+        the linear block and any product whose two sides are both context. A batch then pays
+        only for the two molecular distance matrices instead of all ten terms.
+
+        Args:
+            context: One encoded context, as ``{block: (1, dim) array}`` for the context blocks.
+
+        Returns:
+            A dict with ``const`` and ``mol_weight`` (both of length ``n_train``) and the
+            scalar ``prior_var``, to pass to :meth:`predict_in_context`.
+
+        Raises:
+            ValueError: If an interaction has molecular kernels on both sides, which cannot be
+                reduced to a per-row scalar.
+        """
+        for inter in self.interactions:
+            left, right = self._sides(inter)
+            if self._is_mol_side(left) and self._is_mol_side(right):
+                raise ValueError(
+                    f"interaction {inter!r} has a molecular kernel on both sides and cannot be "
+                    "folded into a fixed context; score it through predict() instead")
+
+        ctx_blocks = [b for b in self.dims if b not in MOL_KERNEL_BLOCKS]
+        missing = [b for b in ctx_blocks if b not in context]
+        if missing:
+            raise ValueError(f"fold_context needs every context block; missing {missing}")
+
+        with torch.no_grad():
+            Zc = {b: torch.as_tensor(np.asarray(context[b]), dtype=self.dtype)
+                  for b in ctx_blocks}
+            cached = {b: self._sq_dists(Zc[b], self.Z_train_[b])
+                      for b in self.rbf_blocks
+                      if b not in self.ard_blocks and b in ctx_blocks}
+            rbf = {b: self._rbf(b, self.params_, Zc, self.Z_train_, cached)[0]
+                   for b in self.rbf_blocks if b in ctx_blocks}
+
+            const = torch.zeros(self.n_train_, dtype=self.dtype)
+            mol_weight = torch.zeros(self.n_train_, dtype=self.dtype)
+            prior = torch.zeros((), dtype=self.dtype)
+
+            for b in self.rbf_blocks:
+                scale = torch.exp(self.params_[f"sc:rbf:{b}"])
+                prior = prior + scale                      # RBF(x, x) == 1 for every block
+                if b in ctx_blocks:
+                    const = const + scale * rbf[b]
+            for b in self.linear_blocks:
+                scale = torch.exp(self.params_[f"sc:linear:{b}"])
+                const = const + scale * (Zc[b] @ self.Z_train_[b].T)[0]
+                prior = prior + scale * (Zc[b] * Zc[b]).sum()
+            for inter in self.interactions:
+                left, right = self._sides(inter)
+                scale = torch.exp(self.params_[f"sc:prod:{inter}"])
+                # Each RBF is 1 on the diagonal, so a side's self-covariance is 1 -- except
+                # the "mol" side, which is the SUM of the two molecular RBFs and so is 2.
+                prior = prior + scale * self._side_diag(left) * self._side_diag(right)
+                if self._is_mol_side(left):
+                    mol_weight = mol_weight + scale * rbf[right]
+                elif self._is_mol_side(right):
+                    mol_weight = mol_weight + scale * rbf[left]
+                else:
+                    const = const + scale * rbf[left] * rbf[right]
+
+            return {"const": const, "mol_weight": mol_weight, "prior_var": prior,
+                    "const_dot_alpha": float((const * self.alpha_.squeeze(1)).sum())}
+
+    def _is_mol_side(self, side: str) -> bool:
+        """Whether one side of an interaction is the molecular kernel."""
+        return side == "mol" or side in MOL_KERNEL_BLOCKS
+
+    @staticmethod
+    def _side_diag(side: str) -> float:
+        """Self-covariance of one side of a product term."""
+        return float(len(MOL_KERNEL_BLOCKS)) if side == "mol" else 1.0
+
+    def predict_in_context(self, mol_blocks: Dict[str, np.ndarray], fold: dict,
+                           return_std: bool = False):
+        """Predict for molecules in the context a :meth:`fold_context` call prepared.
+
+        Args:
+            mol_blocks: The processed molecular blocks of the batch.
+            fold: The dict returned by :meth:`fold_context`.
+            return_std: Also return the posterior standard deviation.
+
+        Returns:
+            ``mean`` or ``(mean, std)``, each of shape ``(n_molecules,)``.
+        """
+        with torch.no_grad():
+            Zm = {b: torch.as_tensor(np.asarray(mol_blocks[b]), dtype=self.dtype)
+                  for b in MOL_KERNEL_BLOCKS}
+            cached = {b: self._sq_dists(Zm[b], self.Z_train_[b])
+                      for b in MOL_KERNEL_BLOCKS if b not in self.ard_blocks}
+            rbf = {b: self._rbf(b, self.params_, Zm, self.Z_train_, cached)
+                   for b in MOL_KERNEL_BLOCKS}
+            scaled = None
+            for b in MOL_KERNEL_BLOCKS:
+                term = torch.exp(self.params_[f"sc:rbf:{b}"]) * rbf[b]
+                scaled = term if scaled is None else scaled + term
+            mol = sum(rbf[b] for b in MOL_KERNEL_BLOCKS)
+
+            cross = scaled + mol * fold["mol_weight"][None, :] + fold["const"][None, :]
+            mean = (self.params_["mean"] + (cross @ self.alpha_).squeeze(1)).numpy()
+            if not return_std:
+                return mean
+            v = torch.linalg.solve_triangular(self.chol_, cross.T, upper=False)
+            var = fold["prior_var"] - (v * v).sum(0)
+            return mean, torch.sqrt(var.clamp_min(0.0)).numpy()
+
     def kernel_report(self, max_rows: int = 400) -> dict:
         """Fitted lengthscales, the share of prior variance each term carries, and the noise.
 

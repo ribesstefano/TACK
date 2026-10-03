@@ -89,11 +89,14 @@ class FusionContext:
         values: The encoded context columns, shape ``(1, n_context_columns)``.
         per_member: For each member, its preprocessor's output for the context blocks.
         source: The record the context was built from.
+        folds: For each member that supports it, the context-only kernel terms collapsed to
+            two vectors, so a batch pays only for the molecular kernels.
     """
 
     values: np.ndarray
     per_member: List[Dict[str, np.ndarray]]
     source: dict
+    folds: List[Optional[dict]] = field(default_factory=list)
 
 
 class FusionEnsemble:
@@ -285,7 +288,26 @@ class FusionEnsemble:
         row[:, self.data.context_columns] = values
         context_blocks = [b for b in BLOCK_ORDER if b in CONTEXT_BLOCKS]
         per_member = [m.pre_.transform_blocks(row, only=context_blocks) for m in self.members]
-        return FusionContext(values=values, per_member=per_member, source=dict(record))
+        folds = [self._fold_member(member, blocks)
+                 for member, blocks in zip(self.members, per_member)]
+        return FusionContext(values=values, per_member=per_member, source=dict(record),
+                             folds=folds)
+
+    @staticmethod
+    def _fold_member(member, context_blocks: Dict[str, np.ndarray]) -> Optional[dict]:
+        """Collapse a member's context-only kernel terms, when its model can do that.
+
+        Six of the GP's ten kernel terms depend on the context alone and are the same for
+        every molecule in a batch; folding them is what makes the context cache pay for
+        itself. A member whose model has no such shortcut simply gets None.
+        """
+        model = getattr(member, "model_", None)
+        if not hasattr(model, "fold_context"):
+            return None
+        try:
+            return model.fold_context(context_blocks)
+        except ValueError:
+            return None        # an interaction this context cannot fold; use the ordinary path
 
     # ---------------------------------------------------------------- prediction
 
@@ -357,17 +379,38 @@ class FusionEnsemble:
         mol_row[:, self.data.index["fingerprint"]] = fp
         mol_row[:, self.data.index["descriptors"]] = desc
 
-        for member, ctx_blocks in zip(self.members, context.per_member):
+        folds = context.folds or [None] * len(self.members)
+        for member, ctx_blocks, fold in zip(self.members, context.per_member, folds):
             mean = np.full(n, np.nan)
             std = np.zeros(n)
             if len(valid):
                 Z = dict(member.pre_.transform_blocks(mol_row[valid], only=["fingerprint",
                                                                             "descriptors"]))
-                for block, row in ctx_blocks.items():
-                    Z[block] = np.repeat(row, len(valid), axis=0)
-                mean[valid], std[valid] = self._member_scores(member, Z, return_std)
+                if fold is not None:
+                    mean[valid], std[valid] = self._folded_scores(member, Z, fold, return_std)
+                else:
+                    for block, row in ctx_blocks.items():
+                        Z[block] = np.repeat(row, len(valid), axis=0)
+                    mean[valid], std[valid] = self._member_scores(member, Z, return_std)
             per_member.append((mean, std))
         return ok, per_member
+
+    def _folded_scores(self, member, mol_blocks: Dict[str, np.ndarray], fold: dict,
+                       return_std: bool):
+        """A member's prediction through its folded context, in the reported units."""
+        wants_std = return_std and member.supports_std
+        result = member.model_.predict_in_context(mol_blocks, fold, return_std=wants_std)
+        score, std = result if wants_std else (result, None)
+        if member.task_type != "binary":
+            scaled = score * member.y_std_ + member.y_mean_
+            return scaled, (std * member.y_std_ if std is not None else np.zeros(len(score)))
+        if member.native_binary:
+            return np.clip(score, 0.0, 1.0), (std if std is not None else np.zeros(len(score)))
+        probability = member._platt(score)
+        if std is None:
+            return probability, np.zeros(len(score))
+        high, low = member._platt(score + std), member._platt(score - std)
+        return probability, np.abs(high - low) / 2.0
 
     def _predict_from_records(self, records: List[dict], return_std: bool):
         """Ordinary path: encode each record in full, then score it with every member."""
