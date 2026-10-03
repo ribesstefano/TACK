@@ -111,6 +111,9 @@ override-dependencies = ["numpy>=2.0.0,<3.0.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
+markers = [
+    "requires_cache: needs a populated TACKAI_CACHE with the context embedding tables",
+]
 
 [dependency-groups]
 dev = [
