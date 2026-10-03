@@ -20,7 +20,7 @@ import pandas as pd
 
 from tackai.fusion.blocks import BLOCK_ORDER
 from tackai.fusion.context import CONTEXT_BLOCKS, ContextEncoder
-from tackai.fusion.data import TASK_LABELS, TASK_TYPES, FusionData
+from tackai.fusion.data import TASK_LABELS, TASK_SUPPORT, TASK_TYPES, FusionData
 from tackai.fusion.features import MolFeaturizer
 
 Z95 = 1.959963984540054          # two-sided 95% normal quantile
@@ -41,7 +41,11 @@ class FusionPrediction:
         task: Task name.
         label_name: Human-readable label of the predicted quantity.
         ok: False where the input SMILES could not be parsed.
-        ci_lower_95 / ci_upper_95: ``mean +/- 1.96 * std``.
+        ci_lower_95 / ci_upper_95: ``mean +/- 1.96 * std``, clipped to the task's own support
+            where it has one (Dmax is a fraction, activity a probability), so an interval
+            never reports an impossible value. This is an interval on the latent mean: it
+            covers the ensemble's disagreement and each member's posterior variance, not the
+            assay's own measurement noise, which the GP fits separately and excludes.
     """
 
     mean: np.ndarray
@@ -57,10 +61,15 @@ class FusionPrediction:
     smiles: Optional[List[str]] = None
 
     def __post_init__(self):
+        support = TASK_SUPPORT.get(self.task)
         if self.ci_lower_95 is None:
             self.ci_lower_95 = self.mean - Z95 * self.std
+            if support is not None:
+                self.ci_lower_95 = np.clip(self.ci_lower_95, support[0], support[1])
         if self.ci_upper_95 is None:
             self.ci_upper_95 = self.mean + Z95 * self.std
+            if support is not None:
+                self.ci_upper_95 = np.clip(self.ci_upper_95, support[0], support[1])
 
     def to_frame(self) -> pd.DataFrame:
         """One row per molecule, with the prediction, its uncertainty and the interval."""
@@ -199,7 +208,43 @@ class FusionEnsemble:
             featurizer = MolFeaturizer(radius=manifest["fingerprint"][0],
                                        fp_size=manifest["fingerprint"][1])
             data = FusionData(encoder=encoder, featurizer=featurizer)
+        cls._check_layout(manifest, data, members)
         return cls(members, data, manifest["task"], weights=manifest.get("weights"))
+
+    @staticmethod
+    def _check_layout(manifest: dict, data: FusionData, members: Sequence) -> None:
+        """Refuse to score with members whose block layout no longer matches the encoder.
+
+        Re-fitting a context PCA changes a cached table's width. The members still slice the
+        columns they were fitted with, so every context block after the changed one lands at
+        the wrong offset and the predictions are quietly wrong rather than absent.
+
+        Args:
+            manifest: The saved manifest.
+            data: The encoder the predictions would be made with.
+            members: The loaded members.
+
+        Raises:
+            ValueError: If any block's width differs between the manifest, the encoder and
+                the members.
+        """
+        expected = manifest.get("block_dims")
+        if not expected:
+            return
+        for name, actual in (("the embedding cache", data.dims),
+                             ("the fitted members", getattr(members[0], "pre_", None)
+                              and members[0].pre_.dims_)):
+            if not actual:
+                continue
+            bad = {b: (expected[b], actual[b]) for b in expected
+                   if b in actual and expected[b] != actual[b]}
+            if bad:
+                detail = ", ".join(f"{b}: trained with {e}, {name} has {a}"
+                                   for b, (e, a) in sorted(bad.items()))
+                raise ValueError(
+                    f"block layout mismatch between this ensemble and {name} ({detail}). The "
+                    "cached embedding tables have changed since the members were fitted; "
+                    "refit the ensemble or restore the tables it was trained on.")
 
     def save(self, path: Union[str, Path]) -> Path:
         """Write every member plus a manifest describing the layout it expects.
@@ -250,7 +295,14 @@ class FusionEnsemble:
         if weights is None:
             values = np.ones(len(self.members))
         elif isinstance(weights, dict):
-            values = np.array([float(weights.get(name, 0.0)) for name in self.names])
+            unknown = sorted(set(weights) - set(self.names))
+            if unknown:
+                raise ValueError(f"unknown member name(s) in weights: {unknown}; "
+                                 f"this ensemble has {self.names}")
+            missing = sorted(set(self.names) - set(weights))
+            if missing:
+                raise ValueError(f"no weight given for member(s): {missing}")
+            values = np.array([float(weights[name]) for name in self.names])
         else:
             values = np.asarray(list(weights), dtype=float)
             if len(values) != len(self.members):

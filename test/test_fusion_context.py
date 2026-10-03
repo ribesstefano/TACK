@@ -106,3 +106,15 @@ def test_tables_are_loaded_once(fake_cache):
     before = enc._tables["poi"]
     enc.encode("poi", [SEQS["poi"][1]])
     assert enc._tables["poi"] is before
+
+
+def test_pandas_na_counts_as_missing(fake_cache):
+    """Records from a nullable-dtype frame carry pd.NA, which is a singleton, not a NaN."""
+    import pandas as pd
+
+    enc = ContextEncoder()
+    row = enc.encode_context({"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
+                              "cell_id": pd.NA, "assay": pd.NA, "assay_time": pd.NA})
+    assert np.isnan(row["assay_time"]).all()
+    assert np.array_equal(row["cell"], enc.encode("cell", [ContextEncoder.NOT_FOUND]))
+    assert np.array_equal(row["assay"], enc.encode("assay", ["unknown"]))

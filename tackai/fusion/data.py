@@ -29,6 +29,8 @@ PDC50_THR = 6.0          # pDC50 above which a degrader counts as active (DC50 <
 TASKS = ("dmax", "pdc50", "activity")
 TASK_TYPES = {"dmax": "regression", "pdc50": "regression", "activity": "binary"}
 TASK_LABELS = {"dmax": "Dmax (fraction)", "pdc50": "pDC50", "activity": "P(active)"}
+#: Range each target can physically take; ``None`` means unbounded.
+TASK_SUPPORT = {"dmax": (0.0, 1.0), "pdc50": None, "activity": (0.0, 1.0)}
 
 N_STRAT_BINS = 5
 REPEAT_SEEDS = [1000 + r for r in range(5)]
@@ -272,8 +274,10 @@ class FusionData:
     def _cache_dir(self) -> Path:
         """Directory holding this table's cached blocks, keyed by content (never a label)."""
         cols = ["smiles", "e3_seq", "poi_seq", "cell_key", "assay_raw", "assay_time"]
-        h = hashlib.sha1(json.dumps([CACHE_VERSION, self.encoder.protein_space, FP_RADIUS,
-                                     FP_SIZE, sorted(self.dims.items())]).encode())
+        h = hashlib.sha1(json.dumps([CACHE_VERSION, self.encoder.protein_space,
+                                     self.featurizer.radius, self.featurizer.fp_size,
+                                     self.featurizer.share_ipc,
+                                     sorted(self.dims.items())]).encode())
         h.update(self.table[cols].astype(str).to_csv(index=False).encode())
         return Path(get_cache_dir()) / "fusion_blocks" / h.hexdigest()[:12]
 
@@ -291,7 +295,9 @@ class FusionData:
                 (directory / "manifest.json").write_text(json.dumps({
                     "n_rows": len(self.table), "dims": self.dims,
                     "protein_space": self.encoder.protein_space,
-                    "fingerprint": [FP_RADIUS, FP_SIZE], "version": CACHE_VERSION}, indent=1))
+                    "fingerprint": [self.featurizer.radius, self.featurizer.fp_size],
+                    "share_ipc": self.featurizer.share_ipc,
+                    "version": CACHE_VERSION}, indent=1))
         self._X = np.concatenate([blocks[b] for b in BLOCK_ORDER], axis=1).astype(np.float32)
         self._groups, self.scaffold_info = scaffold_groups(self.table["smiles"])
         self._targets = make_targets(self.table["dmax_pct"], self.table["dc50_nM"])

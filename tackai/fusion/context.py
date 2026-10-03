@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 import numpy as np
+import pandas as pd
 
 from tackai.data.utils import get_cache_dir
 
@@ -63,15 +64,20 @@ SEQUENCE_BLOCKS = ("poi", "e3")
 
 
 def _is_missing(value) -> bool:
-    """True for ``None``, NaN, pandas NA and blank strings."""
+    """True for ``None``, NaN, pandas NA and blank strings.
+
+    ``pd.NA`` needs its own branch: it is a singleton, so the usual ``value is not value``
+    trick does not catch it, and ``np.isnan(pd.NA)`` raises. Records built from a
+    nullable-dtype frame (``Int64``, ``Float64``, ``string``) carry it routinely.
+    """
     if value is None:
         return True
     if isinstance(value, str):
         return not value.strip()
     try:
-        return bool(np.isnan(value))
+        return bool(pd.isna(value))
     except (TypeError, ValueError):
-        return value is not value      # pandas NA compares unequal to itself
+        return False
 
 
 def normalize_assay(value) -> str:

@@ -166,3 +166,16 @@ def test_from_csv_can_raise_instead_of_dropping(fake_cache, tmp_path):
 def test_a_clean_table_drops_nothing(fake_cache, tiny_csv):
     data = FusionData.from_csv([tiny_csv], cache=False)
     assert data.dropped["total"] == 0
+
+
+def test_block_cache_distinguishes_the_fingerprint_radius(fake_cache, tiny_csv):
+    """Two radii must not share a cache directory, or a radius ablation compares nothing."""
+    from tackai.fusion.features import MolFeaturizer
+
+    a = FusionData.from_csv([tiny_csv], featurizer=MolFeaturizer(radius=16), cache=True)
+    b = FusionData.from_csv([tiny_csv], featurizer=MolFeaturizer(radius=2), cache=True)
+    idx = block_index(BLOCK_DIMS)
+    assert not np.array_equal(a.X[:, idx["fingerprint"]], b.X[:, idx["fingerprint"]])
+
+    direct = MolFeaturizer(radius=2).featurize(a.table["smiles"].tolist())[0]
+    assert np.array_equal(b.X[:, idx["fingerprint"]], direct)

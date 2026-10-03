@@ -91,9 +91,28 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
         ys = (y - self.y_mean_) / self.y_std_
         self.model_, self.hyper_ = self._fit_model(Z, ys, groups, y)
         if self.task_type == "binary" and not self.native_binary:
-            oof = self._oof_scores(Z, ys, groups)
-            self.platt_ = LogisticRegression(C=1e4).fit(oof[:, None], y.astype(int))
+            self._fit_calibrator(Z, ys, groups, y)
+        self._after_fit()
         return self
+
+    def _fit_calibrator(self, Z, ys, groups, y) -> None:
+        """Calibrate scores to probabilities on scaffold-grouped out-of-fold predictions.
+
+        A fold whose labels are all one class has nothing to calibrate -- and sklearn raises
+        rather than saying so -- which would otherwise kill an ensemble fit after minutes of
+        work. Such a fold predicts its single class outright.
+        """
+        classes = np.unique(y.astype(int))
+        if len(classes) < 2:
+            self.platt_ = None
+            self.single_class_ = float(classes[0])
+            return
+        self.single_class_ = None
+        oof = self._oof_scores(Z, ys, groups)
+        self.platt_ = LogisticRegression(C=1e4).fit(oof[:, None], y.astype(int))
+
+    def _after_fit(self) -> None:
+        """Hook for subclasses to record state that inner calibration fits must not clobber."""
 
     def _oof_scores(self, Z, ys, groups) -> np.ndarray:
         """Scaffold-grouped out-of-fold scores with frozen hyper-parameters, for calibration."""
@@ -143,7 +162,11 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
         return np.clip(score, 0.0, 1.0) if self.native_binary else self._platt(score)
 
     def _platt(self, score: np.ndarray) -> np.ndarray:
-        return self.platt_.predict_proba(np.asarray(score)[:, None])[:, 1]
+        """Calibrated probability of the positive class."""
+        score = np.asarray(score)
+        if getattr(self, "single_class_", None) is not None:
+            return np.full(len(score), self.single_class_)
+        return self.platt_.predict_proba(score[:, None])[:, 1]
 
     # subclass hooks -----------------------------------------------------------
 
@@ -200,8 +223,11 @@ class GPInteraction(FusionEstimator):
         state = gp.fit(Z, ys, n_restarts=self.n_restarts, n_iter=self.n_iter, lr=self.lr,
                        seed=self.random_state, max_hyper_points=self.max_hyper_points,
                        state=hyper)
-        self.kernel_report_ = gp.kernel_report()
         return gp, state
+
+    def _after_fit(self) -> None:
+        """Record the kernel of the model being kept, after any inner calibration fits."""
+        self.kernel_report_ = self.model_.kernel_report()
 
     def _predict_model(self, model, Z, return_std: bool = False):
         return model.predict(Z, return_std=return_std)

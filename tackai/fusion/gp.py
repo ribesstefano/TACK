@@ -233,7 +233,7 @@ class AdditiveProductGP:
             try:
                 return torch.linalg.cholesky(K + eye * jitter)
             except Exception:
-                jitter *= 10
+                jitter = max(jitter * 10, 1e-8)     # 0 * 10 is 0: the loop would never end
         raise RuntimeError("GP kernel is not positive definite even with 1e-2 jitter")
 
     # ---------------------------------------------------------------- fitting
@@ -400,8 +400,10 @@ class AdditiveProductGP:
             context: One encoded context, as ``{block: (1, dim) array}`` for the context blocks.
 
         Returns:
-            A dict with ``const`` and ``mol_weight`` (both of length ``n_train``) and the
-            scalar ``prior_var``, to pass to :meth:`predict_in_context`.
+            A dict with ``const`` and ``mol_weight`` (both of length ``n_train``), a
+            ``block_weight`` vector per molecular block (for interactions that name one block
+            rather than ``"mol"``) and the scalar ``prior_var``, to pass to
+            :meth:`predict_in_context`.
 
         Raises:
             ValueError: If an interaction has molecular kernels on both sides, which cannot be
@@ -430,6 +432,10 @@ class AdditiveProductGP:
 
             const = torch.zeros(self.n_train_, dtype=self.dtype)
             mol_weight = torch.zeros(self.n_train_, dtype=self.dtype)
+            # A side naming one molecular block is a different term from the "mol" side, which
+            # is the SUM of the molecular RBFs; it needs its own weight vector.
+            block_weight = {b: torch.zeros(self.n_train_, dtype=self.dtype)
+                            for b in MOL_KERNEL_BLOCKS}
             prior = torch.zeros((), dtype=self.dtype)
 
             for b in self.rbf_blocks:
@@ -447,15 +453,17 @@ class AdditiveProductGP:
                 # Each RBF is 1 on the diagonal, so a side's self-covariance is 1 -- except
                 # the "mol" side, which is the SUM of the two molecular RBFs and so is 2.
                 prior = prior + scale * self._side_diag(left) * self._side_diag(right)
-                if self._is_mol_side(left):
-                    mol_weight = mol_weight + scale * rbf[right]
-                elif self._is_mol_side(right):
-                    mol_weight = mol_weight + scale * rbf[left]
-                else:
+                mol_side, ctx_side = ((left, right) if self._is_mol_side(left)
+                                      else (right, left))
+                if not self._is_mol_side(mol_side):
                     const = const + scale * rbf[left] * rbf[right]
+                elif mol_side == "mol":
+                    mol_weight = mol_weight + scale * rbf[ctx_side]
+                else:
+                    block_weight[mol_side] = block_weight[mol_side] + scale * rbf[ctx_side]
 
-            return {"const": const, "mol_weight": mol_weight, "prior_var": prior,
-                    "const_dot_alpha": float((const * self.alpha_.squeeze(1)).sum())}
+            return {"const": const, "mol_weight": mol_weight, "block_weight": block_weight,
+                    "prior_var": prior}
 
     def _is_mol_side(self, side: str) -> bool:
         """Whether one side of an interaction is the molecular kernel."""
@@ -492,6 +500,9 @@ class AdditiveProductGP:
             mol = sum(rbf[b] for b in MOL_KERNEL_BLOCKS)
 
             cross = scaled + mol * fold["mol_weight"][None, :] + fold["const"][None, :]
+            for block, weight in fold.get("block_weight", {}).items():
+                if bool(torch.any(weight != 0)):
+                    cross = cross + rbf[block] * weight[None, :]
             mean = (self.params_["mean"] + (cross @ self.alpha_).squeeze(1)).numpy()
             if not return_std:
                 return mean

@@ -148,3 +148,26 @@ def test_same_seed_same_predictions(factory):
     a = factory(random_state=3).fit(X, y, g).predict(X)
     b = factory(random_state=3).fit(X, y, g).predict(X)
     assert np.allclose(a, b, rtol=1e-8, atol=1e-10)
+
+
+def test_single_class_binary_fold_does_not_crash():
+    """A fold whose labels are all one class must not die inside the Platt calibrator.
+
+    StratifiedGroupKFold keeps today's activity folds mixed, but a user-supplied split, a
+    rare-positive subset or a pure inner calibration fold all produce this, and it would kill
+    an ensemble fit after minutes of GP work with an error pointing at sklearn.
+    """
+    X, _, g = synth()
+    for label in (0.0, 1.0):
+        y = np.full(len(X), label)
+        est = fast_gp(task_type="binary", random_state=0).fit(X, y, g)
+        p = est.predict(X)
+        assert ((p >= 0) & (p <= 1)).all()
+        assert np.allclose(p, label, atol=1e-6)
+
+
+def test_kernel_report_describes_the_fitted_model_not_an_inner_fold():
+    """For a binary GP the inner calibration fits must not overwrite the reported kernel."""
+    X, y, g = synth(binary=True)
+    est = fast_gp(task_type="binary", random_state=0).fit(X, y, g)
+    assert est.kernel_report_["weight"] == est.model_.kernel_report()["weight"]

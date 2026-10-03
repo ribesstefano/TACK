@@ -240,3 +240,43 @@ def test_folded_context_rejects_a_molecule_only_interaction():
     gp.fit(Z, y, n_restarts=1, n_iter=5, seed=0)
     with pytest.raises(ValueError, match="mol"):
         gp.fold_context({b: Z[b][:1] for b in ("poi", "cell", "assay_time")})
+
+
+@pytest.mark.parametrize("interactions", [
+    ("mol*poi", "mol*cell", "poi*cell"),
+    ("fingerprint*poi",),
+    ("descriptors*cell",),
+    ("fingerprint*poi", "mol*cell", "poi*cell"),
+    ("mol*e3",),
+    ("poi*poi",),
+    (),
+])
+def test_folded_context_matches_the_full_kernel_for_any_interactions(interactions):
+    """The fold must be algebraically exact for every interaction, not just the defaults.
+
+    A side naming a single molecular block (fingerprint*poi) is not the same term as mol*poi:
+    the molecular kernel of a fold is RBF_fp + RBF_desc, so folding a bare block against the
+    shared molecular weight silently adds the other block's kernel to the term.
+    """
+    Z, y = toy(n=80)
+    Z["e3"] = np.random.default_rng(1).normal(size=(80, 3))
+    gp = AdditiveProductGP(dims_of(Z), interactions=interactions)
+    gp.fit(Z, y, n_restarts=1, n_iter=15, seed=0)
+
+    context = {b: Z[b][:1] for b in ("e3", "poi", "cell", "assay_time")}
+    mols = {b: Z[b][:12] for b in ("fingerprint", "descriptors")}
+    folded_mean, folded_std = gp.predict_in_context(mols, gp.fold_context(context),
+                                                    return_std=True)
+    full = {**{b: np.repeat(context[b], 12, axis=0) for b in context}, **mols}
+    mean, std = gp.predict(full, return_std=True)
+    assert np.allclose(folded_mean, mean, rtol=1e-10, atol=1e-12)
+    assert np.allclose(folded_std, std, rtol=1e-10, atol=1e-12)
+
+
+def test_cholesky_with_zero_jitter_raises_instead_of_hanging():
+    """jitter=0 must still escalate: `0 * 10` is 0, so the loop would never terminate."""
+    import torch
+    gp = AdditiveProductGP({"fingerprint": 2, "descriptors": 2, "assay_time": 1}, jitter=0.0)
+    indefinite = torch.tensor([[1.0, 2.0], [2.0, 1.0]], dtype=torch.float64)
+    with pytest.raises(RuntimeError, match="positive definite"):
+        gp._cholesky(indefinite)

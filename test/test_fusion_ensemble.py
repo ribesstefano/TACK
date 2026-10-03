@@ -167,3 +167,32 @@ def test_predict_matrix_agrees_with_the_record_path(data):
     from_record = ens.predict([record])
     assert np.allclose(from_matrix.mean, from_record.mean, rtol=0, atol=0)
     assert np.allclose(from_matrix.std, from_record.std, rtol=0, atol=0)
+
+
+def test_from_pretrained_rejects_a_changed_block_width(data, tmp_path, fake_cache, monkeypatch):
+    """A re-fitted PCA changes a cached table's width; the members still expect the old one."""
+    import numpy as np
+
+    from fusion_fixtures import POI_FILE, SEQS
+    ens = FusionEnsemble.fit(fast_gp, data, task="pdc50", n_members=1, n_folds=3)
+    ens.save(tmp_path / "ens")
+
+    rng = np.random.default_rng(0)                     # re-fit the POI PCA to 60 components
+    np.savez(fake_cache / POI_FILE,
+             **{s: rng.normal(size=60).astype(np.float32) for s in SEQS["poi"]})
+    with pytest.raises(ValueError, match="poi"):
+        FusionEnsemble.from_pretrained(tmp_path / "ens")
+
+
+def test_set_weights_rejects_unknown_member_names(data):
+    ens = FusionEnsemble.fit(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
+    with pytest.raises(ValueError, match="member_99"):
+        ens.set_weights({"member_00": 0.5, "member_99": 0.5})
+
+
+def test_confidence_interval_stays_inside_the_task_support(data):
+    """Dmax is a fraction and activity a probability: an interval reaching 1.34 is nonsense."""
+    ens = FusionEnsemble.fit(fast_gp, data, task="dmax", n_members=2, n_folds=3)
+    pred = ens.predict(SMILES[:4], context=ens.transform_context(CTX))
+    assert (pred.ci_lower_95 >= 0.0).all() and (pred.ci_upper_95 <= 1.0).all()
+    assert (pred.ci_lower_95 <= pred.mean).all() and (pred.mean <= pred.ci_upper_95).all()
