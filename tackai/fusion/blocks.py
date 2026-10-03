@@ -143,7 +143,10 @@ class BlockPreprocessor(BaseEstimator):
             Z = imp.transform(X[:, self.blocks_[b]])
             if sc is not None:
                 Z = sc.transform(Z)
-            out[b] = Z / width
+            # Contiguous on purpose: these arrays go straight into BLAS matmuls, which are
+            # not bit-reproducible across memory layouts. Without this, the ensemble's cached
+            # context path and its ordinary path disagree in the last bit of the GP variance.
+            out[b] = np.ascontiguousarray(Z / width)
         return out
 
     def concat(self, Z: Dict[str, np.ndarray], names: Optional[Sequence[str]] = None) -> np.ndarray:
