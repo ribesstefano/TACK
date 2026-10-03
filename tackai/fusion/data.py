@@ -208,6 +208,8 @@ class FusionData:
                      "poi": self.encoder.dim("poi"), "assay": self.encoder.dim("assay"),
                      "assay_time": 1}
         self.index = block_index(self.dims)
+        self.dropped: Dict[str, int] = {"poi": 0, "e3": 0, "cell": 0, "total": 0,
+                                        "read": 0 if table is None else len(table)}
         self._X: Optional[np.ndarray] = None
         self._groups: Optional[np.ndarray] = None
         self._targets: Optional[Dict[str, np.ndarray]] = None
@@ -219,8 +221,16 @@ class FusionData:
     def from_csv(cls, files: Sequence[Union[str, Path]], *,
                  encoder: Optional[ContextEncoder] = None,
                  featurizer: Optional[MolFeaturizer] = None,
-                 cache: bool = True) -> "FusionData":
+                 cache: bool = True, on_missing: str = "drop",
+                 verbose: bool = False) -> "FusionData":
         """Build the design matrix from curated CSVs.
+
+        Some measurements cannot be encoded: a POI sequence the cached table does not hold, a
+        cell line outside Cellosaurus, a row with no ligase sequence at all. On the two
+        development CSVs that is about 4.6% of rows. Dropping them with a report is the
+        default, because a training table that refuses to build is worse than one that is
+        4.6% smaller; inference (:meth:`encode`) still raises, so a typo in a screening
+        request is never silently replaced.
 
         Args:
             files: CSV paths.
@@ -228,13 +238,36 @@ class FusionData:
             featurizer: Molecular featuriser.
             cache: Reuse (and write) the per-block npy cache under
                 ``TACKAI_CACHE/fusion_blocks/<hash>/``.
+            on_missing: ``"drop"`` to discard rows whose context is not in the cache (and
+                record them in :attr:`dropped`), or ``"raise"`` to fail on the first one.
+            verbose: Print how many rows were read, dropped and kept.
 
         Returns:
             A populated :class:`FusionData`.
         """
+        if on_missing not in {"drop", "raise"}:
+            raise ValueError(f"on_missing must be 'drop' or 'raise', got {on_missing!r}")
         data = cls(build_table(files), encoder=encoder, featurizer=featurizer)
+        if on_missing == "drop":
+            data._drop_unencodable(verbose=verbose)
         data._build_matrix(cache=cache)
         return data
+
+    def _drop_unencodable(self, verbose: bool = False) -> None:
+        """Remove rows whose context the cached tables cannot encode, counting them by block."""
+        keep = np.ones(len(self.table), dtype=bool)
+        counts = {}
+        for block, column in (("poi", "poi_seq"), ("e3", "e3_seq"), ("cell", "cell_key")):
+            ok = self.encoder.encodable(block, self.table[column])
+            counts[block] = int((~ok).sum())
+            keep &= ok
+        self.dropped = {**counts, "total": int((~keep).sum()), "read": len(self.table)}
+        if verbose:
+            print(f"table: {self.dropped['read']} rows read, {self.dropped['total']} dropped "
+                  f"(context not in the cache: " +
+                  ", ".join(f"{b} {counts[b]}" for b in counts) +
+                  f") -> {int(keep.sum())} kept")
+        self.table = self.table[keep].reset_index(drop=True)
 
     def _cache_dir(self) -> Path:
         """Directory holding this table's cached blocks, keyed by content (never a label)."""

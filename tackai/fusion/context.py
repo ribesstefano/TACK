@@ -248,6 +248,31 @@ class ContextEncoder:
             rows.append(table[name])
         return np.stack(rows).astype(np.float32)
 
+    def encodable(self, block: str, keys: Sequence) -> np.ndarray:
+        """Which keys of a block this encoder can turn into a vector.
+
+        Lets a caller building a training table drop the rows it cannot encode instead of
+        hitting the :meth:`encode` exception. Assay text is always encodable, because unseen
+        types fall back to an on-the-fly embedding.
+
+        Args:
+            block: Context block name.
+            keys: Keys to check.
+
+        Returns:
+            Boolean array, one entry per key.
+        """
+        if block == "assay":
+            return np.ones(len(list(keys)), dtype=bool)
+        table = self.table(block)
+        out = []
+        for key in keys:
+            if _is_missing(key):
+                out.append(block == "cell")        # a missing cell line has a vector; a sequence does not
+            else:
+                out.append(str(key).strip() in table)
+        return np.array(out, dtype=bool)
+
     def _encode_assay(self, raws: Sequence) -> np.ndarray:
         """Assay vectors, embedding canonical types the table does not hold."""
         table = self.table("assay")

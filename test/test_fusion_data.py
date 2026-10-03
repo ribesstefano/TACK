@@ -127,3 +127,42 @@ def test_context_blocks_are_cached_between_constructions(fake_cache, tiny_csv):
     second = FusionData.from_csv([tiny_csv], cache=True)
     assert np.allclose(first.X, second.X, equal_nan=True)
     assert (fake_cache / "fusion_blocks").is_dir()
+
+
+def _csv_with_unencodable_rows(tmp_path):
+    """A table where one row has an unknown POI, one an unknown cell line, one no ligase."""
+    import pandas as pd
+    base = {"SMILES": SMILES[0], "Recruiter": "CRBN", "Recruiter_Sequence": SEQS["e3"][0],
+            "Degradation_Target_Uniprot": "P00001", "Degradation_Target_Sequence": SEQS["poi"][0],
+            "Cell_Line_ID": CELLS[0], "Cell_Line": "HeLa", "Assay": "western blot",
+            "DC50": 100.0, "DC50_units": "nM", "DC50_h": 24.0, "Dmax_h": 24.0, "Dmax": 90.0}
+    rows = [dict(base) for _ in range(6)]
+    rows[1]["Degradation_Target_Sequence"] = "MUNKNOWNSEQUENCE"
+    rows[1]["Degradation_Target_Uniprot"] = "P99999"
+    rows[2]["Cell_Line_ID"] = "CVCL_9999"
+    rows[3]["Recruiter_Sequence"] = None
+    rows[4]["Degradation_Target_Sequence"] = None
+    rows[4]["Degradation_Target_Uniprot"] = "P88888"
+    path = tmp_path / "messy.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def test_from_csv_drops_rows_whose_context_is_not_in_the_cache(fake_cache, tmp_path):
+    """A 4.6% slice of the real dev data cannot be encoded; losing it must not be a crash."""
+    data = FusionData.from_csv([_csv_with_unencodable_rows(tmp_path)], cache=False)
+    assert len(data.table) == 2 and data.X.shape[0] == 2
+    assert data.dropped["total"] == 4
+    assert data.dropped["poi"] == 2 and data.dropped["cell"] == 1 and data.dropped["e3"] == 1
+
+
+def test_from_csv_can_raise_instead_of_dropping(fake_cache, tmp_path):
+    """on_missing='raise' names the block it could not encode (whichever comes first)."""
+    with pytest.raises(KeyError, match=r"(poi|e3|cell)"):
+        FusionData.from_csv([_csv_with_unencodable_rows(tmp_path)], cache=False,
+                            on_missing="raise")
+
+
+def test_a_clean_table_drops_nothing(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    assert data.dropped["total"] == 0
