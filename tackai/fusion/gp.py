@@ -159,7 +159,8 @@ class AdditiveProductGP:
         return {b: torch.as_tensor(np.asarray(Z[b]), dtype=self.dtype) for b in self.dims}
 
     @staticmethod
-    def _sq_dists(A: torch.Tensor, B: torch.Tensor, same: bool = False) -> torch.Tensor:
+    def _sq_dists(A: torch.Tensor, B: torch.Tensor, same: bool = False,
+                  b_sq: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Pairwise squared euclidean distances, clamped at zero for numerical safety.
 
         Args:
@@ -170,11 +171,13 @@ class AdditiveProductGP:
                 error ``eps * |a|^2``, which for a raw descriptor column near 1e18 is ~1e19
                 instead of 0, and an RBF whose self-covariance is 0 rather than 1 is not a
                 valid kernel at all.
+            b_sq: Precomputed ``(B * B).sum(1)``; identical to computing it here.
 
         Returns:
             Squared distance matrix.
         """
-        d2 = (A * A).sum(1)[:, None] + (B * B).sum(1)[None, :] - 2.0 * (A @ B.T)
+        b2 = (B * B).sum(1) if b_sq is None else b_sq
+        d2 = (A * A).sum(1)[:, None] + b2[None, :] - 2.0 * (A @ B.T)
         d2 = d2.clamp_min(0.0)
         if same:
             d2 = 0.5 * (d2 + d2.T)
@@ -182,23 +185,30 @@ class AdditiveProductGP:
         return d2
 
     def _cache_distances(self, Za: Dict[str, torch.Tensor], Zb: Dict[str, torch.Tensor],
-                         same: bool = False) -> Dict[str, torch.Tensor]:
+                         same: bool = False, train: Optional[dict] = None) -> Dict[str, torch.Tensor]:
         """Squared distances of the isotropic RBF blocks, computed once per (Za, Zb) pair.
 
         ARD blocks are absent on purpose: their distances depend on the lengthscales and are
         recomputed per step in :meth:`_rbf`.
         """
-        return {b: self._sq_dists(Za[b], Zb[b], same=same)
+        return {b: self._sq_dists(Za[b], Zb[b], same=same,
+                                  b_sq=None if train is None else train["sq"][b])
                 for b in self.rbf_blocks if b not in self.ard_blocks}
 
     def _rbf(self, block: str, params: Dict[str, torch.Tensor],
              Za: Dict[str, torch.Tensor], Zb: Dict[str, torch.Tensor],
-             cached: Dict[str, torch.Tensor], same: bool = False) -> torch.Tensor:
+             cached: Dict[str, torch.Tensor], same: bool = False,
+             train: Optional[dict] = None) -> torch.Tensor:
         """RBF kernel of one block, from the cached distances or recomputed for ARD."""
         ls = self._lengthscale(block, params)
         if block in self.ard_blocks:
-            d2 = self._sq_dists(Za[block] / ls, Zb[block] / ls, same=same)
+            if train is None:
+                right, right_sq = Zb[block] / ls, None
+            else:
+                right, right_sq = train["ard"][block], train["sq"][block]
+            d2 = self._sq_dists(Za[block] / ls, right, same=same, b_sq=right_sq)
             return torch.exp(-0.5 * d2)
+        return torch.exp(-0.5 * cached[block] / (ls[0] ** 2))
         return torch.exp(-0.5 * cached[block] / (ls[0] ** 2))
 
     def _lengthscale(self, block: str, params: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -216,9 +226,11 @@ class AdditiveProductGP:
 
     def _assemble(self, params: Dict[str, torch.Tensor],
                   Za: Dict[str, torch.Tensor], Zb: Dict[str, torch.Tensor],
-                  cached: Dict[str, torch.Tensor], same: bool = False) -> torch.Tensor:
+                  cached: Dict[str, torch.Tensor], same: bool = False,
+                  train: Optional[dict] = None) -> torch.Tensor:
         """The full covariance between two sets of rows (noise-free)."""
-        rbf = {b: self._rbf(b, params, Za, Zb, cached, same=same) for b in self.rbf_blocks}
+        rbf = {b: self._rbf(b, params, Za, Zb, cached, same=same, train=train)
+               for b in self.rbf_blocks}
         total = None
         for b in self.rbf_blocks:
             term = torch.exp(params[f"sc:rbf:{b}"]) * rbf[b]
@@ -385,6 +397,36 @@ class AdditiveProductGP:
             self.chol_ = self._cholesky(K)
             resid = (self.y_train_ - self.params_["mean"]).unsqueeze(1).to(self.chol_.dtype)
             self.alpha_ = torch.cholesky_solve(resid, self.chol_).to(self.dtype)
+        self._train_side_ = self._build_train_side()
+
+    def _build_train_side(self) -> dict:
+        """Quantities of the training rows that no query batch changes.
+
+        The hyper-parameters are frozen once the GP is conditioned, so the row norms of the
+        isotropic blocks and the lengthscale-scaled ARD blocks are the same for every batch
+        and every member call. They are exactly the values ``_sq_dists`` would recompute.
+        """
+        with torch.no_grad():
+            sq, ard = {}, {}
+            for b in self.rbf_blocks:
+                if b in self.ard_blocks:
+                    scaled = self.Z_train_[b] / self._lengthscale(b, self.params_)
+                    ard[b], sq[b] = scaled, (scaled * scaled).sum(1)
+                else:
+                    sq[b] = (self.Z_train_[b] * self.Z_train_[b]).sum(1)
+            return {"sq": sq, "ard": ard}
+
+    def _train_side(self) -> dict:
+        """The train-side cache; rebuilt lazily for a GP pickled before it existed."""
+        if self.__dict__.get("_train_side_") is None:
+            self._train_side_ = self._build_train_side()
+        return self._train_side_
+
+    def _train_side(self) -> dict:
+        """The train-side cache; rebuilt lazily for a GP pickled before it existed."""
+        if self.__dict__.get("_train_side_") is None:
+            self._train_side_ = self._build_train_side()
+        return self._train_side_
 
     def astype(self, dtype: Union[str, torch.dtype], jitter: Optional[float] = None):
         """Re-condition this fitted GP in another precision, keeping its hyper-parameters.
@@ -442,8 +484,10 @@ class AdditiveProductGP:
         """
         with torch.no_grad():
             Zt = self._to_tensor(Z)
+            train = self._train_side()
             cross = self._assemble(self.params_, Zt, self.Z_train_,
-                                   self._cache_distances(Zt, self.Z_train_))
+                                   self._cache_distances(Zt, self.Z_train_, train=train),
+                                   train=train)
             mean = (self.params_["mean"] + (cross @ self.alpha_).squeeze(1)).numpy()
             if not return_std:
                 return mean
@@ -492,12 +536,13 @@ class AdditiveProductGP:
             raise ValueError(f"fold_context needs every context block; missing {missing}")
 
         with torch.no_grad():
+            train = self._train_side()
             Zc = {b: torch.as_tensor(np.asarray(context[b]), dtype=self.dtype)
                   for b in ctx_blocks}
-            cached = {b: self._sq_dists(Zc[b], self.Z_train_[b])
+            cached = {b: self._sq_dists(Zc[b], self.Z_train_[b], b_sq=train["sq"][b])
                       for b in self.rbf_blocks
                       if b not in self.ard_blocks and b in ctx_blocks}
-            rbf = {b: self._rbf(b, self.params_, Zc, self.Z_train_, cached)[0]
+            rbf = {b: self._rbf(b, self.params_, Zc, self.Z_train_, cached, train=train)[0]
                    for b in self.rbf_blocks if b in ctx_blocks}
 
             const = torch.zeros(self.n_train_, dtype=self.dtype)
@@ -532,8 +577,11 @@ class AdditiveProductGP:
                 else:
                     block_weight[mol_side] = block_weight[mol_side] + scale * rbf[ctx_side]
 
+            # Which molecular blocks carry a nonzero weight is a property of the fold, not of
+            # the batch: decide it here, once, instead of testing it on every prediction.
+            active = [b for b in MOL_KERNEL_BLOCKS if bool(torch.any(block_weight[b] != 0))]
             return {"const": const, "mol_weight": mol_weight, "block_weight": block_weight,
-                    "prior_var": prior}
+                    "prior_var": prior, "active_blocks": active}
 
     def _is_mol_side(self, side: str) -> bool:
         """Whether one side of an interaction is the molecular kernel."""
@@ -557,11 +605,12 @@ class AdditiveProductGP:
             ``mean`` or ``(mean, std)``, each of shape ``(n_molecules,)``.
         """
         with torch.no_grad():
+            train = self._train_side()
             Zm = {b: torch.as_tensor(np.asarray(mol_blocks[b]), dtype=self.dtype)
                   for b in MOL_KERNEL_BLOCKS}
-            cached = {b: self._sq_dists(Zm[b], self.Z_train_[b])
+            cached = {b: self._sq_dists(Zm[b], self.Z_train_[b], b_sq=train["sq"][b])
                       for b in MOL_KERNEL_BLOCKS if b not in self.ard_blocks}
-            rbf = {b: self._rbf(b, self.params_, Zm, self.Z_train_, cached)
+            rbf = {b: self._rbf(b, self.params_, Zm, self.Z_train_, cached, train=train)
                    for b in MOL_KERNEL_BLOCKS}
             scaled = None
             for b in MOL_KERNEL_BLOCKS:
@@ -570,9 +619,12 @@ class AdditiveProductGP:
             mol = sum(rbf[b] for b in MOL_KERNEL_BLOCKS)
 
             cross = scaled + mol * fold["mol_weight"][None, :] + fold["const"][None, :]
-            for block, weight in fold.get("block_weight", {}).items():
-                if bool(torch.any(weight != 0)):
-                    cross = cross + rbf[block] * weight[None, :]
+            active = fold.get("active_blocks")
+            if active is None:                  # a fold built before the weights were resolved once
+                active = [b for b, w in fold.get("block_weight", {}).items()
+                          if bool(torch.any(w != 0))]
+            for block in active:
+                cross = cross + rbf[block] * fold["block_weight"][block][None, :]
             mean = (self.params_["mean"] + (cross @ self.alpha_).squeeze(1)).numpy()
             if not return_std:
                 return mean
