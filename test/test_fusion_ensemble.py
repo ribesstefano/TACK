@@ -206,3 +206,82 @@ def test_confidence_interval_stays_inside_the_task_support(data):
     pred = ens.predict(SMILES[:4], context=ens.transform_context(CTX))
     assert (pred.ci_lower_95 >= 0.0).all() and (pred.ci_upper_95 <= 1.0).all()
     assert (pred.ci_lower_95 <= pred.mean).all() and (pred.mean <= pred.ci_upper_95).all()
+
+
+def _activity_ensemble(data, factory, n_members=2):
+    """Members fitted on the folds whose training labels hold both classes.
+
+    On the tiny table the first fold's training rows are all inactive, which no binary model
+    can learn from (``check_labels`` refuses it), so it is skipped.
+    """
+    _, _, y, _ = data.task_rows("activity")
+    folds = [f for f in data.splits("activity", 1, 3)[0] if len(np.unique(y[f[0]])) == 2]
+    return FusionEnsemble.fit(factory, data, task="activity", n_members=n_members,
+                              splits=[folds])
+
+
+def test_calibrate_makes_a_gp_ensemble_report_probabilities(data):
+    from sklearn.metrics import roc_auc_score
+    _, X, y, _ = data.task_rows("activity")
+    ens = _activity_ensemble(data, partial(fast_gp, task_type="binary"))
+    ens.calibrate(X, y)
+    pred = ens.predict_matrix(X)
+    assert ((pred.mean >= 0) & (pred.mean <= 1)).all()
+    assert all(((v >= 0) & (v <= 1)).all() for v in pred.member_predictions.values())
+    assert roc_auc_score(y, pred.mean) > 0.5
+
+
+def test_calibrate_refuses_a_regression_task(data):
+    _, X, y, _ = data.task_rows("pdc50")
+    ens = FusionEnsemble.fit(fast_gp, data, task="pdc50", n_members=1, n_folds=3)
+    with pytest.raises(ValueError, match="binary"):
+        ens.calibrate(X, (y > y.mean()).astype(float))
+
+
+def test_calibrate_refuses_single_class_labels(data):
+    _, X, _, _ = data.task_rows("activity")
+    ens = _activity_ensemble(data, partial(fast_gp, task_type="binary"), n_members=1)
+    with pytest.raises(ValueError, match="calibration labels"):
+        ens.calibrate(X, np.zeros(len(X)))
+
+
+def test_calibrate_refuses_an_empty_set(data):
+    _, X, _, _ = data.task_rows("activity")
+    ens = _activity_ensemble(data, partial(fast_gp, task_type="binary"), n_members=1)
+    with pytest.raises(ValueError, match="calibration labels"):
+        ens.calibrate(X[:0], np.zeros(0))
+
+
+def test_calibrate_refuses_an_all_native_ensemble(data):
+    _, X, y, _ = data.task_rows("activity")
+    ens = _activity_ensemble(data, partial(fast_xgb, task_type="binary"))
+    with pytest.raises(ValueError, match="nothing to calibrate"):
+        ens.calibrate(X, y)
+
+
+def test_calibrate_scores_through_the_path_predict_uses(data):
+    """Calibrating through member.pre_ would fit the map on a different scale than predict's."""
+    from sklearn.linear_model import LogisticRegression
+    _, X, y, _ = data.task_rows("activity")
+    ens = _activity_ensemble(data, partial(fast_gp, task_type="binary"))
+    real, calls = ens._iter_member_blocks, []
+    ens._iter_member_blocks = lambda rows: (calls.append(len(rows)), real(rows))[1]
+    ens.calibrate(X, y)
+    assert calls == [len(X)], "calibrate must score through _iter_member_blocks"
+    for member, Z in zip(ens.members, real(X)):
+        score = member._predict_model(member.model_, Z)
+        expected = LogisticRegression(C=1e4).fit(score[:, None], y.astype(int))
+        assert np.allclose(member.calibrator_.coef_, expected.coef_)
+        assert np.allclose(member.calibrator_.intercept_, expected.intercept_)
+
+
+def test_astype_keeps_the_calibrator(data):
+    _, X, y, _ = data.task_rows("activity")
+    ens = _activity_ensemble(data, partial(fast_gp, task_type="binary", dtype="float64"),
+                             n_members=1)
+    ens.calibrate(X, y)
+    before = ens.members[0].calibrator_
+    ens.astype("float32")
+    assert ens.members[0].calibrator_ is before
+    pred = ens.predict_matrix(X)
+    assert ((pred.mean >= 0) & (pred.mean <= 1)).all()

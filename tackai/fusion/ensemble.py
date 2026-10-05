@@ -17,11 +17,13 @@ from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 
 from tackai.fusion.blocks import BLOCK_ORDER, BlockPreprocessor
 from tackai.fusion.context import CONTEXT_BLOCKS, ContextEncoder
 from tackai.fusion.data import TASK_LABELS, TASK_SUPPORT, TASK_TYPES, FusionData
 from tackai.fusion.features import MolFeaturizer
+from tackai.fusion.training import check_labels
 
 Z95 = 1.959963984540054          # two-sided 95% normal quantile
 
@@ -328,6 +330,46 @@ class FusionEnsemble:
         if total <= 0:
             raise ValueError("member weights must sum to a positive number")
         self.weights = {name: float(w) for name, w in zip(self.names, values / total)}
+
+    def calibrate(self, X, y) -> "FusionEnsemble":
+        """Fit each member's score-to-probability map on rows no member was fitted on.
+
+        A member whose model does not itself output probabilities -- the GP -- scores on a
+        latent scale, and only a held-out set can turn that into a probability. The set must be
+        held out from every member's training rows: fitted on scores the members have already
+        seen, the map comes out overconfident.
+
+        The scores are taken through the same path :meth:`predict` uses, so the map is fitted
+        on the scale it will be applied to. Scoring through each member's own preprocessor
+        instead would differ whenever :attr:`shared_context` is on, since the shared transform
+        is the consensus of the members' own and identical to none of them.
+
+        Args:
+            X: Design matrix of the calibration rows, in this ensemble's block layout.
+            y: Binary labels (0 or 1) for those rows.
+
+        Returns:
+            self
+
+        Raises:
+            ValueError: If the task is not binary, if every member outputs probabilities
+                natively and there is nothing to calibrate, or if the labels are empty,
+                non-finite or hold a single class.
+        """
+        if TASK_TYPES[self.task] != "binary":
+            raise ValueError(f"only a binary task needs calibration; this ensemble predicts "
+                             f"{self.task!r}")
+        if all(m.native_binary for m in self.members):
+            raise ValueError("every member outputs probabilities natively; nothing to calibrate")
+        check_labels(y, "binary", "calibration labels")
+        labels = np.asarray(y).astype(int)
+        for member, Z in zip(self.members, self._iter_member_blocks(np.asarray(X))):
+            if member.native_binary:
+                continue
+            score = member._predict_model(member.model_, Z)
+            member.calibrator_ = LogisticRegression(C=1e4).fit(score[:, None], labels)
+            member.single_class_ = None       # removed with in-fit calibration in the next task
+        return self
 
     @property
     def available_tasks(self) -> List[str]:
