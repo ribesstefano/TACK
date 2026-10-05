@@ -583,16 +583,7 @@ class FusionEnsemble:
         wants_std = return_std and member.supports_std
         result = member.model_.predict_in_context(mol_blocks, fold, return_std=wants_std)
         score, std = result if wants_std else (result, None)
-        if member.task_type != "binary":
-            scaled = score * member.y_std_ + member.y_mean_
-            return scaled, (std * member.y_std_ if std is not None else np.zeros(len(score)))
-        if member.native_binary:
-            return np.clip(score, 0.0, 1.0), (std if std is not None else np.zeros(len(score)))
-        probability = member._platt(score)
-        if std is None:
-            return probability, np.zeros(len(score))
-        high, low = member._platt(score + std), member._platt(score - std)
-        return probability, np.abs(high - low) / 2.0
+        return member.report(score, std)
 
     def _predict_from_records(self, records: List[dict], return_std: bool):
         """Ordinary path: encode each record in full, then score it with every member."""
@@ -617,14 +608,8 @@ class FusionEnsemble:
         """One member's prediction on processed blocks, in the reported units."""
         if return_std and member.supports_std:
             score, std = member._predict_model(member.model_, Z, return_std=True)
-            if member.task_type != "binary":
-                return score * member.y_std_ + member.y_mean_, std * member.y_std_
-            if member.native_binary:
-                return np.clip(score, 0.0, 1.0), std
-            high, low = member._platt(score + std), member._platt(score - std)
-            return member._platt(score), np.abs(high - low) / 2.0
-        score = member._predict_model(member.model_, Z)
-        return member._to_original_units(score), np.zeros(len(score))
+            return member.report(score, std)
+        return member.report(member._predict_model(member.model_, Z))
 
     def _aggregate(self, per_member, ok, smiles, return_individual: bool) -> FusionPrediction:
         """Weighted mean, and the law of total variance over the members."""

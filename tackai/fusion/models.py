@@ -113,12 +113,12 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
         """
         classes = np.unique(y.astype(int))
         if len(classes) < 2:
-            self.platt_ = None
+            self.calibrator_ = None
             self.single_class_ = float(classes[0])
             return
         self.single_class_ = None
         oof = self._oof_scores(Z, ys, groups)
-        self.platt_ = LogisticRegression(C=1e4).fit(oof[:, None], y.astype(int))
+        self.calibrator_ = LogisticRegression(C=1e4).fit(oof[:, None], y.astype(int))
 
     def _after_fit(self) -> None:
         """Hook for subclasses to record state that inner calibration fits must not clobber."""
@@ -150,32 +150,50 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
                 "ensemble's member spread instead")
         Z = self.pre_.transform(X)
         if not return_std:
-            score = self._predict_model(self.model_, Z)
-            return self._to_original_units(score)
-
+            return self.report(self._predict_model(self.model_, Z))[0]
         score, std = self._predict_model(self.model_, Z, return_std=True)
-        if self.task_type != "binary":
-            return score * self.y_std_ + self.y_mean_, std * self.y_std_
-        if self.native_binary:
-            return np.clip(score, 0.0, 1.0), std
-        # Push the latent interval through the calibrator: half the width of
-        # [platt(s - sigma), platt(s + sigma)] is the probability-scale uncertainty.
-        high = self._platt(score + std)
-        low = self._platt(score - std)
-        return self._platt(score), np.abs(high - low) / 2.0
+        return self.report(score, std)
 
-    def _to_original_units(self, score: np.ndarray) -> np.ndarray:
-        """Map a model score to the reported scale."""
-        if self.task_type != "binary":
-            return score * self.y_std_ + self.y_mean_
-        return np.clip(score, 0.0, 1.0) if self.native_binary else self._platt(score)
+    def report(self, score, std=None):
+        """Map a model score to the reported quantity, with its uncertainty.
 
-    def _platt(self, score: np.ndarray) -> np.ndarray:
-        """Calibrated probability of the positive class."""
+        For a regression task the score is already the reported quantity. For a binary task a
+        native classifier's score is a probability and only needs clipping, while a latent
+        score is pushed through the fitted calibrator -- and so is its interval, as half the
+        width of ``[calibrate(score - std), calibrate(score + std)]``.
+
+        Args:
+            score: Model score for each row, on the model's own scale.
+            std: Optional predictive standard deviation on that same scale.
+
+        Returns:
+            ``(value, std)`` in the reported units; ``std`` is zeros when none was given.
+
+        Raises:
+            ValueError: If this member needs a calibrator and has none.
+        """
         score = np.asarray(score)
+        zeros = np.zeros(len(score))
+        if self.task_type != "binary":
+            value = score * self.y_std_ + self.y_mean_
+            return value, (std * self.y_std_ if std is not None else zeros)
+        if self.native_binary:
+            return np.clip(score, 0.0, 1.0), (std if std is not None else zeros)
         if getattr(self, "single_class_", None) is not None:
-            return np.full(len(score), self.single_class_)
-        return self.platt_.predict_proba(score[:, None])[:, 1]
+            return np.full(len(score), self.single_class_), zeros
+        if getattr(self, "calibrator_", None) is None:
+            raise ValueError(
+                f"{type(self).__name__} is uncalibrated: a latent score is not a probability. "
+                "Call FusionEnsemble.calibrate on a held-out set before predicting")
+        probability = self._calibrate(score)
+        if std is None:
+            return probability, zeros
+        high, low = self._calibrate(score + std), self._calibrate(score - std)
+        return probability, np.abs(high - low) / 2.0
+
+    def _calibrate(self, score) -> np.ndarray:
+        """Calibrated probability of the positive class for a latent score."""
+        return self.calibrator_.predict_proba(np.asarray(score)[:, None])[:, 1]
 
     # subclass hooks -----------------------------------------------------------
 

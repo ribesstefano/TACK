@@ -171,3 +171,25 @@ def test_kernel_report_describes_the_fitted_model_not_an_inner_fold():
     X, y, g = synth(binary=True)
     est = fast_gp(task_type="binary", random_state=0).fit(X, y, g)
     assert est.kernel_report_["weight"] == est.model_.kernel_report()["weight"]
+
+
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_report_is_the_single_path_to_reported_units(factory):
+    """predict() must agree with report() on the model's own score, for both estimators."""
+    X, y, g = synth()
+    est = factory(random_state=0).fit(X, y * 100.0, g)
+    Z = est.pre_.transform(X)
+    score = est._predict_model(est.model_, Z)
+    value, std = est.report(score)
+    assert np.allclose(value, est.predict(X))
+    assert std.shape == value.shape and not std.any()
+
+
+def test_report_pushes_a_gp_interval_through_the_calibrator():
+    X, y, g = synth(binary=True)
+    est = fast_gp(task_type="binary", random_state=0).fit(X, y, g)
+    Z = est.pre_.transform(X)
+    score, score_std = est._predict_model(est.model_, Z, return_std=True)
+    value, std = est.report(score, score_std)
+    assert ((value >= 0) & (value <= 1)).all() and (std >= 0).all() and (std <= 1).all()
+    assert np.allclose(value, est.predict(X))
