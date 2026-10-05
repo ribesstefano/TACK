@@ -34,6 +34,31 @@ DEFAULT_INTERACTIONS = ("mol*poi", "mol*cell", "poi*cell")
 #: GPyTorch original carried the same constraint (``GreaterThan(1e-3)``).
 NOISE_FLOOR = 1e-3
 
+#: Where each precision's jitter ladder starts and the largest value it tries before giving up
+#: (float32 then promotes to float64, whose ladder is the original). float32's epsilon is 1.2e-7,
+#: so the float64 starting jitter of 1e-6 would sit below the rounding noise of a unit-scale kernel.
+JITTER_START = {torch.float32: 1e-5, torch.float64: 1e-6}
+JITTER_CEILING = {torch.float32: 1e-3, torch.float64: 1e-2}
+
+
+def _ladder(start: float, ceiling: float):
+    """Jitter values ``start, 10*start, ...`` up to ``ceiling``; ``0 * 10`` is 0, so restart at 1e-8."""
+    jitter = start
+    while jitter <= ceiling * (1 + 1e-9):
+        yield jitter
+        jitter = max(jitter * 10, 1e-8)
+
+
+def _try_cholesky(K: torch.Tensor, start: float, ceiling: float):
+    """Cholesky factor of ``K + jitter*I`` for the first jitter that works, else None."""
+    eye = torch.eye(K.shape[0], dtype=K.dtype)
+    for jitter in _ladder(start, ceiling):
+        try:
+            return torch.linalg.cholesky(K + eye * jitter)
+        except Exception:
+            continue
+    return None
+
 
 class AdditiveProductGP:
     """Exact GP over processed blocks, with cached distances and exact posterior variance.
@@ -45,8 +70,10 @@ class AdditiveProductGP:
         ard_blocks: Blocks given one lengthscale per column.
         rbf_blocks: Blocks given an RBF kernel (default: every block except ``linear_blocks``).
         linear_blocks: Blocks given a linear kernel.
-        jitter: Starting diagonal jitter for the Cholesky factorisation.
-        dtype: Torch dtype for the computation.
+        jitter: Starting diagonal jitter for the Cholesky factorisation (default: 1e-5 in
+            float32, 1e-6 in float64).
+        dtype: Torch dtype for the computation, float32 by default. A factorisation float32
+            cannot do is retried in float64 and recorded in ``promoted_``.
     """
 
     def __init__(self, dims: Dict[str, int], *,
@@ -54,8 +81,8 @@ class AdditiveProductGP:
                  ard_blocks: Sequence[str] = ("descriptors",),
                  rbf_blocks: Optional[Sequence[str]] = None,
                  linear_blocks: Sequence[str] = ("assay_time",),
-                 jitter: float = 1e-6,
-                 dtype: Union[str, torch.dtype] = torch.float64):
+                 jitter: Optional[float] = None,
+                 dtype: Union[str, torch.dtype] = torch.float32):
         self.dims = dict(dims)
         self.linear_blocks = [b for b in linear_blocks if b in self.dims]
         self.rbf_blocks = list(rbf_blocks) if rbf_blocks is not None else [
@@ -64,9 +91,16 @@ class AdditiveProductGP:
         self.interactions = [t for t in interactions if self._term_available(t)]
         self.jitter = jitter
         self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+        self.promoted_ = False
+        self.promotions_ = 0
+        self.factorisations_ = 0
         self.terms = ([f"rbf:{b}" for b in self.rbf_blocks]
                       + [f"linear:{b}" for b in self.linear_blocks]
                       + [f"prod:{t}" for t in self.interactions])
+
+    def _base_jitter(self, dtype: Optional[torch.dtype] = None) -> float:
+        """Starting jitter: the user's, else the precision's default."""
+        return self.jitter if self.jitter is not None else JITTER_START[dtype or self.dtype]
 
     # ---------------------------------------------------------------- layout helpers
 
@@ -225,16 +259,33 @@ class AdditiveProductGP:
             total = term if total is None else total + term
         return total
 
+    def _factor(self, K: torch.Tensor):
+        """Cholesky factor with escalating jitter, promoting float32 to float64 if it must.
+
+        Args:
+            K: Noisy kernel matrix.
+
+        Returns:
+            ``(L, promoted)``; ``L`` is None when even float64 cannot factorise ``K``.
+        """
+        self.factorisations_ = getattr(self, "factorisations_", 0) + 1
+        L = _try_cholesky(K, self._base_jitter(K.dtype), JITTER_CEILING[K.dtype])
+        if L is not None or K.dtype == torch.float64:
+            return L, False
+        L = _try_cholesky(K.to(torch.float64), self._base_jitter(torch.float64),
+                          JITTER_CEILING[torch.float64])
+        if L is not None:
+            self.promotions_ = getattr(self, "promotions_", 0) + 1
+        return L, L is not None
+
     def _cholesky(self, K: torch.Tensor) -> torch.Tensor:
-        """Cholesky factor with escalating jitter; raises if the kernel stays singular."""
-        eye = torch.eye(K.shape[0], dtype=self.dtype)
-        jitter = self.jitter
-        while jitter <= 1e-2:
-            try:
-                return torch.linalg.cholesky(K + eye * jitter)
-            except Exception:
-                jitter = max(jitter * 10, 1e-8)     # 0 * 10 is 0: the loop would never end
-        raise RuntimeError("GP kernel is not positive definite even with 1e-2 jitter")
+        """Cholesky factor of the noisy kernel; raises if even float64 cannot factorise it."""
+        L, promoted = self._factor(K)
+        if L is None:
+            raise RuntimeError("GP kernel is not positive definite even with "
+                               f"{JITTER_CEILING[torch.float64]:g} jitter in float64")
+        self.promoted_ = promoted
+        return L
 
     # ---------------------------------------------------------------- fitting
 
@@ -248,16 +299,10 @@ class AdditiveProductGP:
         n = len(y)
         eye = torch.eye(n, dtype=self.dtype)
         K = self._assemble(params, Z, Z, cached, same=True) + eye * self._noise(params)
-        L = None
-        jitter = self.jitter
-        while L is None:
-            try:
-                L = torch.linalg.cholesky(K + eye * jitter)
-            except Exception:
-                if jitter > 1e-2:
-                    return torch.tensor(float("inf"), dtype=self.dtype)
-                jitter = max(jitter * 10, 1e-8)
-        resid = (y - params["mean"]).unsqueeze(1)
+        L, _ = self._factor(K)
+        if L is None:
+            return torch.tensor(float("inf"), dtype=self.dtype)
+        resid = (y - params["mean"]).unsqueeze(1).to(L.dtype)
         alpha = torch.cholesky_solve(resid, L)
         return (0.5 * (resid * alpha).sum() + torch.log(torch.diagonal(L)).sum()
                 + 0.5 * n * np.log(2.0 * np.pi))
@@ -338,8 +383,33 @@ class AdditiveProductGP:
             K = self._assemble(self.params_, self.Z_train_, self.Z_train_, cached, same=True)
             K = K + torch.eye(self.n_train_, dtype=self.dtype) * self.noise_
             self.chol_ = self._cholesky(K)
-            resid = (self.y_train_ - self.params_["mean"]).unsqueeze(1)
-            self.alpha_ = torch.cholesky_solve(resid, self.chol_)
+            resid = (self.y_train_ - self.params_["mean"]).unsqueeze(1).to(self.chol_.dtype)
+            self.alpha_ = torch.cholesky_solve(resid, self.chol_).to(self.dtype)
+
+    def astype(self, dtype: Union[str, torch.dtype], jitter: Optional[float] = None):
+        """Re-condition this fitted GP in another precision, keeping its hyper-parameters.
+
+        The kernel is rebuilt and refactorised in ``dtype`` (with float64 promotion if that
+        precision cannot do it), so ``promoted_`` reports whether the saved hyper-parameters
+        survive the cast.
+
+        Args:
+            dtype: Target torch dtype (or its name).
+            jitter: Starting jitter (default: the new precision's own).
+
+        Returns:
+            self
+        """
+        dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+        state = self.state_
+        cast = {**state,
+                "params": {k: v.to(dtype) for k, v in state["params"].items()},
+                "ls_scale": {k: v.to(dtype) for k, v in state.get("ls_scale", {}).items()}}
+        Z = {b: a.double().numpy() for b, a in self.Z_train_.items()}
+        y = self.y_train_.double().numpy()
+        self.dtype, self.jitter = dtype, jitter
+        self.load_state(cast, Z, y)
+        return self
 
     # ---------------------------------------------------------------- prediction
 
@@ -377,7 +447,7 @@ class AdditiveProductGP:
             mean = (self.params_["mean"] + (cross @ self.alpha_).squeeze(1)).numpy()
             if not return_std:
                 return mean
-            v = torch.linalg.solve_triangular(self.chol_, cross.T, upper=False)
+            v = torch.linalg.solve_triangular(self.chol_, cross.T.to(self.chol_.dtype), upper=False)
             var = self._diag(self.params_, Zt) - (v * v).sum(0)
             return mean, torch.sqrt(var.clamp_min(0.0)).numpy()
 
@@ -506,7 +576,7 @@ class AdditiveProductGP:
             mean = (self.params_["mean"] + (cross @ self.alpha_).squeeze(1)).numpy()
             if not return_std:
                 return mean
-            v = torch.linalg.solve_triangular(self.chol_, cross.T, upper=False)
+            v = torch.linalg.solve_triangular(self.chol_, cross.T.to(self.chol_.dtype), upper=False)
             var = fold["prior_var"] - (v * v).sum(0)
             return mean, torch.sqrt(var.clamp_min(0.0)).numpy()
 

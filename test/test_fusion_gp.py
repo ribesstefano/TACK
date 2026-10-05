@@ -43,7 +43,7 @@ def test_predict_returns_std_and_it_is_smaller_on_training_points():
 def test_variance_matches_the_textbook_formula():
     """var = k** - ks' (K + sI)^-1 ks, assembled independently from the fitted kernel."""
     Z, y = toy(n=40)
-    gp = AdditiveProductGP(dims_of(Z))
+    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
     gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
     _, std = gp.predict(Z, return_std=True)
     K = gp.kernel_matrix(Z, Z)
@@ -55,10 +55,10 @@ def test_variance_matches_the_textbook_formula():
 
 def test_cached_distances_equal_a_naive_recomputation():
     Z, y = toy()
-    gp = AdditiveProductGP(dims_of(Z))
+    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
     state = gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
     cached = gp.predict(Z)
-    fresh = AdditiveProductGP(dims_of(Z))
+    fresh = AdditiveProductGP(dims_of(Z), dtype="float64")
     fresh.load_state(state, Z, y)
     assert np.allclose(cached, fresh.predict(Z), rtol=1e-10, atol=1e-12)
 
@@ -98,9 +98,9 @@ def test_interactions_are_configurable_including_mol_x_e3():
 
 def test_fit_is_reproducible_for_a_seed():
     Z, y = toy()
-    a = AdditiveProductGP(dims_of(Z))
+    a = AdditiveProductGP(dims_of(Z), dtype="float64")
     a.fit(Z, y, n_restarts=2, n_iter=20, seed=7)
-    b = AdditiveProductGP(dims_of(Z))
+    b = AdditiveProductGP(dims_of(Z), dtype="float64")
     b.fit(Z, y, n_restarts=2, n_iter=20, seed=7)
     assert np.allclose(a.predict(Z), b.predict(Z), rtol=1e-10, atol=1e-12)
 
@@ -184,7 +184,7 @@ def test_rbf_self_covariance_is_one_at_any_column_scale():
     for scale in (1.0, 1e9, 1e18):
         Z, y = toy(n=50)
         Z["descriptors"] = Z["descriptors"] * scale
-        gp = AdditiveProductGP(dims_of(Z))
+        gp = AdditiveProductGP(dims_of(Z), dtype="float64")
         gp.fit(Z, y, n_restarts=1, n_iter=5, seed=0)
         Zt = gp._to_tensor(Z)
         cached = gp._cache_distances(Zt, Zt)
@@ -218,7 +218,7 @@ def test_folded_context_matches_the_full_kernel():
     """
     Z, y = toy(n=80)
     Z["e3"] = np.random.default_rng(1).normal(size=(80, 3))
-    gp = AdditiveProductGP(dims_of(Z))
+    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
     gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
 
     context = {b: Z[b][:1] for b in ("e3", "poi", "cell", "assay_time")}
@@ -260,7 +260,7 @@ def test_folded_context_matches_the_full_kernel_for_any_interactions(interaction
     """
     Z, y = toy(n=80)
     Z["e3"] = np.random.default_rng(1).normal(size=(80, 3))
-    gp = AdditiveProductGP(dims_of(Z), interactions=interactions)
+    gp = AdditiveProductGP(dims_of(Z), interactions=interactions, dtype="float64")
     gp.fit(Z, y, n_restarts=1, n_iter=15, seed=0)
 
     context = {b: Z[b][:1] for b in ("e3", "poi", "cell", "assay_time")}
@@ -280,3 +280,181 @@ def test_cholesky_with_zero_jitter_raises_instead_of_hanging():
     indefinite = torch.tensor([[1.0, 2.0], [2.0, 1.0]], dtype=torch.float64)
     with pytest.raises(RuntimeError, match="positive definite"):
         gp._cholesky(indefinite)
+
+
+import torch
+
+
+def test_default_dtype_is_float32():
+    Z, y = toy()
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
+    assert gp.dtype is torch.float32
+    assert gp.Z_train_["fingerprint"].dtype == torch.float32
+    assert gp.alpha_.dtype == torch.float32
+    assert gp.predict(Z).dtype == np.float32
+
+
+def test_float64_is_still_available():
+    Z, y = toy()
+    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
+    gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
+    assert gp.dtype is torch.float64 and gp.predict(Z).dtype == np.float64
+    assert gp.promoted_ is False
+
+
+def test_jitter_ladder_depends_on_the_dtype():
+    dims = {"fingerprint": 2, "descriptors": 2, "assay_time": 1}
+    assert AdditiveProductGP(dims)._base_jitter() == 1e-5
+    assert AdditiveProductGP(dims, dtype="float64")._base_jitter() == 1e-6
+    assert AdditiveProductGP(dims, jitter=3e-7)._base_jitter() == 3e-7
+
+
+def test_float32_factorisation_is_promoted_to_float64_when_it_must(monkeypatch):
+    """Control flow of the fallback, made deterministic: float32 factorisations are refused."""
+    real = torch.linalg.cholesky
+
+    def float32_cannot(A, *args, **kwargs):
+        if A.dtype == torch.float32:
+            raise torch.linalg.LinAlgError("forced for the test")
+        return real(A, *args, **kwargs)
+    monkeypatch.setattr(torch.linalg, "cholesky", float32_cannot)
+
+    gp = AdditiveProductGP({"fingerprint": 2, "descriptors": 2, "assay_time": 1})
+    L, promoted = gp._factor(torch.eye(10) * 2.0)
+    assert promoted is True and L.dtype == torch.float64
+    assert gp.promotions_ == 1 and gp.factorisations_ == 1
+
+
+def test_a_kernel_that_float64_cannot_factorise_either_is_refused():
+    gp = AdditiveProductGP({"fingerprint": 2, "descriptors": 2, "assay_time": 1})
+    indefinite = torch.tensor([[1.0, 2.0], [2.0, 1.0]], dtype=torch.float32)
+    L, promoted = gp._factor(indefinite)
+    assert L is None and promoted is False
+    with pytest.raises(RuntimeError, match="positive definite"):
+        gp._cholesky(indefinite)
+
+
+def test_a_well_conditioned_float32_kernel_is_not_promoted():
+    gp = AdditiveProductGP({"fingerprint": 2, "descriptors": 2, "assay_time": 1})
+    L, promoted = gp._factor(torch.eye(10) * 2.0)
+    assert promoted is False and L.dtype == torch.float32
+
+
+def test_prediction_works_with_a_promoted_float64_factor():
+    Z, y = toy()
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
+    mean, std = gp.predict(Z, return_std=True)
+    gp.chol_, gp.promoted_ = gp.chol_.double(), True
+    mean2, std2 = gp.predict(Z, return_std=True)
+    assert np.allclose(mean, mean2, atol=1e-6) and np.allclose(std, std2, atol=1e-4)
+
+
+def test_astype_reconditions_in_the_new_precision():
+    Z, y = toy(n=80)
+    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
+    gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
+    mean64, std64 = gp.predict(Z, return_std=True)
+    assert gp.astype("float32") is gp
+    assert gp.dtype is torch.float32 and gp.Z_train_["poi"].dtype == torch.float32
+    assert gp.params_["mean"].dtype == torch.float32
+    mean32, std32 = gp.predict(Z, return_std=True)
+    assert np.allclose(mean32, mean64, rtol=1e-2, atol=1e-2)
+    assert np.allclose(std32, std64, rtol=5e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("scale", [1e9, 1e18, 1e20])
+def test_float32_survives_descriptor_columns_up_to_the_featuriser_limit(scale):  # Review Focus 3
+    """Ipc-like columns reach 1e20; squared they approach float32's 3.4e38 ceiling."""
+    Z, y = toy(n=60)
+    Z["descriptors"] = Z["descriptors"] * scale
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
+    mean, std = gp.predict(Z, return_std=True)
+    assert np.isfinite(mean).all() and np.isfinite(std).all()
+    K = gp.kernel_matrix(Z, Z)
+    assert np.isfinite(K).all()
+    eig = np.linalg.eigvalsh(0.5 * (K + K.T).astype(np.float64))
+    assert eig.min() > -1e-4 * eig.max(), "kernel is indefinite"
+
+
+def test_float32_survives_near_duplicate_molecules():  # Review Focus 3
+    Z, y = toy(n=60)
+    for b in Z:
+        Z[b][1] = Z[b][0] + 1e-7
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
+    assert np.isfinite(gp.predict(Z)).all()
+
+
+def test_folded_context_matches_the_full_kernel_in_float32():
+    Z, y = toy(n=80)
+    Z["e3"] = np.random.default_rng(1).normal(size=(80, 3))
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
+    context = {b: Z[b][:1] for b in ("e3", "poi", "cell", "assay_time")}
+    mols = {b: Z[b][:12] for b in ("fingerprint", "descriptors")}
+    fold = gp.fold_context(context)
+    folded_mean, folded_std = gp.predict_in_context(mols, fold, return_std=True)
+    full = {**{b: np.repeat(context[b], 12, axis=0) for b in context}, **mols}
+    mean, std = gp.predict(full, return_std=True)
+    assert np.allclose(folded_mean, mean, rtol=1e-3, atol=1e-3)
+    assert np.allclose(folded_std, std, atol=2e-3)
+
+
+def test_rbf_self_covariance_is_one_at_any_column_scale_in_float32():
+    """The same guarantee in float32, where the cancellation floor is ~1e-6 rather than ~1e-14."""
+    import torch
+
+    for scale in (1.0, 1e9, 1e18):
+        Z, y = toy(n=50)
+        Z["descriptors"] = Z["descriptors"] * scale
+        gp = AdditiveProductGP(dims_of(Z))
+        gp.fit(Z, y, n_restarts=1, n_iter=5, seed=0)
+        Zt = gp._to_tensor(Z)
+        cached = gp._cache_distances(Zt, Zt)
+        with torch.no_grad():
+            for block in gp.rbf_blocks:
+                diag = gp._rbf(block, gp.params_, Zt, Zt, cached).diagonal().numpy()
+                assert np.allclose(diag, 1.0, atol=1e-4), (
+                    f"scale {scale:.0e}: RBF({block}, x, x) = {diag.min():.6f}, not 1")
+
+
+@pytest.mark.parametrize("interactions", [
+    ("mol*poi", "mol*cell", "poi*cell"),
+    ("fingerprint*poi",),
+    ("descriptors*cell",),
+    ("fingerprint*poi", "mol*cell", "poi*cell"),
+    ("mol*e3",),
+    ("poi*poi",),
+    (),
+])
+def test_folded_context_matches_the_full_kernel_for_any_interactions_in_float32(interactions):
+    """The fold is algebraically exact for every interaction; in float32 it agrees to rounding."""
+    Z, y = toy(n=80)
+    Z["e3"] = np.random.default_rng(1).normal(size=(80, 3))
+    gp = AdditiveProductGP(dims_of(Z), interactions=interactions)
+    gp.fit(Z, y, n_restarts=1, n_iter=15, seed=0)
+
+    context = {b: Z[b][:1] for b in ("e3", "poi", "cell", "assay_time")}
+    mols = {b: Z[b][:12] for b in ("fingerprint", "descriptors")}
+    folded_mean, folded_std = gp.predict_in_context(mols, gp.fold_context(context),
+                                                    return_std=True)
+    full = {**{b: np.repeat(context[b], 12, axis=0) for b in context}, **mols}
+    mean, std = gp.predict(full, return_std=True)
+    assert np.allclose(folded_mean, mean, rtol=1e-3, atol=1e-3)
+    assert np.allclose(folded_std, std, atol=2e-3)
+
+
+def test_variance_matches_the_textbook_formula_in_float32():
+    """Float32 agrees with the float64 textbook formula to ~4e-5 relative (rtol 1e-3 allows for conditioning)."""
+    Z, y = toy(n=40)
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
+    _, std = gp.predict(Z, return_std=True)
+    K = gp.kernel_matrix(Z, Z)
+    Kn = K + np.eye(len(y)) * gp.noise_
+    naive = np.sqrt(np.clip(np.diag(K) - np.einsum("ij,jk,ki->i", K, np.linalg.inv(Kn), K),
+                            0, None))
+    assert np.allclose(std, naive, rtol=1e-3, atol=1e-5)
