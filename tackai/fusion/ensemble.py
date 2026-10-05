@@ -189,7 +189,7 @@ class FusionEnsemble:
     def from_pretrained(cls, model_id: Union[str, Path], *, revision: Optional[str] = None,
                         token: Optional[str] = None,
                         data: Optional[FusionData] = None, dtype: Optional[str] = None,
-                        shared_context: bool = True) -> "FusionEnsemble":
+                        shared_context: Optional[bool] = None) -> "FusionEnsemble":
         """Load a saved ensemble from a local directory or a Hugging Face Hub repo.
 
         Args:
@@ -201,7 +201,8 @@ class FusionEnsemble:
             dtype: Cast every member to this precision after loading; ``None`` keeps the
                 precision it was saved in.
             shared_context: Score every member through the consensus of their context
-                preprocessors (see :class:`FusionEnsemble`).
+                preprocessors (see :class:`FusionEnsemble`). ``None`` uses what the ensemble
+                was saved with (shared, for a manifest that predates the setting).
 
         Returns:
             The loaded ensemble.
@@ -221,7 +222,8 @@ class FusionEnsemble:
             data = FusionData(encoder=encoder, featurizer=featurizer)
         cls._check_layout(manifest, data, members)
         ens = cls(members, data, manifest["task"], weights=manifest.get("weights"),
-                  shared_context=shared_context)
+                  shared_context=(manifest.get("shared_context", True)
+                                  if shared_context is None else shared_context))
         return ens.astype(dtype) if dtype is not None else ens
 
     @staticmethod
@@ -293,6 +295,7 @@ class FusionEnsemble:
             "block_order": BLOCK_ORDER,
             "protein_space": self.data.encoder.protein_space,
             "dtype": getattr(self.members[0], "dtype", "float64"),
+            "shared_context": self.shared_context,
             "fingerprint": [self.data.featurizer.radius, self.data.featurizer.fp_size],
             "versions": {"tackai": getattr(tackai, "__version__", "unknown"),
                          "numpy": np.__version__, "torch": torch.__version__,
@@ -339,13 +342,21 @@ class FusionEnsemble:
         :attr:`promoted`. Preprocessors switch their output dtype; tree members only change
         the dtype their inputs are prepared in. The shared context is rebuilt.
 
+        The cast cannot be undone (reload from disk for the original precision), and a
+        :class:`FusionContext` built before it is stale: call :meth:`transform_context` again.
+
         Args:
             dtype: ``"float32"`` or ``"float64"``.
 
         Returns:
             self
+
+        Raises:
+            ValueError: For any other precision, before any member has been changed.
         """
         name = str(dtype).replace("torch.", "")
+        if name not in ("float32", "float64"):
+            raise ValueError(f"dtype must be float32 or float64, got {dtype!r}")
         for member in self.members:
             member.dtype = name
             member.pre_.dtype = name
@@ -548,6 +559,14 @@ class FusionEnsemble:
         done, out = {}, []
         for member in self.members:
             pre = member.pre_
+            if not all(np.array_equal(pre.blocks_[b], self.data.index[b]) for b in raw):
+                # Fitted with its own column layout (``blocks=``): the featuriser's arrays are
+                # in the data's order, so this member reads its columns from a full-width row.
+                row = np.zeros((len(fp), self.data.n_columns), dtype=np.float64)
+                row[:, self.data.index["fingerprint"]] = fp
+                row[:, self.data.index["descriptors"]] = desc
+                out.append(pre.transform_blocks(row, only=list(raw)))
+                continue
             key = tuple(pre.transform_signature(b) for b in raw) if shareable else None
             if key is None or key not in done:
                 Z = {b: pre.transform_block(b, arr) for b, arr in raw.items()}

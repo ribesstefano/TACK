@@ -66,6 +66,12 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
         self.random_state = random_state
         self.dtype = dtype
 
+    def __setstate__(self, state):
+        """Restore an object pickled before ``dtype`` existed, which was fitted in float64."""
+        state = dict(state)
+        state.setdefault("dtype", "float64")
+        super().__setstate__(state)
+
     @property
     def supports_std(self) -> bool:
         """Whether this estimator can report a predictive standard deviation."""

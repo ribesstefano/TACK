@@ -34,6 +34,28 @@ DEFAULT_INTERACTIONS = ("mol*poi", "mol*cell", "poi*cell")
 #: GPyTorch original carried the same constraint (``GreaterThan(1e-3)``).
 NOISE_FLOOR = 1e-3
 
+#: The precisions a GP can run in.
+SUPPORTED_DTYPES = {"float32": torch.float32, "float64": torch.float64}
+
+
+def resolve_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
+    """A supported precision as a torch dtype; anything else is refused up front.
+
+    Args:
+        dtype: ``"float32"``, ``"float64"`` or the matching torch dtype.
+
+    Returns:
+        The torch dtype.
+
+    Raises:
+        ValueError: For any other precision, before any state has been changed.
+    """
+    name = str(dtype).replace("torch.", "")
+    if name not in SUPPORTED_DTYPES:
+        raise ValueError(f"dtype must be float32 or float64, got {dtype!r}")
+    return SUPPORTED_DTYPES[name]
+
+
 #: Where each precision's jitter ladder starts and the largest value it tries before giving up
 #: (float32 then promotes to float64, whose ladder is the original). float32's epsilon is 1.2e-7,
 #: so the float64 starting jitter of 1e-6 would sit below the rounding noise of a unit-scale kernel.
@@ -90,7 +112,7 @@ class AdditiveProductGP:
         self.ard_blocks = [b for b in ard_blocks if b in self.rbf_blocks]
         self.interactions = [t for t in interactions if self._term_available(t)]
         self.jitter = jitter
-        self.dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+        self.dtype = resolve_dtype(dtype)
         self.promoted_ = False
         self.promotions_ = 0
         self.factorisations_ = 0
@@ -208,7 +230,6 @@ class AdditiveProductGP:
                 right, right_sq = train["ard"][block], train["sq"][block]
             d2 = self._sq_dists(Za[block] / ls, right, same=same, b_sq=right_sq)
             return torch.exp(-0.5 * d2)
-        return torch.exp(-0.5 * cached[block] / (ls[0] ** 2))
         return torch.exp(-0.5 * cached[block] / (ls[0] ** 2))
 
     def _lengthscale(self, block: str, params: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -422,27 +443,30 @@ class AdditiveProductGP:
             self._train_side_ = self._build_train_side()
         return self._train_side_
 
-    def _train_side(self) -> dict:
-        """The train-side cache; rebuilt lazily for a GP pickled before it existed."""
-        if self.__dict__.get("_train_side_") is None:
-            self._train_side_ = self._build_train_side()
-        return self._train_side_
-
     def astype(self, dtype: Union[str, torch.dtype], jitter: Optional[float] = None):
         """Re-condition this fitted GP in another precision, keeping its hyper-parameters.
 
-        The kernel is rebuilt and refactorised in ``dtype`` (with float64 promotion if that
-        precision cannot do it), so ``promoted_`` reports whether the saved hyper-parameters
-        survive the cast.
+        The kernel is rebuilt and refactorised in ``dtype``. ``promoted_`` is True when float32
+        could not factorise it and float64 did; False only means float32 succeeded, possibly
+        after adding jitter up to 1e-3. Promotion refactorises the kernel as assembled in
+        ``dtype``, so it cannot undo rounding already in that kernel, and ``alpha_`` is stored
+        in ``dtype`` either way.
+
+        The cast overwrites the stored training rows and hyper-parameters, so it cannot be
+        undone: float64 -> float32 -> float64 is not the original model (reload it from disk
+        for that).
 
         Args:
-            dtype: Target torch dtype (or its name).
+            dtype: ``"float32"`` or ``"float64"`` (or the torch dtype).
             jitter: Starting jitter (default: the new precision's own).
+
+        Raises:
+            ValueError: For any other precision, before anything is changed.
 
         Returns:
             self
         """
-        dtype = getattr(torch, dtype) if isinstance(dtype, str) else dtype
+        dtype = resolve_dtype(dtype)
         state = self.state_
         cast = {**state,
                 "params": {k: v.to(dtype) for k, v in state["params"].items()},

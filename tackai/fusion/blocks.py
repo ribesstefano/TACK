@@ -82,6 +82,12 @@ class BlockPreprocessor(BaseEstimator):
         self.scale_blocks = scale_blocks
         self.dtype = dtype
 
+    def __setstate__(self, state):
+        """Restore an object pickled before ``dtype`` existed, which was fitted in float64."""
+        state = dict(state)
+        state.setdefault("dtype", "float64")
+        super().__setstate__(state)
+
     def _dtype(self) -> np.dtype:
         """The output dtype; float64 for an object pickled before ``dtype`` existed."""
         return np.dtype(getattr(self, "dtype", "float64"))
