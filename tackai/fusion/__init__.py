@@ -12,6 +12,7 @@ from tackai.fusion.data import (TASK_LABELS, TASK_TYPES, TASKS, FusionData, buil
                                 make_targets, scaffold_groups)
 from tackai.fusion.gp import AdditiveProductGP
 from tackai.fusion.models import FusionEstimator, GPInteraction, XGBoostFusion
+from tackai.fusion.training import check_labels, fit_member, validation_split
 from tackai.fusion.ensemble import FusionContext, FusionEnsemble, FusionPrediction
 from tackai.fusion.features import DESCRIPTOR_NAMES, MolFeaturizer
 
@@ -20,4 +21,5 @@ __all__ = ["BLOCK_ORDER", "BLOCK_DIMS", "DENSE_BLOCKS", "SMALL_BLOCKS", "MOL_BLO
            "ContextEncoder", "CONTEXT_FILES", "normalize_assay",
            "FusionData", "build_table", "make_targets", "scaffold_groups", "TASKS",
            "TASK_TYPES", "TASK_LABELS", "AdditiveProductGP", "FusionEstimator", "GPInteraction", "XGBoostFusion",
-           "FusionEnsemble", "FusionPrediction", "FusionContext"]
+           "FusionEnsemble", "FusionPrediction", "FusionContext",
+           "check_labels", "validation_split", "fit_member"]

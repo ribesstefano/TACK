@@ -143,3 +143,9 @@ def test_fit_is_reproducible_for_a_seed():
     b = fit_member(fast_gp, X, y, random_state=3).predict(X)
     assert np.allclose(a, b, rtol=1e-8, atol=1e-10)
 
+
+
+def test_the_training_helpers_are_exported():
+    import tackai.fusion as fusion
+    for name in ("check_labels", "validation_split", "fit_member"):
+        assert hasattr(fusion, name) and name in fusion.__all__
