@@ -188,7 +188,7 @@ class FusionEnsemble:
     @classmethod
     def from_pretrained(cls, model_id: Union[str, Path], *, revision: Optional[str] = None,
                         token: Optional[str] = None,
-                        data: Optional[FusionData] = None,
+                        data: Optional[FusionData] = None, dtype: Optional[str] = None,
                         shared_context: bool = True) -> "FusionEnsemble":
         """Load a saved ensemble from a local directory or a Hugging Face Hub repo.
 
@@ -198,6 +198,8 @@ class FusionEnsemble:
             token: Hub token, for a private repo.
             data: Reuse this :class:`FusionData` instead of rebuilding an encoder-only one
                 from the manifest (inference needs only the encoder and the layout).
+            dtype: Cast every member to this precision after loading; ``None`` keeps the
+                precision it was saved in.
             shared_context: Score every member through the consensus of their context
                 preprocessors (see :class:`FusionEnsemble`).
 
@@ -218,8 +220,9 @@ class FusionEnsemble:
                                        fp_size=manifest["fingerprint"][1])
             data = FusionData(encoder=encoder, featurizer=featurizer)
         cls._check_layout(manifest, data, members)
-        return cls(members, data, manifest["task"], weights=manifest.get("weights"),
-                   shared_context=shared_context)
+        ens = cls(members, data, manifest["task"], weights=manifest.get("weights"),
+                  shared_context=shared_context)
+        return ens.astype(dtype) if dtype is not None else ens
 
     @staticmethod
     def _check_layout(manifest: dict, data: FusionData, members: Sequence) -> None:
@@ -289,6 +292,7 @@ class FusionEnsemble:
             "block_dims": self.data.dims,
             "block_order": BLOCK_ORDER,
             "protein_space": self.data.encoder.protein_space,
+            "dtype": getattr(self.members[0], "dtype", "float64"),
             "fingerprint": [self.data.featurizer.radius, self.data.featurizer.fp_size],
             "versions": {"tackai": getattr(tackai, "__version__", "unknown"),
                          "numpy": np.__version__, "torch": torch.__version__,
@@ -326,6 +330,37 @@ class FusionEnsemble:
     def available_tasks(self) -> List[str]:
         """The tasks this ensemble can predict (one, the task it was fitted on)."""
         return [self.task]
+
+    def astype(self, dtype: str) -> "FusionEnsemble":
+        """Serve every member in another precision, in place and without refitting.
+
+        GP members are re-conditioned in ``dtype`` with their saved hyper-parameters; a
+        factorisation that precision cannot do is promoted to float64 and shows up in
+        :attr:`promoted`. Preprocessors switch their output dtype; tree members only change
+        the dtype their inputs are prepared in. The shared context is rebuilt.
+
+        Args:
+            dtype: ``"float32"`` or ``"float64"``.
+
+        Returns:
+            self
+        """
+        name = str(dtype).replace("torch.", "")
+        for member in self.members:
+            member.dtype = name
+            member.pre_.dtype = name
+            model = getattr(member, "model_", None)
+            if hasattr(model, "astype"):
+                model.astype(name)
+        if self.context_pre_ is not None:
+            self.context_pre_ = self._build_context_pre()
+        return self
+
+    @property
+    def promoted(self) -> List[bool]:
+        """Per member: whether its GP's factorisation had to be promoted to float64."""
+        return [bool(getattr(getattr(m, "model_", None), "promoted_", False))
+                for m in self.members]
 
     @property
     def _context_blocks(self) -> List[str]:
