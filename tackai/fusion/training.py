@@ -68,3 +68,45 @@ def validation_split(groups, test_size: float = 0.2, random_state: int = 0):
                          f"{n_groups}; fit without early stopping or widen the fold")
     splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=random_state)
     return next(splitter.split(np.zeros(len(groups)), groups=groups))
+
+
+def fit_member(factory, X, y, train=None, *, groups=None, early_stopping: bool = False,
+               random_state: int = 0):
+    """Fit one ensemble member on the rows ``train``.
+
+    This is the whole per-member recipe, and it is deliberately short: check the labels, build
+    the estimator, optionally carve an early-stopping set out of the training rows, fit. An
+    ensemble-level loop over folds calls this once per member.
+
+    Args:
+        factory: Callable returning a fresh estimator, called with ``random_state`` alone. Bake
+            ``task_type`` and every other setting into the factory, e.g.
+            ``partial(GPInteraction, task_type="binary")``.
+        X: Full design matrix.
+        y: Full label vector, in the units the member should report.
+        train: Row indices to train on; defaults to every row.
+        groups: Scaffold group id per row. Required when ``early_stopping`` is set, so the
+            validation rows share no scaffold with the rows the model fits.
+        early_stopping: Hold out a grouped fraction of ``train`` and pass it to the estimator
+            as a validation set, for a model that can early-stop on it.
+        random_state: Seed, forwarded to the factory and to the validation split.
+
+    Returns:
+        The fitted estimator.
+
+    Raises:
+        ValueError: If the training labels -- or, with early stopping, the validation labels --
+            cannot be learned from, or if ``early_stopping`` is set without ``groups``.
+    """
+    train = np.arange(len(y)) if train is None else np.asarray(train)
+    estimator = factory(random_state=random_state)
+    check_labels(y[train], estimator.task_type, "training labels")
+    if not early_stopping:
+        return estimator.fit(X[train], y[train])
+    if groups is None:
+        raise ValueError("early_stopping needs groups, so the validation rows share no "
+                         "scaffold with the rows the model fits")
+    inner, val = validation_split(np.asarray(groups)[train], random_state=random_state)
+    check_labels(y[train[val]], estimator.task_type, "validation labels")
+    return estimator.fit(X[train[inner]], y[train[inner]],
+                         validation=(X[train[val]], y[train[val]]))

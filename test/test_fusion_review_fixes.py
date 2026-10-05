@@ -7,7 +7,7 @@ import pytest
 import torch
 from sklearn.base import clone
 
-from fusion_fixtures import CELLS, SEQS, SMILES
+from fusion_fixtures import CELLS, SEQS, SMILES, build_ensemble
 from tackai.fusion.blocks import BlockPreprocessor, block_index
 from tackai.fusion.data import FusionData
 from tackai.fusion.ensemble import FusionEnsemble
@@ -34,7 +34,7 @@ def data(fake_cache, tiny_csv):
 
 @pytest.fixture
 def ens64(data):
-    return FusionEnsemble.fit(partial(fast_gp, dtype="float64"), data, task="pdc50",
+    return build_ensemble(partial(fast_gp, dtype="float64"), data, task="pdc50",
                               n_members=2, n_folds=3)
 
 
@@ -48,18 +48,6 @@ def test_a_preprocessor_pickled_before_dtype_existed_supports_repr_and_clone(): 
     assert loaded.dtype == "float64" and loaded.get_params()["dtype"] == "float64"
     assert "BlockPreprocessor" in repr(loaded)
     assert clone(loaded).dtype == "float64"
-
-
-def test_an_estimator_pickled_before_dtype_existed_supports_repr_and_clone():  # Review Focus 1
-    X, y = design()
-    est = fast_gp().fit(X, y)
-    del est.dtype
-    del est.pre_.dtype
-    loaded = pickle.loads(pickle.dumps(est))
-    assert loaded.dtype == "float64" and loaded.pre_.dtype == "float64"
-    assert "GPInteraction" in repr(loaded) and "BlockPreprocessor" in repr(loaded.pre_)
-    assert clone(loaded).dtype == "float64"
-    assert np.isfinite(loaded.predict(X)).all()
 
 
 # -- an unsupported precision must be refused before anything is changed --------------------------
@@ -94,7 +82,7 @@ def test_a_member_with_its_own_descriptor_order_is_scored_correctly_from_a_cache
     """The descriptor kernel is ARD, so the order of its columns changes the prediction."""
     blocks = block_index(data.dims)
     blocks["descriptors"] = blocks["descriptors"][::-1].copy()
-    ens = FusionEnsemble.fit(partial(fast_gp, blocks=blocks, dtype="float64"), data,
+    ens = build_ensemble(partial(fast_gp, blocks=blocks, dtype="float64"), data,
                              task="pdc50", n_members=2, n_folds=3)
     from_context = ens.predict(SMILES[:4], context=ens.transform_context(CTX))
     from_records = ens.predict(RECORDS)

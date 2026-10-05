@@ -43,7 +43,7 @@ def test_gp_member_can_be_float64_end_to_end():
 
 def test_xgboost_member_preprocesses_in_the_requested_dtype():
     X, y = design()
-    est = XGBoostFusion(n_estimators=10, grid=[{"max_depth": 3, "reg_lambda": 5.0}]).fit(X, y)
+    est = XGBoostFusion(n_estimators=10, max_depth=3, reg_lambda=5.0).fit(X, y)
     assert est.pre_.dtype == "float32"
     assert est.pre_.transform(X)["fingerprint"].dtype == np.float32
     assert np.isfinite(est.predict(X)).all()

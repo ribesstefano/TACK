@@ -94,7 +94,7 @@ def test_gp_member_fits_the_real_dmax_fold():
     _, X, y, groups = data.task_rows("dmax")
     train, test = data.splits("dmax", n_repeats=1, n_folds=5)[0][0]
 
-    gp = GPInteraction(random_state=0).fit(X[train], y[train], groups[train])
+    gp = GPInteraction(random_state=0).fit(X[train], y[train])
     mean, std = gp.predict(X[test], return_std=True)
     assert np.isfinite(mean).all() and (std > 0).all()
     assert gp.model_.noise_ >= 1e-3

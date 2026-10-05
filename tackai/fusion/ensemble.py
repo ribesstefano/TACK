@@ -13,7 +13,7 @@ The API mirrors :class:`tackai.ensemble_predictor.EnsemblePredictor`: build with
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -135,57 +135,6 @@ class FusionEnsemble:
         self.context_pre_ = self._build_context_pre() if shared_context else None
 
     # ---------------------------------------------------------------- construction
-
-    @classmethod
-    def fit(cls, factory: Union[Callable, Sequence[Callable]], data: FusionData, task: str, *,
-            splits=None, n_members: Optional[int] = 5, n_repeats: int = 5, n_folds: int = 5,
-            n_jobs: int = 1, verbose: bool = False) -> "FusionEnsemble":
-        """Fit one member per cross-validation fold.
-
-        Five members are the default because the speed study found five about as accurate as
-        twenty-five at a quarter of the cost.
-
-        Args:
-            factory: Callable returning a fresh estimator, or one callable per member. Each is
-                called with ``task_type`` and ``random_state``.
-            data: Training data.
-            task: Task name.
-            splits: Pre-computed ``splits[repeat][fold]``; defaults to the task's own splits.
-            n_members: Number of folds to fit (ignored when ``factory`` is a list).
-            n_repeats: Repeats to draw folds from.
-            n_folds: Folds per repeat.
-            n_jobs: Parallel worker processes for the fits.
-            verbose: Print progress per member.
-
-        Returns:
-            A fitted :class:`FusionEnsemble`.
-        """
-        if task not in TASK_TYPES:
-            raise ValueError(f"task must be one of {sorted(TASK_TYPES)}, got {task!r}")
-        _, X, y, groups = data.task_rows(task)
-        splits = splits if splits is not None else data.splits(task, n_repeats, n_folds)
-        folds = [fold for repeat in splits for fold in repeat]
-
-        factories = list(factory) if isinstance(factory, (list, tuple)) else None
-        count = len(factories) if factories is not None else min(n_members, len(folds))
-        if count > len(folds):
-            raise ValueError(f"asked for {count} members but only {len(folds)} folds exist")
-        make = (lambda k: factories[k]) if factories is not None else (lambda k: factory)
-
-        def fit_one(k):
-            train, _ = folds[k]
-            est = make(k)(task_type=TASK_TYPES[task], random_state=k)
-            if verbose:
-                print(f"fitting member {k} on {len(train)} rows")
-            return est.fit(X[train], y[train], groups[train])
-
-        if n_jobs and n_jobs > 1:
-            from joblib import Parallel, delayed
-            members = Parallel(n_jobs=n_jobs, backend="loky")(
-                delayed(fit_one)(k) for k in range(count))
-        else:
-            members = [fit_one(k) for k in range(count)]
-        return cls(members, data, task)
 
     @classmethod
     def from_pretrained(cls, model_id: Union[str, Path], *, revision: Optional[str] = None,
@@ -368,7 +317,6 @@ class FusionEnsemble:
                 continue
             score = member._predict_model(member.model_, Z)
             member.calibrator_ = LogisticRegression(C=1e4).fit(score[:, None], labels)
-            member.single_class_ = None       # removed with in-fit calibration in the next task
         return self
 
     @property

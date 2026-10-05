@@ -45,3 +45,41 @@ SMILES = [
     "CN1CCN(CC1)c1ccc(cc1)NC(=O)c1ccc(Cl)cc1",
     "CCOC(=O)c1ccc(cc1)N1CCN(CC1)C(=O)c1ccccc1",
 ]
+
+
+def build_ensemble(factory, data, task, n_members=3, n_folds=3):
+    """Fit one member per fold and wrap them in a FusionEnsemble, for tests.
+
+    Deliberately test-only: the package's own ensemble-fitting entry point is being written
+    separately, and this must not pre-empt its name or its behaviour.
+
+    A fold whose training labels hold a single value is skipped, because ``fit_member`` refuses
+    it by design. The tiny test table has one such fold in its activity task; the real tables
+    have none. That refusal is tested directly in ``test_fusion_training.py``.
+
+    Args:
+        factory: Callable returning a fresh estimator, called with ``random_state``; or a list
+            of them, one per member.
+        data: The :class:`~tackai.fusion.data.FusionData` to draw rows and splits from.
+        task: Task name.
+        n_members: Number of folds to fit (ignored when ``factory`` is a list).
+        n_folds: Folds per repeat.
+
+    Returns:
+        A fitted :class:`~tackai.fusion.ensemble.FusionEnsemble`.
+    """
+    import numpy as np
+    from functools import partial
+
+    from tackai.fusion.data import TASK_TYPES
+    from tackai.fusion.ensemble import FusionEnsemble
+    from tackai.fusion.training import fit_member
+
+    _, X, y, _ = data.task_rows(task)
+    folds = [f for f in data.splits(task, 1, n_folds)[0] if len(np.unique(y[f[0]])) > 1]
+    makers = list(factory) if isinstance(factory, (list, tuple)) else None
+    count = len(makers) if makers is not None else min(n_members, len(folds))
+    members = [fit_member(partial(makers[k] if makers else factory, task_type=TASK_TYPES[task]),
+                          X, y, folds[k][0], random_state=k)
+               for k in range(count)]
+    return FusionEnsemble(members, data, task)

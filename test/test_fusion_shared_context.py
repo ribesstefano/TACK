@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from fusion_fixtures import CELLS, SEQS, SMILES
+from fusion_fixtures import CELLS, SEQS, SMILES, build_ensemble
 from tackai.fusion.blocks import LEGACY_SCALE_BLOCKS, BlockPreprocessor
 from tackai.fusion.data import FusionData
 from tackai.fusion.ensemble import FusionEnsemble
@@ -23,12 +23,12 @@ def fast_gp(**kw):
 
 
 def fast_xgb(**kw):
-    return XGBoostFusion(n_estimators=20, grid=[{"max_depth": 3, "reg_lambda": 5.0}], **kw)
+    return XGBoostFusion(n_estimators=20, max_depth=3, reg_lambda=5.0, **kw)
 
 
 @pytest.fixture
 def fitted(data):
-    return FusionEnsemble.fit(fast_gp, data, task=TASK, n_members=3, n_folds=3)
+    return build_ensemble(fast_gp, data, task=TASK, n_members=3, n_folds=3)
 
 
 def make_members_disagree(members, data, order=None):
@@ -124,7 +124,7 @@ def test_a_missing_assay_time_is_imputed_from_the_consensus(fitted):  # Review F
 
 
 def test_gp_and_xgboost_members_share_the_context(data):  # Review Focus 5
-    ens = FusionEnsemble.fit([fast_gp, fast_xgb], data, task=TASK, n_folds=3)
+    ens = build_ensemble([fast_gp, fast_xgb], data, task=TASK, n_folds=3)
     ctx = ens.transform_context(CTX)
     assert ctx.per_member[0] is ctx.per_member[1]
     assert ctx.folds[0] is not None and ctx.folds[1] is None
@@ -135,7 +135,7 @@ def test_gp_and_xgboost_members_share_the_context(data):  # Review Focus 5
 
 
 def test_scaled_float64_members_from_the_old_code_still_load_and_score(data):  # Review Focus 1
-    ens = FusionEnsemble.fit(lambda **kw: fast_gp(dtype="float64", **kw), data, task=TASK,
+    ens = build_ensemble(lambda **kw: fast_gp(dtype="float64", **kw), data, task=TASK,
                              n_members=2, n_folds=3)
     make_members_disagree(ens.members, data)
     for member in ens.members:

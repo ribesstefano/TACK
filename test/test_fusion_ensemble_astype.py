@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from fusion_fixtures import CELLS, SEQS, SMILES
+from fusion_fixtures import CELLS, SEQS, SMILES, build_ensemble
 from tackai.fusion.data import FusionData
 from tackai.fusion.ensemble import FusionEnsemble
 from tackai.fusion.models import GPInteraction, XGBoostFusion
@@ -25,12 +25,12 @@ def fast_gp(**kw):
 
 
 def fast_xgb(**kw):
-    return XGBoostFusion(n_estimators=20, grid=[{"max_depth": 3, "reg_lambda": 5.0}], **kw)
+    return XGBoostFusion(n_estimators=20, max_depth=3, reg_lambda=5.0, **kw)
 
 
 @pytest.fixture
 def ens64(data):
-    return FusionEnsemble.fit(partial(fast_gp, dtype="float64"), data, task="pdc50",
+    return build_ensemble(partial(fast_gp, dtype="float64"), data, task="pdc50",
                               n_members=2, n_folds=3)
 
 
@@ -68,7 +68,7 @@ def test_the_manifest_records_the_precision(ens64, tmp_path):
 
 
 def test_astype_leaves_xgboost_members_working(data):
-    ens = FusionEnsemble.fit([fast_gp, fast_xgb], data, task="pdc50", n_folds=3)
+    ens = build_ensemble([fast_gp, fast_xgb], data, task="pdc50", n_folds=3)
     ens.astype("float64")
     assert np.isfinite(ens.predict(RECORDS).mean).all()
     assert ens.promoted == [False, False]

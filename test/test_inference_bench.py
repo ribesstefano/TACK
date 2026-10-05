@@ -12,6 +12,7 @@ import ensemble_inference_bench as bench  # noqa: E402
 from tackai.fusion.data import FusionData  # noqa: E402
 from tackai.fusion.ensemble import FusionEnsemble  # noqa: E402
 from tackai.fusion.models import GPInteraction  # noqa: E402
+from fusion_fixtures import build_ensemble
 
 
 def fast_gp(**kw):
@@ -21,7 +22,7 @@ def fast_gp(**kw):
 @pytest.fixture
 def small(fake_cache, tiny_csv):
     data = FusionData.from_csv([tiny_csv], cache=False)
-    ens = FusionEnsemble.fit(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
+    ens = build_ensemble(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
     return data, ens
 
 

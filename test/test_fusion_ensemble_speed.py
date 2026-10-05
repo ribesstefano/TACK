@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from fusion_fixtures import CELLS, SEQS, SMILES
+from fusion_fixtures import CELLS, SEQS, SMILES, build_ensemble
 from tackai.fusion.blocks import BlockPreprocessor
 from tackai.fusion.data import FusionData
 from tackai.fusion.ensemble import FusionEnsemble
@@ -23,7 +23,7 @@ def fast_gp(**kw):
 
 @pytest.fixture
 def ens(data):
-    return FusionEnsemble.fit(fast_gp, data, task="pdc50", n_members=3, n_folds=3)
+    return build_ensemble(fast_gp, data, task="pdc50", n_members=3, n_folds=3)
 
 
 def count_calls(monkeypatch, cls, name):
