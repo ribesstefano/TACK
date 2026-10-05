@@ -375,6 +375,8 @@ class AdditiveProductGP:
             for restart in range(n_restarts):
                 torch.manual_seed(seed * 1000 + restart)
                 params = self._init_params(np.random.default_rng(seed * 1000 + restart))
+                with torch.no_grad():       # start the free mean at the data's own, as y is not rescaled
+                    params["mean"].fill_(float(y_sub.mean()))
                 opt = torch.optim.Adam(params.values(), lr=lr)
                 for _ in range(n_iter):
                     opt.zero_grad()

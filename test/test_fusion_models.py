@@ -101,12 +101,19 @@ def test_gp_binary_std_is_a_probability_interval():
 
 
 @pytest.mark.parametrize("factory", FACTORIES)
-def test_constant_target_does_not_divide_by_zero(factory):  # Review Focus 3
-    X, _, g = synth()
-    y = np.full(len(X), 3.5)
+def test_no_target_scaling_is_recorded(factory):
+    """The GP learns its own mean and XGBoost is scale-indifferent; nothing rescales y."""
+    X, y, g = synth()
     est = factory(random_state=0).fit(X, y, g)
+    assert not hasattr(est, "y_mean_") and not hasattr(est, "y_std_")
+
+
+@pytest.mark.parametrize("factory", FACTORIES)
+def test_predictions_are_in_the_units_y_was_given_in(factory):
+    X, y, g = synth()
+    est = factory(random_state=0).fit(X, y + 500.0, g)
     pred = est.predict(X)
-    assert np.isfinite(pred).all() and np.allclose(pred, 3.5, atol=1e-3)
+    assert abs(pred.mean() - (y.mean() + 500.0)) < 0.5 * y.std()
 
 
 @pytest.mark.parametrize("factory", FACTORIES)

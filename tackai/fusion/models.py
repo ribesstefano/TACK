@@ -42,12 +42,13 @@ def slice_blocks(Z: Dict[str, np.ndarray], idx) -> Dict[str, np.ndarray]:
 
 
 class FusionEstimator(BaseEstimator, RegressorMixin):
-    """Fold-internal preprocessing, target standardisation and binary handling.
+    """Fold-internal preprocessing and binary handling.
 
     Subclasses implement ``_fit_model(Z, ys, groups, y_raw, hyper=None) -> (model, hyper)``
-    and ``_predict_model(model, Z, return_std=False)``, both in standardised-target units.
-    ``fit`` must be given the *training rows only*; ``predict`` returns original units, or a
-    calibrated probability of the positive class when ``task_type="binary"``.
+    and ``_predict_model(model, Z, return_std=False)``, both in the labels' own units (the
+    target is not rescaled). ``fit`` must be given the *training rows only*; ``predict``
+    returns those units, or a calibrated probability of the positive class when
+    ``task_type="binary"``.
 
     Args:
         task_type: ``"regression"`` or ``"binary"``.
@@ -93,14 +94,11 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
         """
         y = np.asarray(y, dtype=float)
         groups = np.arange(len(y)) if groups is None else np.asarray(groups)
-        self.y_mean_ = float(y.mean())
-        self.y_std_ = float(y.std()) or 1.0        # a constant target must not divide by zero
         self.pre_ = self._make_preprocessor().fit(X)
         Z = self.pre_.transform(X)
-        ys = (y - self.y_mean_) / self.y_std_
-        self.model_, self.hyper_ = self._fit_model(Z, ys, groups, y)
+        self.model_, self.hyper_ = self._fit_model(Z, y, groups, y)
         if self.task_type == "binary" and not self.native_binary:
-            self._fit_calibrator(Z, ys, groups, y)
+            self._fit_calibrator(Z, y, groups, y)
         self._after_fit()
         return self
 
@@ -175,8 +173,7 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
         score = np.asarray(score)
         zeros = np.zeros(len(score))
         if self.task_type != "binary":
-            value = score * self.y_std_ + self.y_mean_
-            return value, (std * self.y_std_ if std is not None else zeros)
+            return score, (std if std is not None else zeros)
         if self.native_binary:
             return np.clip(score, 0.0, 1.0), (std if std is not None else zeros)
         if getattr(self, "single_class_", None) is not None:
@@ -323,7 +320,7 @@ class XGBoostFusion(FusionEstimator):
 
     def _fit_model(self, Z, ys, groups, y_raw, hyper=None):
         A = self.pre_.concat(Z)
-        target = np.asarray(y_raw, float) if self.task_type == "binary" else ys
+        target = np.asarray(ys, float)
         grid = list(self.grid) if self.grid else list(self.GRID)
         if hyper is None:
             if len(grid) > 1:
