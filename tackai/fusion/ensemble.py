@@ -126,6 +126,8 @@ class FusionEnsemble:
     def __init__(self, members: Sequence, data: FusionData, task: str,
                  weights: Optional[Union[Sequence[float], Dict[str, float]]] = None,
                  shared_context: bool = True):
+        if task not in TASK_TYPES:
+            raise ValueError(f"task must be one of {sorted(TASK_TYPES)}, got {task!r}")
         self.members = list(members)
         self.data = data
         self.task = task

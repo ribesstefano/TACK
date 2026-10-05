@@ -74,9 +74,9 @@ def fit_member(factory, X, y, train=None, *, groups=None, early_stopping: bool =
                random_state: int = 0):
     """Fit one ensemble member on the rows ``train``.
 
-    This is the whole per-member recipe, and it is deliberately short: check the labels, build
-    the estimator, optionally carve an early-stopping set out of the training rows, fit. An
-    ensemble-level loop over folds calls this once per member.
+    This is the whole per-member recipe, and it is deliberately short: build the estimator,
+    optionally carve an early-stopping set out of the training rows, check the labels of the
+    rows it will actually fit, fit. An ensemble-level loop over folds calls this once per member.
 
     Args:
         factory: Callable returning a fresh estimator, called with ``random_state`` alone. Bake
@@ -85,28 +85,34 @@ def fit_member(factory, X, y, train=None, *, groups=None, early_stopping: bool =
         X: Full design matrix.
         y: Full label vector, in the units the member should report.
         train: Row indices to train on; defaults to every row.
-        groups: Scaffold group id per row. Required when ``early_stopping`` is set, so the
+        groups: Scaffold group id per row. Required for a member that early-stops, so the
             validation rows share no scaffold with the rows the model fits.
-        early_stopping: Hold out a grouped fraction of ``train`` and pass it to the estimator
-            as a validation set, for a model that can early-stop on it.
+        early_stopping: Hold out a grouped fraction of the groups in ``train`` and pass those
+            rows to the estimator as a validation set. Applies only to an estimator that
+            early-stops (``early_stops``); any other is fitted on every training row, since it
+            would ignore a validation set and the rows would be thrown away for nothing.
         random_state: Seed, forwarded to the factory and to the validation split.
 
     Returns:
         The fitted estimator.
 
     Raises:
-        ValueError: If the training labels -- or, with early stopping, the validation labels --
-            cannot be learned from, or if ``early_stopping`` is set without ``groups``.
+        ValueError: If the labels of the rows to fit -- or, for a classifier, of the validation
+            rows -- cannot be learned from, or if an early-stopping member is given no
+            ``groups``.
     """
     train = np.arange(len(y)) if train is None else np.asarray(train)
     estimator = factory(random_state=random_state)
-    check_labels(y[train], estimator.task_type, "training labels")
-    if not early_stopping:
-        return estimator.fit(X[train], y[train])
-    if groups is None:
-        raise ValueError("early_stopping needs groups, so the validation rows share no "
-                         "scaffold with the rows the model fits")
-    inner, val = validation_split(np.asarray(groups)[train], random_state=random_state)
-    check_labels(y[train[val]], estimator.task_type, "validation labels")
-    return estimator.fit(X[train[inner]], y[train[inner]],
-                         validation=(X[train[val]], y[train[val]]))
+    fit_rows, val_rows = train, None
+    if early_stopping and estimator.early_stops:
+        if groups is None:
+            raise ValueError("early_stopping needs groups, so the validation rows share no "
+                             "scaffold with the rows the model fits")
+        inner, val = validation_split(np.asarray(groups)[train], random_state=random_state)
+        fit_rows, val_rows = train[inner], train[val]
+    check_labels(y[fit_rows], estimator.task_type, "training labels")
+    if val_rows is None:
+        return estimator.fit(X[fit_rows], y[fit_rows])
+    if estimator.task_type == "binary":     # a regression error is measurable on a constant
+        check_labels(y[val_rows], "binary", "validation labels")
+    return estimator.fit(X[fit_rows], y[fit_rows], validation=(X[val_rows], y[val_rows]))

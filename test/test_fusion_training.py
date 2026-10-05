@@ -149,3 +149,33 @@ def test_the_training_helpers_are_exported():
     import tackai.fusion as fusion
     for name in ("check_labels", "validation_split", "fit_member"):
         assert hasattr(fusion, name) and name in fusion.__all__
+
+
+def test_fit_member_does_not_starve_a_model_that_cannot_early_stop():
+    """A GP ignores a validation set, so carving one out would only throw rows away."""
+    X, y, g = synth(n=150)
+    est = fit_member(fast_gp, X, y, groups=g, early_stopping=True, random_state=0)
+    assert est.model_.n_train_ == len(y)
+
+
+def test_fit_member_accepts_a_constant_regression_validation_set():
+    """A constant validation target still has a measurable error; only a classifier needs two."""
+    X, y, g = synth(n=150)
+    _, val = validation_split(g, random_state=0)
+    y = y.copy()
+    y[val] = 3.5
+    est = fit_member(fast_xgb, X, y, groups=g, early_stopping=True, random_state=0)
+    assert est.model_.best_iteration is not None
+
+
+def test_fit_member_checks_the_rows_it_actually_fits():
+    """Mixed overall, but the rows left after the validation split are all one class."""
+    X, y, g = synth(n=150, binary=True)
+    inner, val = validation_split(g, random_state=0)
+    y = y.copy()
+    y[inner] = 1.0
+    y[val[: len(val) // 2]] = 0.0
+    y[val[len(val) // 2:]] = 1.0
+    with pytest.raises(ValueError, match="training labels"):
+        fit_member(partial(fast_xgb, task_type="binary"), X, y, groups=g,
+                   early_stopping=True, random_state=0)

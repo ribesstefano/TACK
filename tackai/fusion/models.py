@@ -35,6 +35,7 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
     """
 
     native_binary = False      # True when the model itself outputs probabilities
+    early_stops = False        # True when the model uses a validation set to stop early
 
     def __init__(self, task_type: str = "regression",
                  blocks: Optional[Dict[str, np.ndarray]] = None, random_state: int = 0,
@@ -237,6 +238,7 @@ class XGBoostFusion(FusionEstimator):
     """
 
     native_binary = True
+    early_stops = True
 
     def __init__(self, task_type: str = "regression",
                  blocks: Optional[Dict[str, np.ndarray]] = None, random_state: int = 0,

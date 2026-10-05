@@ -278,3 +278,10 @@ def test_astype_keeps_the_calibrator(data):
     assert ens.members[0].calibrator_ is before
     pred = ens.predict_matrix(X)
     assert ((pred.mean >= 0) & (pred.mean <= 1)).all()
+
+
+def test_an_unknown_task_is_refused_at_construction(data):
+    """A typo must fail here, not as a bare KeyError at predict time after the fitting."""
+    ens = build_ensemble(fast_gp, data, "pdc50", n_members=1, n_folds=3)
+    with pytest.raises(ValueError, match="task must be one of"):
+        FusionEnsemble(ens.members, data, "pdc500")
