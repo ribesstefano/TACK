@@ -1,5 +1,6 @@
 """The generic ensemble: shared input for every member, cached context, from_pretrained."""
 import json
+from functools import partial
 
 import numpy as np
 import pytest
@@ -48,13 +49,22 @@ def test_context_path_agrees_with_the_ordinary_path(data):
     context-only kernel terms into two vectors, which sums the same quantities in a different
     order. Bitwise equality would mean the fast path was not actually taking a shortcut.
     """
-    ens = FusionEnsemble.fit(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
+    ens = FusionEnsemble.fit(partial(fast_gp, dtype="float64"), data, task="pdc50", n_members=2, n_folds=3)
     ctx = ens.transform_context(CTX)
     fast = ens.predict(SMILES[:4], context=ctx)
     slow = ens.predict([{"smiles": s, **CTX} for s in SMILES[:4]])
     assert np.allclose(fast.mean, slow.mean, rtol=1e-10, atol=1e-12)
     assert np.allclose(fast.std, slow.std, rtol=1e-10, atol=1e-12)
     assert all(fold is not None for fold in ctx.folds), "GP members should fold their context"
+
+
+def test_context_path_agrees_with_the_ordinary_path_in_float32(data):
+    ens = FusionEnsemble.fit(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
+    ctx = ens.transform_context(CTX)
+    fast = ens.predict(SMILES[:4], context=ctx)
+    slow = ens.predict([{"smiles": s, **CTX} for s in SMILES[:4]])
+    assert np.allclose(fast.mean, slow.mean, rtol=1e-3, atol=1e-3)
+    assert np.allclose(fast.std, slow.std, atol=2e-3)
 
 
 def test_std_combines_member_variance_and_member_spread(data):

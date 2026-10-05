@@ -5,7 +5,7 @@ the block preprocessing is fitted on the training rows only, the target is stand
 a regression model used for the binary task is calibrated on scaffold-grouped out-of-fold
 scores. Subclasses only have to fit a model to processed blocks and score new ones.
 """
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence
 
 import numpy as np
 import xgboost as xgb
@@ -53,15 +53,18 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
         task_type: ``"regression"`` or ``"binary"``.
         blocks: Block column indices (default: the standard contiguous layout).
         random_state: Seed for every stochastic component.
+        dtype: Floating-point type of the processed blocks and, for a GP, of the model.
     """
 
     native_binary = False      # True when the model itself outputs probabilities
 
     def __init__(self, task_type: str = "regression",
-                 blocks: Optional[Dict[str, np.ndarray]] = None, random_state: int = 0):
+                 blocks: Optional[Dict[str, np.ndarray]] = None, random_state: int = 0,
+                 dtype: str = "float32"):
         self.task_type = task_type
         self.blocks = blocks
         self.random_state = random_state
+        self.dtype = dtype
 
     @property
     def supports_std(self) -> bool:
@@ -69,7 +72,7 @@ class FusionEstimator(BaseEstimator, RegressorMixin):
         return False
 
     def _make_preprocessor(self) -> BlockPreprocessor:
-        return BlockPreprocessor(blocks=self.blocks)
+        return BlockPreprocessor(blocks=self.blocks, dtype=self.dtype)
 
     def fit(self, X, y, groups=None) -> "FusionEstimator":
         """Fit on the training rows of one fold.
@@ -198,14 +201,17 @@ class GPInteraction(FusionEstimator):
         lr: Adam learning rate.
         max_hyper_points: Rows used to fit the hyper-parameters; the exact GP that follows
             conditions on every training row.
+        dtype: Precision of the processed blocks and of the GP (``"float32"`` or ``"float64"``).
     """
 
     def __init__(self, task_type: str = "regression",
                  blocks: Optional[Dict[str, np.ndarray]] = None, random_state: int = 0,
                  interactions: Sequence[str] = DEFAULT_INTERACTIONS,
                  ard_blocks: Sequence[str] = ("descriptors",), n_restarts: int = 3,
-                 n_iter: int = 60, lr: float = 0.1, max_hyper_points: int = 1200):
-        super().__init__(task_type=task_type, blocks=blocks, random_state=random_state)
+                 n_iter: int = 60, lr: float = 0.1, max_hyper_points: int = 1200,
+                 dtype: str = "float32"):
+        super().__init__(task_type=task_type, blocks=blocks, random_state=random_state,
+                         dtype=dtype)
         self.interactions = interactions
         self.ard_blocks = ard_blocks
         self.n_restarts = n_restarts
@@ -219,7 +225,7 @@ class GPInteraction(FusionEstimator):
 
     def _fit_model(self, Z, ys, groups, y_raw, hyper=None):
         gp = AdditiveProductGP(self.pre_.dims_, interactions=self.interactions,
-                               ard_blocks=self.ard_blocks)
+                               ard_blocks=self.ard_blocks, dtype=self.dtype)
         state = gp.fit(Z, ys, n_restarts=self.n_restarts, n_iter=self.n_iter, lr=self.lr,
                        seed=self.random_state, max_hyper_points=self.max_hyper_points,
                        state=hyper)
@@ -248,6 +254,7 @@ class XGBoostFusion(FusionEstimator):
         n_estimators: Boosting rounds before early stopping.
         learning_rate: Boosting learning rate.
         n_jobs: XGBoost threads.
+        dtype: Precision the blocks are prepared in (XGBoost itself works in float32).
     """
 
     native_binary = True
@@ -256,8 +263,9 @@ class XGBoostFusion(FusionEstimator):
     def __init__(self, task_type: str = "regression",
                  blocks: Optional[Dict[str, np.ndarray]] = None, random_state: int = 0,
                  grid: Optional[Sequence[dict]] = None, n_estimators: int = 400,
-                 learning_rate: float = 0.05, n_jobs: int = 1):
-        super().__init__(task_type=task_type, blocks=blocks, random_state=random_state)
+                 learning_rate: float = 0.05, n_jobs: int = 1, dtype: str = "float32"):
+        super().__init__(task_type=task_type, blocks=blocks, random_state=random_state,
+                         dtype=dtype)
         self.grid = grid
         self.n_estimators = n_estimators
         self.learning_rate = learning_rate
