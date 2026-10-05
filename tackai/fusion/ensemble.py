@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Union
 import numpy as np
 import pandas as pd
 
-from tackai.fusion.blocks import BLOCK_ORDER
+from tackai.fusion.blocks import BLOCK_ORDER, BlockPreprocessor
 from tackai.fusion.context import CONTEXT_BLOCKS, ContextEncoder
 from tackai.fusion.data import TASK_LABELS, TASK_SUPPORT, TASK_TYPES, FusionData
 from tackai.fusion.features import MolFeaturizer
@@ -116,15 +116,21 @@ class FusionEnsemble:
         data: The :class:`FusionData` whose encoder and layout the members were fitted with.
         task: Task name (``"dmax"``, ``"pdc50"`` or ``"activity"``).
         weights: Member weights (default: equal).
+        shared_context: Score every member through the consensus of their context
+            preprocessors, so the members cannot disagree about the context whatever folds
+            they were fitted on. ``False`` restores each member's own context transform.
     """
 
     def __init__(self, members: Sequence, data: FusionData, task: str,
-                 weights: Optional[Union[Sequence[float], Dict[str, float]]] = None):
+                 weights: Optional[Union[Sequence[float], Dict[str, float]]] = None,
+                 shared_context: bool = True):
         self.members = list(members)
         self.data = data
         self.task = task
         self.names = [f"member_{i:02d}" for i in range(len(self.members))]
         self.set_weights(weights)
+        self.shared_context = shared_context
+        self.context_pre_ = self._build_context_pre() if shared_context else None
 
     # ---------------------------------------------------------------- construction
 
@@ -182,7 +188,8 @@ class FusionEnsemble:
     @classmethod
     def from_pretrained(cls, model_id: Union[str, Path], *, revision: Optional[str] = None,
                         token: Optional[str] = None,
-                        data: Optional[FusionData] = None) -> "FusionEnsemble":
+                        data: Optional[FusionData] = None,
+                        shared_context: bool = True) -> "FusionEnsemble":
         """Load a saved ensemble from a local directory or a Hugging Face Hub repo.
 
         Args:
@@ -191,6 +198,8 @@ class FusionEnsemble:
             token: Hub token, for a private repo.
             data: Reuse this :class:`FusionData` instead of rebuilding an encoder-only one
                 from the manifest (inference needs only the encoder and the layout).
+            shared_context: Score every member through the consensus of their context
+                preprocessors (see :class:`FusionEnsemble`).
 
         Returns:
             The loaded ensemble.
@@ -209,7 +218,8 @@ class FusionEnsemble:
                                        fp_size=manifest["fingerprint"][1])
             data = FusionData(encoder=encoder, featurizer=featurizer)
         cls._check_layout(manifest, data, members)
-        return cls(members, data, manifest["task"], weights=manifest.get("weights"))
+        return cls(members, data, manifest["task"], weights=manifest.get("weights"),
+                   shared_context=shared_context)
 
     @staticmethod
     def _check_layout(manifest: dict, data: FusionData, members: Sequence) -> None:
@@ -317,6 +327,38 @@ class FusionEnsemble:
         """The tasks this ensemble can predict (one, the task it was fitted on)."""
         return [self.task]
 
+    @property
+    def _context_blocks(self) -> List[str]:
+        """The context blocks, in design-matrix order."""
+        return [b for b in BLOCK_ORDER if b in CONTEXT_BLOCKS]
+
+    def _build_context_pre(self) -> BlockPreprocessor:
+        """The one context transform every member uses: the consensus of their own.
+
+        Raises:
+            ValueError: If the members disagree about a context block's columns, width or
+                whether it is standardised (they were not fitted with one setting).
+        """
+        return BlockPreprocessor.consensus([m.pre_ for m in self.members],
+                                           only=self._context_blocks)
+
+    def _iter_member_blocks(self, X: np.ndarray):
+        """Each member's processed blocks for the rows ``X``, one member at a time.
+
+        With a shared context the context blocks are transformed once and handed to every
+        member; the molecular blocks always go through the member's own preprocessor, since
+        they were fitted on raw molecular columns. A generator, so a large batch never holds
+        every member's copy at once.
+        """
+        if self.context_pre_ is None:
+            for member in self.members:
+                yield member.pre_.transform(X)
+            return
+        shared = self.context_pre_.transform_blocks(X, only=self._context_blocks)
+        molecular = [b for b in BLOCK_ORDER if b not in CONTEXT_BLOCKS]
+        for member in self.members:
+            yield {**member.pre_.transform_blocks(X, only=molecular), **shared}
+
     # ---------------------------------------------------------------- context cache
 
     def transform_context(self, record: dict) -> FusionContext:
@@ -338,8 +380,13 @@ class FusionEnsemble:
         values = self.data.encode_context(record)
         row = np.zeros((1, self.data.n_columns), dtype=np.float64)
         row[:, self.data.context_columns] = values
-        context_blocks = [b for b in BLOCK_ORDER if b in CONTEXT_BLOCKS]
-        per_member = [m.pre_.transform_blocks(row, only=context_blocks) for m in self.members]
+        context_blocks = self._context_blocks
+        if self.context_pre_ is not None:
+            shared = self.context_pre_.transform_blocks(row, only=context_blocks)
+            per_member = [shared for _ in self.members]
+        else:
+            per_member = [m.pre_.transform_blocks(row, only=context_blocks)
+                          for m in self.members]
         folds = [self._fold_member(member, blocks)
                  for member, blocks in zip(self.members, per_member)]
         return FusionContext(values=values, per_member=per_member, source=dict(record),
@@ -407,13 +454,13 @@ class FusionEnsemble:
         X = np.asarray(X)
         n = len(X)
         ok = np.ones(n, dtype=bool)
+        blocks = self._iter_member_blocks(X) if n else iter([None] * len(self.members))
         per_member = []
-        for member in self.members:
+        for member, Z in zip(self.members, blocks):
             if n == 0:
                 per_member.append((np.empty(0), np.empty(0)))
-                continue
-            Z = member.pre_.transform(X)
-            per_member.append(self._member_scores(member, Z, return_std))
+            else:
+                per_member.append(self._member_scores(member, Z, return_std))
         return self._aggregate(per_member, ok, [None] * n, return_individual)
 
     def _predict_with_context(self, smiles: List[str], context: FusionContext,
@@ -502,11 +549,12 @@ class FusionEnsemble:
         X, ok = self.data.encode(records, return_ok=True)
         valid = np.flatnonzero(ok)
         Xv = X if len(valid) == n else X[valid]
+        blocks = (self._iter_member_blocks(Xv) if len(valid)
+                  else iter([None] * len(self.members)))
         per_member = []
-        for member in self.members:
+        for member, Z in zip(self.members, blocks):
             mean, std = np.full(n, np.nan), np.zeros(n)
             if len(valid):
-                Z = member.pre_.transform(Xv)
                 mean[valid], std[valid] = self._member_scores(member, Z, return_std)
             per_member.append((mean, std))
         return ok, per_member
