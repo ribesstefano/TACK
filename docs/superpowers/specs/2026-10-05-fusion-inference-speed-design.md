@@ -178,3 +178,37 @@ measurable in a single run through the `shared_context`, `dtype` and `scale_bloc
   ensembles score with semantics they were not fitted under. Anything that consumes
   `ensembles/fusion_*` for a scientific number in that window gets worse answers than the
   published ones. Flagged here so the retrain is not forgotten.
+
+## Plan amendments (2026-10-05)
+
+Writing the implementation plan (`docs/superpowers/plans/2026-10-05-fusion-inference-speed.md`)
+refined the design in these places. Where this section and the text above disagree, this
+section wins.
+
+- **Jitter ladder.** float32 tries 1e-5, 1e-4, 1e-3 and then promotes to float64 (whose ladder
+  is the original 1e-6 .. 1e-2), instead of climbing to 1e-1. Promoting distorts the model less
+  than a 100x larger jitter.
+- **Promotion is partial.** It refactorises the float32-assembled kernel in float64, which
+  removes the factorisation's own rounding error but not the rounding already in the stored
+  kernel. If the notebook reports promoted members, the follow-up is to reassemble the kernel
+  in float64. This weakens the "mitigated by float64 promotion" line in Risks.
+- **A seventh redundancy, R7.** With no scaler, the molecular transform is identical for every
+  member (the imputer is a no-op on NaN-free features), yet it was repeated per member. The
+  ensemble now transforms it once per distinct `transform_signature`, and only when the batch
+  has no NaN.
+- **`models.py` changes after all.** `FusionEstimator`, `GPInteraction` and `XGBoostFusion` gain a
+  `dtype` parameter (default `"float32"`) so one knob reaches the preprocessor and the GP.
+- **`FusionData.encode(records, return_ok=False)`** rather than returning `(X, ok)` always, so
+  existing callers keep working.
+- **New ensemble surface:** `FusionEnsemble.astype(dtype)` (re-condition GP members in another
+  precision, in place), `FusionEnsemble.promoted`, `from_pretrained(..., dtype=None,
+  shared_context=True)`, and a `"dtype"` entry in the manifest. `astype` is what lets the
+  float64 artifacts on disk be benchmarked in float32 without a refit.
+- **Baseline holds out real rows.** The saved ensembles were fitted on the pool of split 0, so
+  the baseline records the score on that split's held-out fold, and the notebook compares it
+  with the new configurations on the same rows.
+- **Four configurations, not two.** The notebook separates A (float64, per-member context),
+  B (float64, shared), C (float32, per-member) and D (float32, shared), so redundancy removal,
+  the shared context and float32 each get their own number.
+- **Notebook extras:** the stage breakdown is measured by wrapping methods (exclusive times)
+  rather than by `cProfile` alone; a `cProfile` table of the new code is included as well.
