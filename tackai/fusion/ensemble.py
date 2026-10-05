@@ -420,24 +420,22 @@ class FusionEnsemble:
                               return_std: bool):
         """Fast path: featurise the molecules, reuse each member's transformed context."""
         n = len(smiles)
-        ok = np.zeros(n, dtype=bool)
-        per_member = []
         if n == 0:
-            return ok, [(np.empty(0), np.empty(0)) for _ in self.members]
+            return np.zeros(0, dtype=bool), [(np.empty(0), np.empty(0)) for _ in self.members]
 
         fp, desc, ok = self.data.featurizer.featurize(smiles)
         valid = np.flatnonzero(ok)
-        mol_row = np.zeros((n, self.data.n_columns), dtype=np.float64)
-        mol_row[:, self.data.index["fingerprint"]] = fp
-        mol_row[:, self.data.index["descriptors"]] = desc
+        if len(valid) < n:                       # copy only when something is invalid
+            fp, desc = fp[valid], desc[valid]
+        molecular = self._molecular_blocks(fp, desc) if len(valid) else None
 
         folds = context.folds or [None] * len(self.members)
-        for member, ctx_blocks, fold in zip(self.members, context.per_member, folds):
-            mean = np.full(n, np.nan)
-            std = np.zeros(n)
+        per_member = []
+        for k, (member, ctx_blocks, fold) in enumerate(zip(self.members, context.per_member,
+                                                           folds)):
+            mean, std = np.full(n, np.nan), np.zeros(n)
             if len(valid):
-                Z = dict(member.pre_.transform_blocks(mol_row[valid], only=["fingerprint",
-                                                                            "descriptors"]))
+                Z = dict(molecular[k])           # a copy: the molecular dict may be shared
                 if fold is not None:
                     mean[valid], std[valid] = self._folded_scores(member, Z, fold, return_std)
                 else:
@@ -446,6 +444,37 @@ class FusionEnsemble:
                     mean[valid], std[valid] = self._member_scores(member, Z, return_std)
             per_member.append((mean, std))
         return ok, per_member
+
+    def _molecular_blocks(self, fp: np.ndarray, desc: np.ndarray) -> List[Dict[str, np.ndarray]]:
+        """Each member's processed molecular blocks, computed once per distinct transform.
+
+        Members whose preprocessors treat a molecular block identically (no scaler, same
+        width and dtype) get the same array. That is only exact on NaN-free input, where the
+        per-member imputer does nothing; the featuriser never emits NaN (it uses a sentinel),
+        but if one appears every member transforms for itself. The arrays are shared between
+        members, so nothing downstream may write into them.
+
+        Args:
+            fp: Fingerprints of the valid molecules.
+            desc: Descriptors of the valid molecules.
+
+        Returns:
+            One ``{"fingerprint", "descriptors"}`` dict per member.
+        """
+        raw = {"fingerprint": fp, "descriptors": desc}
+        shareable = not (np.isnan(fp).any() or np.isnan(desc).any())
+        done, out = {}, []
+        for member in self.members:
+            pre = member.pre_
+            key = tuple(pre.transform_signature(b) for b in raw) if shareable else None
+            if key is None or key not in done:
+                Z = {b: pre.transform_block(b, arr) for b, arr in raw.items()}
+                if key is not None:
+                    done[key] = Z
+            else:
+                Z = done[key]
+            out.append(Z)
+        return out
 
     def _folded_scores(self, member, mol_blocks: Dict[str, np.ndarray], fold: dict,
                        return_std: bool):
@@ -470,15 +499,14 @@ class FusionEnsemble:
         if n == 0:
             return np.zeros(0, dtype=bool), [(np.empty(0), np.empty(0)) for _ in self.members]
 
-        X = self.data.encode(records)
-        _, _, ok = self.data.featurizer.featurize([r.get("smiles") for r in records])
+        X, ok = self.data.encode(records, return_ok=True)
         valid = np.flatnonzero(ok)
+        Xv = X if len(valid) == n else X[valid]
         per_member = []
         for member in self.members:
-            mean = np.full(n, np.nan)
-            std = np.zeros(n)
+            mean, std = np.full(n, np.nan), np.zeros(n)
             if len(valid):
-                Z = member.pre_.transform(X[valid])
+                Z = member.pre_.transform(Xv)
                 mean[valid], std[valid] = self._member_scores(member, Z, return_std)
             per_member.append((mean, std))
         return ok, per_member

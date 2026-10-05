@@ -143,7 +143,7 @@ def _first_valid(*series: pd.Series) -> pd.Series:
 def build_table(files: Sequence[Union[str, Path]]) -> pd.DataFrame:
     """Read and harmonise the curated CSVs into one row-per-measurement table.
 
-    Handles both layouts in ``data/yaochen`` (AutoTPD+ and TACKv2), drops rows without a
+    Handles both layouts in AutoTPD+ and TACKv2, drops rows without a
     SMILES, and fills a missing POI sequence from the most frequent sequence recorded for the
     same UniProt entry. No de-duplication: repeated measurements are repeated rows.
 
@@ -394,7 +394,7 @@ class FusionData:
 
     # ---------------------------------------------------------------- inference
 
-    def encode(self, records: Union[Sequence[dict], pd.DataFrame]) -> np.ndarray:
+    def encode(self, records: Union[Sequence[dict], pd.DataFrame], return_ok: bool = False):
         """Encode inference records into rows of the design matrix.
 
         Molecular features are computed on the fly; context blocks are looked up in the
@@ -403,17 +403,21 @@ class FusionData:
         Args:
             records: Dicts (or a DataFrame) with ``smiles``, ``poi_seq``, ``e3_seq``,
                 ``cell_id``, ``assay`` and optionally ``assay_time``.
+            return_ok: Also return which rows' SMILES RDKit could parse, so a caller that
+                needs it does not featurise a second time to find out.
 
         Returns:
-            Array of shape ``(len(records), n_columns)``, ``float32``.
+            Array of shape ``(len(records), n_columns)``, ``float32``; with ``return_ok``,
+            ``(array, ok)``.
         """
         if isinstance(records, pd.DataFrame):
             records = records.to_dict("records")
         records = list(records)
         if not records:
-            return np.empty((0, self.n_columns), dtype=np.float32)
+            empty = np.empty((0, self.n_columns), dtype=np.float32)
+            return (empty, np.empty(0, dtype=bool)) if return_ok else empty
 
-        fp, desc, _ = self.featurizer.featurize([r.get("smiles") for r in records])
+        fp, desc, ok = self.featurizer.featurize([r.get("smiles") for r in records])
         blocks = {"fingerprint": fp, "descriptors": desc}
         blocks["e3"] = self.encoder.encode("e3", [r.get("e3_seq") for r in records])
         blocks["cell"] = self.encoder.encode(
@@ -423,7 +427,8 @@ class FusionData:
         blocks["assay_time"] = np.array(
             [[np.nan if r.get("assay_time") is None else float(r["assay_time"])] for r in records],
             dtype=np.float32)
-        return np.concatenate([blocks[b] for b in BLOCK_ORDER], axis=1).astype(np.float32)
+        X = np.concatenate([blocks[b] for b in BLOCK_ORDER], axis=1).astype(np.float32)
+        return (X, ok) if return_ok else X
 
     def encode_context(self, record: dict) -> np.ndarray:
         """Encode one experimental context, for reuse across many molecules.
