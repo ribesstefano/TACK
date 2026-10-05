@@ -68,7 +68,7 @@ fitted scaler per member per block, and is useless to the tree members planned n
 | Preprocessor statistics | **Fitted in float64, applied in float32** | A raw `Ipc` descriptor near 1e18 would lose the imputer mean entirely if the mean were accumulated in float32. Fit happens once; transform happens per batch |
 | Jitter ladder | Scales with dtype: float32 starts 1e-5, ceiling 1e-1; float64 keeps 1e-6, ceiling 1e-2 | float32 eps ≈ 1.2e-7, so a 1e-6 jitter is below the noise of a unit-scale kernel |
 | Context scaling | `scale_blocks` defaults to `()` — no dense block is standardised | User's call; inputs are pre-PCA'd and the planned XGBoost members ignore scaling |
-| `assay_time` scaling | **Kept standardised** | It is the one context block that is *not* PCA-reduced — raw hours, 0-168, feeding a *linear* kernel where absolute magnitude sets the term's weight. Overturnable on review |
+| `assay_time` scaling | **Dropped too** — no block is standardised anywhere in the pipeline | User's call, 2026-10-05, overriding the first draft. Consequence: `assay_time` is raw, uncentred hours (0-168) feeding a *linear* kernel, so `<x,x>` lands at 1e2-1e4 and the term's log-scale parameter has to absorb ~4 orders of magnitude to stay comparable with the unit-scale RBFs. It *can* — `sc:linear:assay_time` is a free parameter — but the marginal-likelihood surface is worse conditioned for it, in float32 especially. The later hyper-parameter optimisation should cover the linear term's scale range explicitly |
 | `÷ sqrt(width)` | Kept for every dense block | A deterministic constant, not a fitted statistic; it stops a 1024-wide block dominating a shared-lengthscale kernel, and is monotone per column so trees are unaffected |
 | Canonical context | **Consensus over members**: per block, the mean of the fitted imputer statistics and, when present, of the scaler `mean_`/`scale_` | User's call. Independent of any single fold, needs no extra data, and works on the artifacts already on disk. Rejected: member 0's preprocessor (tied to one fold); a full-dataset refit (forces a manifest migration for no measured gain) |
 | Scope of the canonical context | All three prediction paths — cached-context, records, and `predict_matrix` | "The same context on all members" has to hold however the batch arrived, or two paths disagree |
@@ -100,7 +100,9 @@ shift on held-out rows, per task, against the current per-member behaviour.
 
 ## Changes by file
 
-- **`tackai/fusion/blocks.py`** — `scale_blocks` default `()`; fit statistics in float64 and
+- **`tackai/fusion/blocks.py`** — no block is standardised: `scale_blocks` defaults to `()` and
+  the `SMALL_BLOCKS` branch drops its scaler, leaving `assay_time` median-imputed only; fit
+  statistics in float64 and
   transform to a configurable dtype defaulting to float32; slice views for contiguous blocks;
   skip the imputer for a block fitted with no missing values; fuse the remaining passes.
   New: a constructor for a consensus preprocessor from several fitted ones.
