@@ -59,8 +59,21 @@ CONTEXT_FILES: Dict[str, Dict[str, str]] = {
     },
 }
 
+#: Hugging Face Hub dataset repo published by scripts/publish_fusion_context.py and read by
+#: FusionData.from_pretrained(). A dataset repo, not a model repo: these tables are an input
+#: to every fusion model, never the output of one.
+DEFAULT_CONTEXT_REPO = "ailab-bio/TACK-fusion-context"
+
 CONTEXT_BLOCKS = ("e3", "cell", "poi", "assay", "assay_time")
+#: Assay duration [h] used where a measurement does not record one. A fixed constant on
+#: purpose: nothing about it is learned from the training rows.
+ASSAY_TIME_DEFAULT = 24.0
 SEQUENCE_BLOCKS = ("poi", "e3")
+
+
+def assay_time_or_default(value) -> float:
+    """The assay duration in hours, or :data:`ASSAY_TIME_DEFAULT` when it is not recorded."""
+    return ASSAY_TIME_DEFAULT if _is_missing(value) else float(value)
 
 
 def _is_missing(value) -> bool:
@@ -185,6 +198,15 @@ class ContextEncoder:
             return 1
         return int(next(iter(self.table(block).values())).shape[0])
 
+    @property
+    def dims(self) -> Dict[str, int]:
+        """Width of every context block, discovered from the cached tables.
+
+        Loads each table once (they are kept), so this is where a change of a PCA width in the
+        cache becomes visible.
+        """
+        return {b: self.dim(b) for b in CONTEXT_BLOCKS}
+
     def _pca(self, block: str):
         """``(mean_, components_)`` of the block's cached PCA."""
         side = np.load(self.cache_dir / self.files(block)["pca_model"])
@@ -300,8 +322,8 @@ class ContextEncoder:
                 ``assay`` and optionally ``assay_time``.
 
         Returns:
-            Mapping of block name to a ``(1, dim)`` array; a missing ``assay_time`` is NaN,
-            which the preprocessor imputes with the training median.
+            Mapping of block name to a ``(1, dim)`` array; a missing ``assay_time`` becomes
+            :data:`ASSAY_TIME_DEFAULT`.
         """
         cell = record.get("cell_id", record.get("cell_key"))
         time = record.get("assay_time")
@@ -310,5 +332,5 @@ class ContextEncoder:
             "cell": self.encode("cell", [cell]),
             "poi": self.encode("poi", [record.get("poi_seq")]),
             "assay": self.encode("assay", [record.get("assay")]),
-            "assay_time": np.array([[np.nan if _is_missing(time) else float(time)]], dtype=np.float32),
+            "assay_time": np.array([[assay_time_or_default(time)]], dtype=np.float32),
         }
