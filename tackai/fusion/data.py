@@ -8,6 +8,7 @@ screening loop can score molecules that did not exist when the models were fitte
 """
 import hashlib
 import json
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -18,9 +19,10 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 from sklearn.model_selection import StratifiedGroupKFold
 
 from tackai.data.utils import get_cache_dir
-from tackai.fusion.blocks import BLOCK_ORDER, block_index
-from tackai.fusion.context import CONTEXT_BLOCKS, ContextEncoder
-from tackai.fusion.features import FP_RADIUS, FP_SIZE, MolFeaturizer
+from tackai.fusion.context import (CONTEXT_BLOCKS, DEFAULT_CONTEXT_REPO, SEQUENCE_BLOCKS,
+                                   ContextEncoder, assay_time_or_default)
+from tackai.fusion.mol_encoder import (DESCRIPTOR_NAMES, FP_RADIUS, FP_SIZE, MOL_BLOCKS,
+                                       MolEncoder)
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -34,9 +36,26 @@ TASK_SUPPORT = {"dmax": (0.0, 1.0), "pdc50": None, "activity": (0.0, 1.0)}
 
 N_STRAT_BINS = 5
 REPEAT_SEEDS = [1000 + r for r in range(5)]
-CACHE_VERSION = "v1"
+CACHE_VERSION = "v2"   # v2: a missing assay_time is stored as ASSAY_TIME_DEFAULT, not NaN
 
-MOL_BLOCKS_IN_ORDER = ("fingerprint", "descriptors")
+#: Every block of the design matrix, in column order: molecular first, then the context.
+BLOCK_ORDER = [*MOL_BLOCKS, *CONTEXT_BLOCKS]
+
+
+def block_index(dims: Dict[str, int]) -> Dict[str, np.ndarray]:
+    """Column indices of every block, laid out contiguously in :data:`BLOCK_ORDER`.
+
+    Args:
+        dims: Mapping of block name to its width.
+
+    Returns:
+        Mapping of block name to an integer array of column indices.
+    """
+    out, start = {}, 0
+    for b in BLOCK_ORDER:
+        out[b] = np.arange(start, start + dims[b])
+        start += dims[b]
+    return out
 
 
 def make_targets(dmax_pct, dc50_nM) -> Dict[str, np.ndarray]:
@@ -140,6 +159,15 @@ def _first_valid(*series: pd.Series) -> pd.Series:
     return out
 
 
+def _file_sha256(path: Path) -> str:
+    """Streamed sha256 of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def build_table(files: Sequence[Union[str, Path]]) -> pd.DataFrame:
     """Read and harmonise the curated CSVs into one row-per-measurement table.
 
@@ -176,7 +204,8 @@ def build_table(files: Sequence[Union[str, Path]]) -> pd.DataFrame:
             "poi_seq": raw["Degradation_Target_Sequence"],
             "cell_key": cell_key, "assay_raw": raw["Assay"],
             "assay_time": hours.mean(axis=1, skipna=True),   # DC50_h and Dmax_h agree in ~98% of rows
-            "dmax_pct": raw["Dmax"].astype(float), "dc50_nM": raw["DC50"].astype(float)}))
+            "dmax_pct": raw["Dmax"].astype(float).clip(0, 100),
+            "dc50_nM": raw["DC50"].astype(float)}))
 
     tab = pd.concat(parts, ignore_index=True)
     tab = tab[tab["smiles"].notna() & (tab["smiles"].astype(str).str.strip() != "")]
@@ -196,19 +225,25 @@ class FusionData:
         table: Harmonised measurement table (see :func:`build_table`); may be ``None`` for an
             encoder-only instance used purely for inference.
         encoder: Context embedding lookup (default: a fresh :class:`ContextEncoder`).
-        featurizer: Molecular featuriser (default: a fresh :class:`MolFeaturizer`).
+        featurizer: Molecular featuriser (default: a fresh :class:`MolEncoder`).
+        descriptors: Names of the RDKit descriptors to use (default: all of
+            :data:`DESCRIPTOR_NAMES`), or ``None`` for Morgan fingerprints only. Only applies
+            to the default featuriser; combining it with ``featurizer`` is an error.
     """
 
     def __init__(self, table: Optional[pd.DataFrame] = None,
                  encoder: Optional[ContextEncoder] = None,
-                 featurizer: Optional[MolFeaturizer] = None):
+                 featurizer: Optional[MolEncoder] = None,
+                 descriptors: Optional[Sequence[str]] = DESCRIPTOR_NAMES):
+        if featurizer is not None and descriptors is not DESCRIPTOR_NAMES:
+            raise ValueError("pass either featurizer or descriptors, not both: a supplied "
+                             "featurizer already fixes its own descriptors")
         self.table = table
         self.encoder = encoder or ContextEncoder()
-        self.featurizer = featurizer or MolFeaturizer()
-        self.dims = {"fingerprint": self.featurizer.fp_size, "descriptors": 217,
-                     "e3": self.encoder.dim("e3"), "cell": self.encoder.dim("cell"),
-                     "poi": self.encoder.dim("poi"), "assay": self.encoder.dim("assay"),
-                     "assay_time": 1}
+        self.featurizer = featurizer or MolEncoder(descriptors=descriptors)
+        # Nothing about the layout is assumed: the featuriser reports the molecular widths and
+        # the encoder discovers the context widths from the cached tables.
+        self.dims = {**self.featurizer.dims, **self.encoder.dims}
         self.index = block_index(self.dims)
         self.dropped: Dict[str, int] = {"poi": 0, "e3": 0, "cell": 0, "total": 0,
                                         "read": 0 if table is None else len(table)}
@@ -222,7 +257,8 @@ class FusionData:
     @classmethod
     def from_csv(cls, files: Sequence[Union[str, Path]], *,
                  encoder: Optional[ContextEncoder] = None,
-                 featurizer: Optional[MolFeaturizer] = None,
+                 featurizer: Optional[MolEncoder] = None,
+                 descriptors: Optional[Sequence[str]] = DESCRIPTOR_NAMES,
                  cache: bool = True, on_missing: str = "drop",
                  verbose: bool = False) -> "FusionData":
         """Build the design matrix from curated CSVs.
@@ -238,6 +274,8 @@ class FusionData:
             files: CSV paths.
             encoder: Context embedding lookup.
             featurizer: Molecular featuriser.
+            descriptors: RDKit descriptor names for the default featuriser, or ``None`` for
+                fingerprints only (see :class:`FusionData`).
             cache: Reuse (and write) the per-block npy cache under
                 ``TACKAI_CACHE/fusion_blocks/<hash>/``.
             on_missing: ``"drop"`` to discard rows whose context is not in the cache (and
@@ -249,10 +287,114 @@ class FusionData:
         """
         if on_missing not in {"drop", "raise"}:
             raise ValueError(f"on_missing must be 'drop' or 'raise', got {on_missing!r}")
-        data = cls(build_table(files), encoder=encoder, featurizer=featurizer)
+        data = cls(build_table(files), encoder=encoder, featurizer=featurizer,
+                   descriptors=descriptors)
         if on_missing == "drop":
             data._drop_unencodable(verbose=verbose)
         data._build_matrix(cache=cache)
+        return data
+
+    @classmethod
+    def from_pretrained(cls, repo_id: Union[str, Path] = DEFAULT_CONTEXT_REPO, *,
+                        revision: Optional[str] = None,
+                        token: Optional[str] = None,
+                        cache_dir: Optional[Union[str, Path]] = None,
+                        force_download: bool = False,
+                        protein_space: str = "per_block",
+                        featurizer: Optional[MolEncoder] = None,
+                        descriptors: Optional[Sequence[str]] = DESCRIPTOR_NAMES) -> "FusionData":
+        """Build an encoder-only FusionData from the published context embedding tables.
+
+        Downloads (or reuses a local directory of) the context tables named in
+        :data:`~tackai.fusion.context.CONTEXT_FILES`, installs them into the local cache, and
+        returns a :class:`FusionData` with no table — ready for :meth:`encode`,
+        :meth:`encode_context` and :meth:`assemble`, but not for :attr:`X`, :attr:`groups` or
+        :meth:`target` (use :meth:`from_csv` for a training table).
+
+        Args:
+            repo_id: A Hugging Face Hub dataset repo id, or a local directory written by
+                ``scripts/publish_fusion_context.py``'s ``stage`` phase (default:
+                :data:`~tackai.fusion.context.DEFAULT_CONTEXT_REPO`).
+            revision: Hub revision, for a repo id.
+            token: Hub token, for a private repo.
+            cache_dir: Directory to install the tables into (default: ``TACKAI_CACHE`` via
+                :func:`get_cache_dir`). Created if it does not exist.
+            force_download: Overwrite a cached file whose content differs from the published
+                one, instead of raising. A mismatch almost always means the cache already
+                holds tables from a different, locally refitted PCA.
+            protein_space: Passed to :class:`ContextEncoder`.
+            featurizer: Molecular featuriser (default: a fresh :class:`MolEncoder`).
+            descriptors: RDKit descriptor names for the default featuriser, or ``None`` for
+                fingerprints only.
+
+        Returns:
+            A :class:`FusionData` with ``table=None``.
+
+        Raises:
+            FileNotFoundError: If the resolved source holds no ``manifest.json``.
+            ValueError: If a cached file's content differs from the manifest's record of it
+                (and ``force_download`` is false), or if the installed tables' widths
+                disagree with the manifest's ``block_dims``.
+        """
+        source = Path(repo_id)
+        if not source.exists():
+            try:
+                from huggingface_hub import snapshot_download
+            except ImportError as e:
+                raise ImportError(
+                    "huggingface_hub is required to download from the Hub; install it, or "
+                    "pass a local directory to from_pretrained() instead."
+                ) from e
+            source = Path(snapshot_download(repo_id=str(repo_id), repo_type="dataset",
+                                            revision=revision, token=token))
+
+        manifest_path = source / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(
+                f"no manifest.json found in {source}; this does not look like a context "
+                "embedding repo published by scripts/publish_fusion_context.py"
+            )
+        manifest = json.loads(manifest_path.read_text())
+
+        target = Path(cache_dir) if cache_dir is not None else Path(get_cache_dir())
+        target.mkdir(parents=True, exist_ok=True)
+        for filename, entry in manifest["files"].items():
+            dest = target / filename
+            if dest.exists():
+                dest_hash = _file_sha256(dest)
+                if dest_hash == entry["sha256"]:
+                    continue
+                if not force_download:
+                    raise ValueError(
+                        f"{filename} already exists in {target} with different content "
+                        f"(cached sha256 {dest_hash[:12]}…, published sha256 "
+                        f"{entry['sha256'][:12]}…). This usually means the cache holds "
+                        "tables from a different, locally refitted PCA. Pass "
+                        "force_download=True to overwrite, or point cache_dir elsewhere."
+                    )
+            shutil.copy2(source / filename, dest)
+
+        encoder = ContextEncoder(cache_dir=target, protein_space=protein_space)
+        data = cls(table=None, encoder=encoder, featurizer=featurizer, descriptors=descriptors)
+
+        expected = dict(manifest.get("block_dims", {}))
+        combined_dim = manifest.get("combined_dim")
+        if protein_space == "combined" and combined_dim is not None:
+            # poi/e3 now read the shared combined table instead of their own per-block one
+            # (ContextEncoder.files), so the per-block widths staged into block_dims are the
+            # wrong thing to check them against.
+            for seq_block in SEQUENCE_BLOCKS:
+                expected[seq_block] = combined_dim
+        bad = {b: (expected[b], data.dims[b]) for b in expected
+              if b in data.dims and expected[b] != data.dims[b]}
+        if bad:
+            detail = ", ".join(f"{b}: published with {e}, the cache now has {a}"
+                               for b, (e, a) in sorted(bad.items()))
+            raise ValueError(
+                f"block layout mismatch after installing the published context tables "
+                f"({detail}). The cache already held tables for one or more blocks from a "
+                "different PCA fit; clear them from the cache or point cache_dir elsewhere."
+            )
         return data
 
     def _drop_unencodable(self, verbose: bool = False) -> None:
@@ -276,7 +418,7 @@ class FusionData:
         cols = ["smiles", "e3_seq", "poi_seq", "cell_key", "assay_raw", "assay_time"]
         h = hashlib.sha1(json.dumps([CACHE_VERSION, self.encoder.protein_space,
                                      self.featurizer.radius, self.featurizer.fp_size,
-                                     self.featurizer.share_ipc,
+                                     self.featurizer.share_ipc, self.featurizer.descriptors,
                                      sorted(self.dims.items())]).encode())
         h.update(self.table[cols].astype(str).to_csv(index=False).encode())
         return Path(get_cache_dir()) / "fusion_blocks" / h.hexdigest()[:12]
@@ -297,6 +439,7 @@ class FusionData:
                     "protein_space": self.encoder.protein_space,
                     "fingerprint": [self.featurizer.radius, self.featurizer.fp_size],
                     "share_ipc": self.featurizer.share_ipc,
+                    "descriptors": self.featurizer.descriptors,
                     "version": CACHE_VERSION}, indent=1))
         self._X = np.concatenate([blocks[b] for b in BLOCK_ORDER], axis=1).astype(np.float32)
         self._groups, self.scaffold_info = scaffold_groups(self.table["smiles"])
@@ -313,7 +456,8 @@ class FusionData:
         blocks["cell"] = self.encoder.encode("cell", self.table["cell_key"])
         blocks["poi"] = self.encoder.encode("poi", self.table["poi_seq"])
         blocks["assay"] = self.encoder.encode("assay", self.table["assay_raw"])
-        blocks["assay_time"] = self.table[["assay_time"]].to_numpy(np.float32)
+        blocks["assay_time"] = np.array([[assay_time_or_default(t)] for t in self.table["assay_time"]],
+                                        dtype=np.float32)
         return blocks
 
     # ---------------------------------------------------------------- training views
@@ -338,6 +482,18 @@ class FusionData:
         return self.table["smiles"].to_numpy(object)
 
     @property
+    def blocks_indexes(self) -> Dict[str, np.ndarray]:
+        """Column indices of every block, as the ``blocks`` argument of an estimator.
+
+        Built from the featuriser's and the encoder's own widths, so it follows this data's
+        layout whatever it is. Pass it explicitly: ``GPInteraction(blocks=data.blocks_indexes)``.
+
+        Returns:
+            A fresh mapping; changing it does not change this data's layout.
+        """
+        return {b: idx.copy() for b, idx in self.index.items()}
+
+    @property
     def n_columns(self) -> int:
         """Width of the design matrix."""
         return sum(self.dims.values())
@@ -350,7 +506,7 @@ class FusionData:
     @property
     def mol_columns(self) -> np.ndarray:
         """Columns holding the molecular blocks."""
-        return np.concatenate([self.index[b] for b in MOL_BLOCKS_IN_ORDER])
+        return np.concatenate([self.index[b] for b in MOL_BLOCKS])
 
     def target(self, task: str) -> np.ndarray:
         """Target values of a task for every row (NaN where undefined)."""
@@ -402,7 +558,7 @@ class FusionData:
 
         Args:
             records: Dicts (or a DataFrame) with ``smiles``, ``poi_seq``, ``e3_seq``,
-                ``cell_id``, ``assay`` and optionally ``assay_time``.
+                ``cell_id``, ``assay`` and optionally ``assay_time`` (default 24 h).
             return_ok: Also return which rows' SMILES RDKit could parse, so a caller that
                 needs it does not featurise a second time to find out.
 
@@ -424,9 +580,8 @@ class FusionData:
             "cell", [r.get("cell_id", r.get("cell_key")) for r in records])
         blocks["poi"] = self.encoder.encode("poi", [r.get("poi_seq") for r in records])
         blocks["assay"] = self.encoder.encode("assay", [r.get("assay") for r in records])
-        blocks["assay_time"] = np.array(
-            [[np.nan if r.get("assay_time") is None else float(r["assay_time"])] for r in records],
-            dtype=np.float32)
+        blocks["assay_time"] = np.array([[assay_time_or_default(r.get("assay_time"))]
+                                         for r in records], dtype=np.float32)
         X = np.concatenate([blocks[b] for b in BLOCK_ORDER], axis=1).astype(np.float32)
         return (X, ok) if return_ok else X
 
@@ -455,10 +610,24 @@ class FusionData:
             Array of shape ``(len(smiles), n_columns)``, ``float32``.
         """
         smiles = list(smiles)
-        X = np.empty((len(smiles), self.n_columns), dtype=np.float32)
         if not smiles:
-            return X
+            return np.empty((0, self.n_columns), dtype=np.float32)
         fp, desc, _ = self.featurizer.featurize(smiles)
+        return self.assemble_features(context_row, fp, desc)
+
+    def assemble_features(self, context_row: np.ndarray, fp: np.ndarray,
+                          desc: np.ndarray) -> np.ndarray:
+        """Combine one encoded context with molecular features that are already computed.
+
+        Args:
+            context_row: Output of :meth:`encode_context`.
+            fp: Fingerprints, shape ``(n, fp_size)``.
+            desc: Descriptors, shape ``(n, n_descriptors)``.
+
+        Returns:
+            Array of shape ``(n, n_columns)``, ``float32``.
+        """
+        X = np.empty((len(fp), self.n_columns), dtype=np.float32)
         X[:, self.index["fingerprint"]] = fp
         X[:, self.index["descriptors"]] = desc
         X[:, self.context_columns] = np.asarray(context_row, dtype=np.float32)
