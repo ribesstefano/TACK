@@ -5,6 +5,14 @@ The tables are produced by ``notebooks/context_embeddings.ipynb`` (cell lines),
 ``notebooks/assay_embeddings.ipynb`` (assay types), and live in ``TACKAI_CACHE``. They are
 already reduced, which is why no PCA runs anywhere in this pipeline.
 
+They can also be fetched directly from the Hugging Face Hub dataset repo named by
+:data:`DEFAULT_CONTEXT_REPO`, via
+:meth:`~tackai.fusion.data.FusionData.from_pretrained`, which installs them into
+``TACKAI_CACHE`` and verifies their content against a published manifest before using them.
+That download never happens implicitly from inside this module: :meth:`ContextEncoder.table`
+still raises a plain ``FileNotFoundError`` when a table is missing, so a kernel fit never
+blocks on an unexpected network call.
+
 What happens to a key the tables do not contain depends on whether the vector can be
 reconstructed at all:
 

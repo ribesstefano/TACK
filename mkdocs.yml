@@ -54,6 +54,7 @@ nav:
       - Fast Screening (Reusing Context): guide/screening.md
       - Loading the TACK Dataset: guide/loading-dataset.md
       - Command-Line Interface: guide/cli.md
+      - Fusion Context Cache: guide/fusion-context.md
   - Tutorial Notebook: tutorial/ensemble_predictor_tutorial.ipynb
   - API Reference:
       - EnsemblePredictor: api/ensemble-predictor.md
