@@ -39,6 +39,7 @@ def fake_cache(tmp_path, monkeypatch):
     _write_pca_model(cache / POI_FILE.replace(".npz", "_model.npz"), 640, 51, 7)
     _write_pca_model(cache / E3_FILE.replace(".npz", "_model.npz"), 640, 7, 8)
     _write_pca_model(cache / ASSAY_PCA_FILE, 768, 8, 9)
+    _write_pca_model(cache / COMBINED_FILE.replace(".npz", "_model.npz"), 640, 52, 10)
     monkeypatch.setenv("TACKAI_CACHE", str(cache))
     return cache
 
