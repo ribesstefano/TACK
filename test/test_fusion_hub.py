@@ -124,15 +124,20 @@ def test_from_pretrained_can_encode_a_context(fake_cache, tmp_path, tiny_records
     assert ctx.shape == (1, len(data.context_columns))
 
 
-def test_from_pretrained_second_call_is_a_no_op(fake_cache, tmp_path):
+def test_from_pretrained_second_call_is_a_no_op(fake_cache, tmp_path, monkeypatch):
+    """shutil.copy2 preserves the source mtime, so a stat()-based before/after comparison
+    cannot tell a real no-op from a silent, identical re-copy. Assert on the actual signal: no
+    copy2 call happens once every file already matches."""
     staged = tmp_path / "staged"
     pfc.stage(fake_cache, staged)
     target = tmp_path / "fresh_cache"
     FusionData.from_pretrained(staged, cache_dir=target)
-    before = {p.name: p.stat().st_mtime_ns for p in target.iterdir()}
+
+    copy_calls = []
+    monkeypatch.setattr("tackai.fusion.data.shutil.copy2",
+                        lambda src, dst: copy_calls.append((src, dst)))
     FusionData.from_pretrained(staged, cache_dir=target)
-    after = {p.name: p.stat().st_mtime_ns for p in target.iterdir()}
-    assert before == after
+    assert copy_calls == []
 
 
 def test_from_pretrained_supports_the_combined_protein_space(fake_cache, tmp_path):
@@ -157,14 +162,55 @@ def test_from_pretrained_rejects_a_tampered_cached_file(fake_cache, tmp_path):
 
 
 def test_from_pretrained_force_download_overwrites(fake_cache, tmp_path):
+    """Checking dims["poi"] alone would pass even if force_download silently failed to
+    overwrite: the tampered file in this test has the same width (51) as the real one, by
+    construction. Assert the installed bytes actually match the manifest's hash instead."""
     staged = tmp_path / "staged"
     pfc.stage(fake_cache, staged)
     target = tmp_path / "fresh_cache"
     FusionData.from_pretrained(staged, cache_dir=target)
     rng = np.random.default_rng(0)
     np.savez(target / POI_FILE, **{s: rng.normal(size=51).astype(np.float32) for s in "xy"})
-    data = FusionData.from_pretrained(staged, cache_dir=target, force_download=True)
-    assert data.dims["poi"] == 51
+    FusionData.from_pretrained(staged, cache_dir=target, force_download=True)
+    manifest = json.loads((staged / "manifest.json").read_text())
+    assert pfc.sha256_of(target / POI_FILE) == manifest["files"][POI_FILE]["sha256"]
+
+
+def test_from_pretrained_conflict_leaves_the_cache_untouched(fake_cache, tmp_path):
+    """A hash conflict on one file must not have already copied the others in before raising
+    — otherwise the cache can end up holding a Hub table next to a stale local PCA side file,
+    silently mixing two PCA fits instead of refusing to. POI_FILE sorts after CELL_FILE and
+    ASSAY_FILE alphabetically, so a single-pass copy-as-you-go loop would already have copied
+    them before reaching the conflict."""
+    staged = tmp_path / "staged"
+    pfc.stage(fake_cache, staged)
+    target = tmp_path / "fresh_cache"
+    target.mkdir()
+    rng = np.random.default_rng(0)
+    np.savez(target / POI_FILE, **{s: rng.normal(size=51).astype(np.float32) for s in "xy"})
+    with pytest.raises(ValueError, match=POI_FILE):
+        FusionData.from_pretrained(staged, cache_dir=target)
+    assert not (target / CELL_FILE).exists()
+    assert not (target / ASSAY_FILE).exists()
+
+
+def test_from_pretrained_rejects_a_corrupt_source_file(fake_cache, tmp_path):
+    staged = tmp_path / "staged"
+    pfc.stage(fake_cache, staged)
+    (staged / POI_FILE).write_bytes(b"not a valid npz")
+    with pytest.raises(ValueError, match="corrupt"):
+        FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache")
+
+
+def test_from_pretrained_rejects_a_manifest_missing_a_required_file(fake_cache, tmp_path):
+    staged = tmp_path / "staged"
+    pfc.stage(fake_cache, staged)
+    manifest_path = staged / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    del manifest["files"][POI_FILE]
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match="version"):
+        FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache")
 
 
 def test_from_pretrained_rejects_a_missing_manifest(tmp_path):

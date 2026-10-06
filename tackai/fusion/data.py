@@ -19,8 +19,8 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 from sklearn.model_selection import StratifiedGroupKFold
 
 from tackai.data.utils import get_cache_dir
-from tackai.fusion.context import (CONTEXT_BLOCKS, DEFAULT_CONTEXT_REPO, SEQUENCE_BLOCKS,
-                                   ContextEncoder, assay_time_or_default)
+from tackai.fusion.context import (CONTEXT_BLOCKS, CONTEXT_FILES, DEFAULT_CONTEXT_REPO,
+                                   SEQUENCE_BLOCKS, ContextEncoder, assay_time_or_default)
 from tackai.fusion.mol_encoder import (DESCRIPTOR_NAMES, FP_RADIUS, FP_SIZE, MOL_BLOCKS,
                                        MolEncoder)
 
@@ -331,10 +331,14 @@ class FusionData:
             A :class:`FusionData` with ``table=None``.
 
         Raises:
-            FileNotFoundError: If the resolved source holds no ``manifest.json``.
-            ValueError: If a cached file's content differs from the manifest's record of it
-                (and ``force_download`` is false), or if the installed tables' widths
-                disagree with the manifest's ``block_dims``.
+            FileNotFoundError: If the resolved source holds no ``manifest.json``, or is
+                missing a file its own manifest lists.
+            ValueError: If the manifest does not list every file this ``tackai`` version
+                expects (a version mismatch between the published repo and this library), if
+                a source file's content does not match its own manifest (a corrupt download
+                or staged copy), if a cached file's content differs from the manifest's
+                record of it (and ``force_download`` is false), or if the installed tables'
+                widths disagree with the manifest's ``block_dims``.
         """
         source = Path(repo_id)
         if not source.exists():
@@ -356,23 +360,63 @@ class FusionData:
             )
         manifest = json.loads(manifest_path.read_text())
 
+        # The set of files this tackai version needs is CONTEXT_FILES, not whatever keys the
+        # manifest happens to list: a manifest key is untrusted input (it names the download,
+        # not this code), so it is never joined onto a path. Iterating CONTEXT_FILES instead
+        # means a crafted or corrupted manifest entry can neither escape cache_dir via a
+        # traversal path nor get installed as an unread file, and an older/newer manifest that
+        # is missing an entry this version needs is reported as a version mismatch instead of
+        # a confusing downstream error.
+        required = {filename for files in CONTEXT_FILES.values() for filename in files.values()}
+        missing_from_manifest = sorted(required - set(manifest.get("files", {})))
+        if missing_from_manifest:
+            raise ValueError(
+                f"{source} is missing {len(missing_from_manifest)} file(s) this tackai "
+                f"version expects: {missing_from_manifest}. The published repo and this "
+                "tackai version disagree about the context table layout — pass revision= to "
+                "pin an older snapshot of the repo, or upgrade tackai."
+            )
+
         target = Path(cache_dir) if cache_dir is not None else Path(get_cache_dir())
         target.mkdir(parents=True, exist_ok=True)
-        for filename, entry in manifest["files"].items():
+
+        # Two passes: validate everything first, copy nothing until every file has been
+        # checked. A single-pass copy-as-you-go loop would leave a half-installed cache on the
+        # first conflict it hits — a Hub table sitting next to a stale local PCA side file,
+        # silently mixing two PCA fits instead of refusing to.
+        to_copy, conflicts = [], []
+        for filename in sorted(required):
+            entry = manifest["files"][filename]
+            src = source / filename
+            if not src.exists():
+                raise FileNotFoundError(f"{filename} is listed in {manifest_path} but is "
+                                        f"missing from {source}")
+            src_hash = _file_sha256(src)
+            if src_hash != entry["sha256"]:
+                raise ValueError(
+                    f"{filename} in {source} does not match its own manifest (file sha256 "
+                    f"{src_hash[:12]}…, manifest sha256 {entry['sha256'][:12]}…) "
+                    "— the download or staged copy is corrupt."
+                )
             dest = target / filename
             if dest.exists():
                 dest_hash = _file_sha256(dest)
                 if dest_hash == entry["sha256"]:
-                    continue
+                    continue                                 # already installed, nothing to do
                 if not force_download:
-                    raise ValueError(
-                        f"{filename} already exists in {target} with different content "
-                        f"(cached sha256 {dest_hash[:12]}…, published sha256 "
-                        f"{entry['sha256'][:12]}…). This usually means the cache holds "
-                        "tables from a different, locally refitted PCA. Pass "
-                        "force_download=True to overwrite, or point cache_dir elsewhere."
-                    )
-            shutil.copy2(source / filename, dest)
+                    conflicts.append(filename)
+                    continue
+            to_copy.append(filename)
+
+        if conflicts:
+            raise ValueError(
+                f"{len(conflicts)} file(s) already exist in {target} with different content "
+                f"than published: {conflicts}. This usually means the cache holds tables "
+                "from a different, locally refitted PCA. Pass force_download=True to "
+                "overwrite, or point cache_dir elsewhere."
+            )
+        for filename in to_copy:
+            shutil.copy2(source / filename, target / filename)
 
         encoder = ContextEncoder(cache_dir=target, protein_space=protein_space)
         data = cls(table=None, encoder=encoder, featurizer=featurizer, descriptors=descriptors)
