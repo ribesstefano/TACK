@@ -2,8 +2,7 @@
 import numpy as np
 import pytest
 
-from fusion_fixtures import CELLS, SEQS, SMILES
-from tackai.fusion.blocks import BLOCK_DIMS, block_index
+from fusion_fixtures import BLOCK_DIMS, BLOCK_ORDER, CELLS, SEQS, SMILES, block_index
 from tackai.fusion.data import DMAX_THR, PDC50_THR, FusionData, make_targets, scaffold_groups
 
 N_COLS = sum(BLOCK_DIMS.values())
@@ -170,12 +169,68 @@ def test_a_clean_table_drops_nothing(fake_cache, tiny_csv):
 
 def test_block_cache_distinguishes_the_fingerprint_radius(fake_cache, tiny_csv):
     """Two radii must not share a cache directory, or a radius ablation compares nothing."""
-    from tackai.fusion.features import MolFeaturizer
+    from tackai.fusion.mol_encoder import MolEncoder
 
-    a = FusionData.from_csv([tiny_csv], featurizer=MolFeaturizer(radius=16), cache=True)
-    b = FusionData.from_csv([tiny_csv], featurizer=MolFeaturizer(radius=2), cache=True)
+    a = FusionData.from_csv([tiny_csv], featurizer=MolEncoder(radius=16), cache=True)
+    b = FusionData.from_csv([tiny_csv], featurizer=MolEncoder(radius=2), cache=True)
     idx = block_index(BLOCK_DIMS)
     assert not np.array_equal(a.X[:, idx["fingerprint"]], b.X[:, idx["fingerprint"]])
 
-    direct = MolFeaturizer(radius=2).featurize(a.table["smiles"].tolist())[0]
+    direct = MolEncoder(radius=2).featurize(a.table["smiles"].tolist())[0]
     assert np.array_equal(b.X[:, idx["fingerprint"]], direct)
+
+
+# -- blocks_indexes: the layout an estimator must be given -----------------------------------------
+
+def test_blocks_indexes_cover_every_column_once_in_block_order(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    assert list(data.blocks_indexes) == BLOCK_ORDER
+    flat = np.concatenate([data.blocks_indexes[b] for b in BLOCK_ORDER])
+    assert np.array_equal(flat, np.arange(data.n_columns))
+
+
+def test_blocks_indexes_is_a_copy(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    mine = data.blocks_indexes
+    mine["poi"] = np.arange(3)
+    mine["e3"][0] = -1
+    assert len(data.index["poi"]) == data.dims["poi"] and data.index["e3"][0] >= 0
+
+
+def test_the_gp_follows_the_layout_of_data_with_non_default_widths(fake_cache, tiny_csv):
+    from tackai.fusion.context import ContextEncoder
+    from tackai.fusion.gp import GPInteraction
+    data = FusionData.from_csv([tiny_csv], encoder=ContextEncoder(protein_space="combined"),
+                               cache=False)
+    assert data.dims != BLOCK_DIMS and data.n_columns != N_COLS
+    _, X, y, _ = data.task_rows("pdc50")
+    est = GPInteraction(blocks=data.blocks_indexes, n_restarts=1, n_iter=5,
+                        max_hyper_points=40).fit(X, y)
+    assert est.dims_ == data.dims
+    assert np.isfinite(est.predict(X)).all()
+
+
+def test_the_layout_is_discovered_not_assumed(fake_cache, tiny_csv):
+    """dims = featuriser's molecular widths + the encoder's discovered context widths."""
+    from tackai.fusion.context import ContextEncoder
+    from tackai.fusion.mol_encoder import MolEncoder
+    data = FusionData.from_csv([tiny_csv], cache=False)
+    assert data.dims == BLOCK_DIMS                      # the fixture's literals match reality
+    assert list(data.dims) == BLOCK_ORDER
+    wide = FusionData(featurizer=MolEncoder(fp_size=256),
+                      encoder=ContextEncoder(protein_space="combined"))
+    assert wide.dims == {**MolEncoder(fp_size=256).dims, **ContextEncoder(
+        protein_space="combined").dims}
+    assert wide.dims["fingerprint"] == 256 and wide.dims["poi"] == wide.dims["e3"] == 52
+    assert wide.n_columns == sum(wide.dims.values())
+    assert np.array_equal(np.concatenate(list(wide.blocks_indexes.values())),
+                          np.arange(wide.n_columns))
+
+
+def test_descriptors_argument_reaches_the_featurizer():
+    from tackai.fusion.mol_encoder import MolEncoder
+    d = FusionData(descriptors=["MolWt"])
+    assert d.featurizer.descriptors == ["MolWt"] and d.dims["descriptors"] == 1
+    assert FusionData(descriptors=None).dims["descriptors"] == 0
+    with pytest.raises(ValueError, match="not both"):
+        FusionData(featurizer=MolEncoder(), descriptors=["MolWt"])

@@ -1,10 +1,12 @@
-"""One dtype knob on the estimators reaches the preprocessor and the GP."""
-import numpy as np
-import pytest
-import torch
+"""Everything runs in float32; there is no precision option left to set."""
+import inspect
 
-from tackai.fusion.blocks import BLOCK_DIMS, block_index
-from tackai.fusion.models import GPInteraction, XGBoostFusion
+import numpy as np
+import torch
+from sklearn.base import clone
+
+from fusion_fixtures import BLOCK_DIMS, DEFAULT_BLOCKS, block_index
+from tackai.fusion.gp import GPInteraction
 
 
 def design(n=40, seed=0):
@@ -21,34 +23,28 @@ def design(n=40, seed=0):
 
 
 def fast_gp(**kw):
-    return GPInteraction(n_restarts=1, n_iter=5, max_hyper_points=40, **kw)
+    return GPInteraction(**{"blocks": DEFAULT_BLOCKS, **kw}, n_restarts=1, n_iter=5,
+                         max_hyper_points=40)
 
 
-def test_estimators_default_to_float32():
-    assert GPInteraction().dtype == "float32" and XGBoostFusion().dtype == "float32"
+def test_no_estimator_takes_a_dtype():
+    assert "dtype" not in inspect.signature(GPInteraction.__init__).parameters
 
 
-def test_gp_member_is_float32_end_to_end():
+def test_the_gp_is_float32_end_to_end():
     X, y = design()
     est = fast_gp().fit(X, y)
-    assert est.pre_.dtype == "float32" and est.model_.dtype is torch.float32
-    assert est.predict(X).dtype in (np.float32, np.float64) and np.isfinite(est.predict(X)).all()
-
-
-def test_gp_member_can_be_float64_end_to_end():
-    X, y = design()
-    est = fast_gp(dtype="float64").fit(X, y)
-    assert est.pre_.dtype == "float64" and est.model_.dtype is torch.float64
-
-
-def test_xgboost_member_preprocesses_in_the_requested_dtype():
-    X, y = design()
-    est = XGBoostFusion(n_estimators=10, max_depth=3, reg_lambda=5.0).fit(X, y)
-    assert est.pre_.dtype == "float32"
-    assert est.pre_.transform(X)["fingerprint"].dtype == np.float32
+    assert est.model_.dtype is torch.float32
+    assert est.model_.Z_train_["poi"].dtype == torch.float32
+    assert est.model_.alpha_.dtype == torch.float32
     assert np.isfinite(est.predict(X)).all()
 
 
-def test_dtype_survives_sklearn_clone():
-    from sklearn.base import clone
-    assert clone(fast_gp(dtype="float64")).dtype == "float64"
+def test_a_float64_design_matrix_is_accepted():
+    X, y = design()
+    assert X.dtype == np.float64
+    assert np.isfinite(fast_gp().fit(X, y).predict(X)).all()
+
+
+def test_the_gp_estimator_survives_sklearn_clone():
+    assert set(clone(fast_gp()).blocks) == set(DEFAULT_BLOCKS)

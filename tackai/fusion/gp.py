@@ -18,15 +18,21 @@ The covariance is
 
 where the molecular kernel of a product term is ``RBF_fingerprint + RBF_descriptors``, as in
 the notebook.
+
+:class:`GPInteraction` is the sklearn-facing estimator wrapping :class:`AdditiveProductGP`: it
+trains on exactly the design matrix it is given and nothing else -- choosing the rows, tuning
+hyper-parameters, rescaling labels and calibrating a latent score all happen outside, in
+:mod:`tackai.fusion.training` and :meth:`tackai.fusion.ensemble.FusionEnsemble.calibrate`.
 """
-from typing import Dict, Optional, Sequence, Tuple, Union
+from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from sklearn.base import BaseEstimator, RegressorMixin
 
 #: The blocks whose sum forms the molecular kernel of a product term.
 MOL_KERNEL_BLOCKS = ("fingerprint", "descriptors")
-DEFAULT_INTERACTIONS = ("mol*poi", "mol*cell", "poi*cell")
+DEFAULT_INTERACTIONS = ("mol*poi", "mol*e3", "mol*cell", "poi*cell")
 
 #: Smallest observation noise the likelihood may use. The development table measures the same
 #: compound in the same context repeatedly, so K has exactly repeated rows and is singular;
@@ -34,30 +40,13 @@ DEFAULT_INTERACTIONS = ("mol*poi", "mol*cell", "poi*cell")
 #: GPyTorch original carried the same constraint (``GreaterThan(1e-3)``).
 NOISE_FLOOR = 1e-3
 
-#: The precisions a GP can run in.
-SUPPORTED_DTYPES = {"float32": torch.float32, "float64": torch.float64}
-
-
-def resolve_dtype(dtype: Union[str, torch.dtype]) -> torch.dtype:
-    """A supported precision as a torch dtype; anything else is refused up front.
-
-    Args:
-        dtype: ``"float32"``, ``"float64"`` or the matching torch dtype.
-
-    Returns:
-        The torch dtype.
-
-    Raises:
-        ValueError: For any other precision, before any state has been changed.
-    """
-    name = str(dtype).replace("torch.", "")
-    if name not in SUPPORTED_DTYPES:
-        raise ValueError(f"dtype must be float32 or float64, got {dtype!r}")
-    return SUPPORTED_DTYPES[name]
+#: The GP runs in float32. A factorisation float32 cannot do is retried once in float64 (see
+#: :meth:`AdditiveProductGP._factor`); the model itself is never stored in another precision.
+DTYPE = torch.float32
 
 
 #: Where each precision's jitter ladder starts and the largest value it tries before giving up
-#: (float32 then promotes to float64, whose ladder is the original). float32's epsilon is 1.2e-7,
+#: (a float32 factorisation that fails promotes to float64, whose ladder is the original). float32's epsilon is 1.2e-7,
 #: so the float64 starting jitter of 1e-6 would sit below the rounding noise of a unit-scale kernel.
 JITTER_START = {torch.float32: 1e-5, torch.float64: 1e-6}
 JITTER_CEILING = {torch.float32: 1e-3, torch.float64: 1e-2}
@@ -83,10 +72,14 @@ def _try_cholesky(K: torch.Tensor, start: float, ceiling: float):
 
 
 class AdditiveProductGP:
-    """Exact GP over processed blocks, with cached distances and exact posterior variance.
+    """Exact GP over raw blocks, with cached distances and exact posterior variance.
+
+    Every block except the ``linear_blocks`` is divided by ``sqrt(width)`` on the way in, so no
+    block dominates a shared-lengthscale kernel by width alone. Nothing else is done to the
+    data, and callers pass it unscaled.
 
     Args:
-        dims: Mapping of block name to width (as produced by ``BlockPreprocessor.dims_``).
+        dims: Mapping of block name to width.
         interactions: Product kernel terms, each ``"<a>*<b>"`` where a side is either a block
             name or ``"mol"`` (the sum of the molecular RBFs).
         ard_blocks: Blocks given one lengthscale per column.
@@ -94,8 +87,9 @@ class AdditiveProductGP:
         linear_blocks: Blocks given a linear kernel.
         jitter: Starting diagonal jitter for the Cholesky factorisation (default: 1e-5 in
             float32, 1e-6 in float64).
-        dtype: Torch dtype for the computation, float32 by default. A factorisation float32
-            cannot do is retried in float64 and recorded in ``promoted_``.
+
+    The computation is float32; a kernel float32 cannot factorise is retried in float64 and
+    recorded in ``promoted_``.
     """
 
     def __init__(self, dims: Dict[str, int], *,
@@ -103,8 +97,7 @@ class AdditiveProductGP:
                  ard_blocks: Sequence[str] = ("descriptors",),
                  rbf_blocks: Optional[Sequence[str]] = None,
                  linear_blocks: Sequence[str] = ("assay_time",),
-                 jitter: Optional[float] = None,
-                 dtype: Union[str, torch.dtype] = torch.float32):
+                 jitter: Optional[float] = None):
         self.dims = dict(dims)
         self.linear_blocks = [b for b in linear_blocks if b in self.dims]
         self.rbf_blocks = list(rbf_blocks) if rbf_blocks is not None else [
@@ -112,7 +105,9 @@ class AdditiveProductGP:
         self.ard_blocks = [b for b in ard_blocks if b in self.rbf_blocks]
         self.interactions = [t for t in interactions if self._term_available(t)]
         self.jitter = jitter
-        self.dtype = resolve_dtype(dtype)
+        self.dtype = DTYPE
+        self._sqrt_width = {b: 1.0 if b in self.linear_blocks else float(np.sqrt(self.dims[b]))
+                            for b in self.dims}
         self.promoted_ = False
         self.promotions_ = 0
         self.factorisations_ = 0
@@ -164,7 +159,7 @@ class AdditiveProductGP:
         """
         scales = {}
         for block in self.ard_blocks:
-            column = np.asarray(Z[block], dtype=np.float64)
+            column = self._block_tensor(block, Z[block]).numpy().astype(np.float64)
             spread = column.std(axis=0)
             spread = np.where(spread > 0, spread, 1.0)      # a constant column needs no scaling
             scales[block] = torch.as_tensor(spread, dtype=self.dtype)
@@ -177,8 +172,13 @@ class AdditiveProductGP:
 
     # ---------------------------------------------------------------- kernel pieces
 
+    def _block_tensor(self, block: str, values) -> torch.Tensor:
+        """One raw block as a float32 tensor, divided by ``sqrt(width)`` unless it is linear."""
+        t = torch.as_tensor(np.asarray(values), dtype=self.dtype)
+        return t / self._sqrt_width[block] if self._sqrt_width[block] != 1.0 else t
+
     def _to_tensor(self, Z: Dict[str, np.ndarray]) -> Dict[str, torch.Tensor]:
-        return {b: torch.as_tensor(np.asarray(Z[b]), dtype=self.dtype) for b in self.dims}
+        return {b: self._block_tensor(b, Z[b]) for b in self.dims}
 
     @staticmethod
     def _sq_dists(A: torch.Tensor, B: torch.Tensor, same: bool = False,
@@ -349,7 +349,7 @@ class AdditiveProductGP:
         GP that follows uses all of them), which is what makes repeated fits affordable.
 
         Args:
-            Z: Processed blocks of the training rows.
+            Z: Raw blocks of the training rows.
             y: Training targets.
             n_restarts: Random restarts of the marginal-likelihood optimisation.
             n_iter: Adam steps per restart.
@@ -401,7 +401,7 @@ class AdditiveProductGP:
 
         Args:
             state: A state returned by :meth:`fit`.
-            Z: Processed blocks of the training rows.
+            Z: Raw blocks of the training rows.
             y: Training targets.
         """
         y = np.asarray(y, dtype=float)
@@ -445,48 +445,14 @@ class AdditiveProductGP:
             self._train_side_ = self._build_train_side()
         return self._train_side_
 
-    def astype(self, dtype: Union[str, torch.dtype], jitter: Optional[float] = None):
-        """Re-condition this fitted GP in another precision, keeping its hyper-parameters.
-
-        The kernel is rebuilt and refactorised in ``dtype``. ``promoted_`` is True when float32
-        could not factorise it and float64 did; False only means float32 succeeded, possibly
-        after adding jitter up to 1e-3. Promotion refactorises the kernel as assembled in
-        ``dtype``, so it cannot undo rounding already in that kernel, and ``alpha_`` is stored
-        in ``dtype`` either way.
-
-        The cast overwrites the stored training rows and hyper-parameters, so it cannot be
-        undone: float64 -> float32 -> float64 is not the original model (reload it from disk
-        for that).
-
-        Args:
-            dtype: ``"float32"`` or ``"float64"`` (or the torch dtype).
-            jitter: Starting jitter (default: the new precision's own).
-
-        Raises:
-            ValueError: For any other precision, before anything is changed.
-
-        Returns:
-            self
-        """
-        dtype = resolve_dtype(dtype)
-        state = self.state_
-        cast = {**state,
-                "params": {k: v.to(dtype) for k, v in state["params"].items()},
-                "ls_scale": {k: v.to(dtype) for k, v in state.get("ls_scale", {}).items()}}
-        Z = {b: a.double().numpy() for b, a in self.Z_train_.items()}
-        y = self.y_train_.double().numpy()
-        self.dtype, self.jitter = dtype, jitter
-        self.load_state(cast, Z, y)
-        return self
-
     # ---------------------------------------------------------------- prediction
 
     def kernel_matrix(self, Za: Dict[str, np.ndarray], Zb: Dict[str, np.ndarray]) -> np.ndarray:
         """Noise-free covariance between two sets of rows, with the fitted hyper-parameters.
 
         Args:
-            Za: Processed blocks of the first set.
-            Zb: Processed blocks of the second set.
+            Za: Raw blocks of the first set.
+            Zb: Raw blocks of the second set.
 
         Returns:
             Covariance matrix of shape ``(len(Za), len(Zb))``.
@@ -502,7 +468,7 @@ class AdditiveProductGP:
         """Posterior mean, and optionally the posterior standard deviation.
 
         Args:
-            Z: Processed blocks of the rows to predict.
+            Z: Raw blocks of the rows to predict.
             return_std: Also return the epistemic standard deviation (noise-free).
 
         Returns:
@@ -563,8 +529,7 @@ class AdditiveProductGP:
 
         with torch.no_grad():
             train = self._train_side()
-            Zc = {b: torch.as_tensor(np.asarray(context[b]), dtype=self.dtype)
-                  for b in ctx_blocks}
+            Zc = {b: self._block_tensor(b, context[b]) for b in ctx_blocks}
             cached = {b: self._sq_dists(Zc[b], self.Z_train_[b], b_sq=train["sq"][b])
                       for b in self.rbf_blocks
                       if b not in self.ard_blocks and b in ctx_blocks}
@@ -623,7 +588,7 @@ class AdditiveProductGP:
         """Predict for molecules in the context a :meth:`fold_context` call prepared.
 
         Args:
-            mol_blocks: The processed molecular blocks of the batch.
+            mol_blocks: The raw molecular blocks of the batch.
             fold: The dict returned by :meth:`fold_context`.
             return_std: Also return the posterior standard deviation.
 
@@ -632,8 +597,7 @@ class AdditiveProductGP:
         """
         with torch.no_grad():
             train = self._train_side()
-            Zm = {b: torch.as_tensor(np.asarray(mol_blocks[b]), dtype=self.dtype)
-                  for b in MOL_KERNEL_BLOCKS}
+            Zm = {b: self._block_tensor(b, mol_blocks[b]) for b in MOL_KERNEL_BLOCKS}
             cached = {b: self._sq_dists(Zm[b], self.Z_train_[b], b_sq=train["sq"][b])
                       for b in MOL_KERNEL_BLOCKS if b not in self.ard_blocks}
             rbf = {b: self._rbf(b, self.params_, Zm, self.Z_train_, cached, train=train)
@@ -694,3 +658,156 @@ class AdditiveProductGP:
             return {"lengthscale": lengthscale,
                     "weight": {k: v / total for k, v in shares.items()},
                     "noise": self.noise_}
+
+
+class GPInteraction(BaseEstimator, RegressorMixin):
+    """M4: additive-kernel GP with cross-block product kernels.
+
+    Trains on exactly the design matrix it is given and nothing else: choosing the rows,
+    tuning hyper-parameters, rescaling labels and calibrating a latent score all happen
+    outside, in :mod:`tackai.fusion.training` and
+    :meth:`tackai.fusion.ensemble.FusionEnsemble.calibrate`. The target is never rescaled;
+    ``predict`` returns values in the labels' own units. For ``task_type="binary"`` the GP has
+    no native probability output (``native_binary`` is False), so it returns a latent score
+    that only becomes a probability once ``calibrator_`` is set.
+
+    The kernel is a sum of per-block RBFs, a linear term on the small blocks and the product
+    kernels named by ``interactions`` — the three benchmarked ones by default. ``mol*e3`` is
+    also expressible now that the ligase is an embedding rather than a one-hot, but stays off
+    by default so results remain comparable with the published comparison.
+
+    Args:
+        blocks: Column indices of every block of the design matrix, i.e.
+            ``FusionData.blocks_indexes``. Required: the GP builds one kernel per block, and a
+            layout assumed instead of read from the data would silently slice the wrong columns.
+        task_type: ``"regression"`` or ``"binary"``.
+        random_state: Seed for every stochastic component.
+        interactions: Product kernel terms.
+        ard_blocks: Blocks given one lengthscale per column. The descriptor block needs this:
+            its columns are raw and span ~20 orders of magnitude (``Ipc``), which no single
+            lengthscale can fit.
+        n_restarts: Random restarts of the marginal-likelihood optimisation.
+        n_iter: Adam steps per restart.
+        lr: Adam learning rate.
+        max_hyper_points: Rows used to fit the hyper-parameters; the exact GP that follows
+            conditions on every training row.
+    """
+
+    native_binary = False      # True when the model itself outputs probabilities
+    early_stops = False        # a GP has no early stopping
+
+    def __init__(self, blocks: Dict[str, np.ndarray], task_type: str = "regression",
+                 random_state: int = 0,
+                 interactions: Sequence[str] = DEFAULT_INTERACTIONS,
+                 ard_blocks: Sequence[str] = ("descriptors",), n_restarts: int = 3,
+                 n_iter: int = 60, lr: float = 0.1, max_hyper_points: int = 1200):
+        self.blocks = blocks
+        self.task_type = task_type
+        self.random_state = random_state
+        self.interactions = interactions
+        self.ard_blocks = ard_blocks
+        self.n_restarts = n_restarts
+        self.n_iter = n_iter
+        self.lr = lr
+        self.max_hyper_points = max_hyper_points
+
+    @property
+    def supports_std(self) -> bool:
+        return True
+
+    @property
+    def dims_(self) -> Dict[str, int]:
+        """Width of every block."""
+        return {b: len(idx) for b, idx in self.blocks.items()}
+
+    def split(self, X) -> Dict[str, np.ndarray]:
+        """The blocks of a design matrix, each C-contiguous (BLAS results depend on layout)."""
+        X = np.asarray(X)
+        return {b: np.ascontiguousarray(X[:, np.asarray(idx)]) for b, idx in self.blocks.items()}
+
+    def fit(self, X, y, *, validation=None) -> "GPInteraction":
+        """Fit the GP on the rows given; ``validation`` is unused, as a GP has no early stopping.
+
+        This trains and nothing else. Choosing the rows, scaling the labels, selecting the
+        hyper-parameters and calibrating the output all happen before or after this call -- see
+        :mod:`tackai.fusion.training` and :meth:`tackai.fusion.ensemble.FusionEnsemble.calibrate`.
+
+        Args:
+            X: Design matrix of the rows to train on; every value must be finite.
+            y: Labels, in the units the model should report.
+            validation: Unused; accepted for a uniform ``fit_member`` call across estimators.
+
+        Returns:
+            self
+
+        Raises:
+            ValueError: If ``X`` holds a NaN or infinite value.
+        """
+        X = np.asarray(X)
+        if not np.isfinite(X).all():
+            raise ValueError("the design matrix holds NaN or infinite values; FusionData fills "
+                             "a missing assay_time with a constant, so this is a data problem")
+        self.calibrator_ = None
+        y = np.asarray(y, dtype=float)
+        gp = AdditiveProductGP(self.dims_, interactions=self.interactions,
+                               ard_blocks=self.ard_blocks)
+        gp.fit(self.split(X), y, n_restarts=self.n_restarts, n_iter=self.n_iter, lr=self.lr,
+               seed=self.random_state, max_hyper_points=self.max_hyper_points)
+        self.kernel_report_ = gp.kernel_report()
+        self.model_ = gp
+        return self
+
+    def predict(self, X, return_std: bool = False):
+        """Predict for new rows.
+
+        Args:
+            X: Design matrix.
+            return_std: Also return the predictive standard deviation.
+
+        Returns:
+            Predictions in original units (a probability for ``task_type="binary"``), or
+            ``(prediction, std)`` when ``return_std`` is set.
+        """
+        X = np.asarray(X)
+        if not return_std:
+            return self.report(self._predict_model(self.model_, X))[0]
+        score, std = self._predict_model(self.model_, X, return_std=True)
+        return self.report(score, std)
+
+    def _predict_model(self, model: AdditiveProductGP, X, return_std: bool = False):
+        return model.predict(self.split(X), return_std=return_std)
+
+    def report(self, score, std=None):
+        """Map a model score to the reported quantity, with its uncertainty.
+
+        For a regression task the score is already the reported quantity. For a binary task a
+        latent score is pushed through the fitted calibrator -- and so is its interval, as half
+        the width of ``[calibrate(score - std), calibrate(score + std)]``.
+
+        Args:
+            score: Model score for each row, on the model's own scale.
+            std: Optional predictive standard deviation on that same scale.
+
+        Returns:
+            ``(value, std)`` in the reported units; ``std`` is zeros when none was given.
+
+        Raises:
+            ValueError: If this member needs a calibrator and has none.
+        """
+        score = np.asarray(score)
+        zeros = np.zeros(len(score))
+        if self.task_type != "binary":
+            return score, (std if std is not None else zeros)
+        if self.calibrator_ is None:
+            raise ValueError(
+                f"{type(self).__name__} is uncalibrated: a latent score is not a probability. "
+                "Call FusionEnsemble.calibrate on a held-out set before predicting")
+        probability = self._calibrate(score)
+        if std is None:
+            return probability, zeros
+        high, low = self._calibrate(score + std), self._calibrate(score - std)
+        return probability, np.abs(high - low) / 2.0
+
+    def _calibrate(self, score) -> np.ndarray:
+        """Calibrated probability of the positive class for a latent score."""
+        return self.calibrator_.predict_proba(np.asarray(score)[:, None])[:, 1]

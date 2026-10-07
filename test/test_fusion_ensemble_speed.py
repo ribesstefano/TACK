@@ -1,12 +1,10 @@
-"""The context path does its shared work once, and changes no returned bit by doing so."""
+"""The context path shares its work: featurise once, build the full matrix only if needed."""
 import numpy as np
 import pytest
 
-from fusion_fixtures import CELLS, SEQS, SMILES, build_ensemble
-from tackai.fusion.blocks import BlockPreprocessor
+from fusion_fixtures import CELLS, DEFAULT_BLOCKS, SEQS, SMILES, build_ensemble
 from tackai.fusion.data import FusionData
-from tackai.fusion.ensemble import FusionEnsemble
-from tackai.fusion.models import GPInteraction
+from tackai.fusion.gp import GPInteraction
 
 CTX = {"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0], "cell_id": CELLS[0],
        "assay": "western blot", "assay_time": 24.0}
@@ -18,7 +16,8 @@ def data(fake_cache, tiny_csv):
 
 
 def fast_gp(**kw):
-    return GPInteraction(n_restarts=1, n_iter=5, max_hyper_points=40, **kw)
+    return GPInteraction(**{"blocks": DEFAULT_BLOCKS, **kw}, n_restarts=1, n_iter=5,
+                         max_hyper_points=40)
 
 
 @pytest.fixture
@@ -26,45 +25,18 @@ def ens(data):
     return build_ensemble(fast_gp, data, task="pdc50", n_members=3, n_folds=3)
 
 
-def count_calls(monkeypatch, cls, name):
+def count_calls(monkeypatch, obj, name):
     calls = []
-    original = getattr(cls, name)
+    original = getattr(obj, name)
 
-    def spy(self, *args, **kwargs):
+    def spy(*args, **kwargs):
         calls.append(1)
-        return original(self, *args, **kwargs)
-    monkeypatch.setattr(cls, name, spy)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(obj, name, spy)
     return calls
 
 
-def unhoisted_context_predict(ens, smiles, ctx):
-    """The context path as it was: a full-width scratch row and one [valid] copy per member."""
-    n = len(smiles)
-    fp, desc, ok = ens.data.featurizer.featurize(smiles)
-    valid = np.flatnonzero(ok)
-    mol_row = np.zeros((n, ens.data.n_columns), dtype=np.float64)
-    mol_row[:, ens.data.index["fingerprint"]] = fp
-    mol_row[:, ens.data.index["descriptors"]] = desc
-    per_member = []
-    for member, fold in zip(ens.members, ctx.folds):
-        mean, std = np.full(n, np.nan), np.zeros(n)
-        Z = dict(member.pre_.transform_blocks(mol_row[valid],
-                                              only=["fingerprint", "descriptors"]))
-        mean[valid], std[valid] = ens._folded_scores(member, Z, fold, True)
-        per_member.append((mean, std))
-    return ens._aggregate(per_member, ok, smiles, True)
-
-
-def test_context_path_is_bit_identical_to_the_unhoisted_reference(ens):
-    ctx = ens.transform_context(CTX)
-    smiles = SMILES[:4] + ["not a molecule"] + SMILES[4:6]
-    got, ref = ens.predict(smiles, context=ctx), unhoisted_context_predict(ens, smiles, ctx)
-    assert np.array_equal(got.mean, ref.mean, equal_nan=True)
-    assert np.array_equal(got.std, ref.std, equal_nan=True)
-    assert got.ok.tolist() == ref.ok.tolist() == [True] * 4 + [False] + [True] * 2
-
-
-def test_invalid_neighbours_do_not_disturb_the_valid_rows(ens):  # Review Focus 2
+def test_invalid_neighbours_do_not_disturb_the_valid_rows(ens):
     ctx = ens.transform_context(CTX)
     clean = ens.predict(SMILES[:4], context=ctx)
     mixed = ens.predict([SMILES[0], "bad", SMILES[1], SMILES[2], "worse", SMILES[3]], context=ctx)
@@ -73,39 +45,22 @@ def test_invalid_neighbours_do_not_disturb_the_valid_rows(ens):  # Review Focus 
     assert np.isnan(mixed.mean[~keep]).all()
 
 
-def test_an_all_invalid_batch_is_all_nan_and_not_an_error(ens):  # Review Focus 2
+def test_an_all_invalid_batch_is_all_nan_and_not_an_error(ens):
     pred = ens.predict(["bad", "worse"], context=ens.transform_context(CTX))
     assert np.isnan(pred.mean).all() and not pred.ok.any()
 
 
-def test_members_with_identical_molecular_transforms_share_one_result(ens, monkeypatch):
+def test_the_context_path_agrees_with_the_records_path(ens):
     ctx = ens.transform_context(CTX)
-    ens.predict(SMILES[:4], context=ctx)                       # warm the featuriser memo
-    calls = count_calls(monkeypatch, BlockPreprocessor, "transform_block")
-    ens.predict(SMILES[:4], context=ctx)
-    assert len(calls) == 2, "fingerprint and descriptors should be transformed once for all members"
+    fast = ens.predict(SMILES[:4], context=ctx)
+    slow = ens.predict([{"smiles": s, **CTX} for s in SMILES[:4]])
+    assert np.allclose(fast.mean, slow.mean, rtol=1e-3, atol=1e-3)
+    assert np.allclose(fast.std, slow.std, rtol=1e-3, atol=1e-3)
 
 
-def test_a_nan_feature_switches_sharing_off(ens, monkeypatch):  # Review Focus 2
-    """With no NaN the imputer is a no-op and sharing is exact; with one it is not."""
+def test_folded_members_never_assemble_a_full_matrix(ens, monkeypatch):
     ctx = ens.transform_context(CTX)
-    real = ens.data.featurizer.featurize
-
-    def with_nan(smiles):
-        fp, desc, ok = real(smiles)
-        desc = desc.copy()
-        desc[0, 3] = np.nan
-        return fp, desc, ok
-    monkeypatch.setattr(ens.data.featurizer, "featurize", with_nan)
-    calls = count_calls(monkeypatch, BlockPreprocessor, "transform_block")
-    pred = ens.predict(SMILES[:4], context=ctx)
-    assert len(calls) == 2 * len(ens.members)
-    assert np.isfinite(pred.mean).all()
-
-
-def test_the_context_path_never_builds_a_full_width_row(ens, monkeypatch):
-    ctx = ens.transform_context(CTX)
-    calls = count_calls(monkeypatch, BlockPreprocessor, "transform_blocks")
+    calls = count_calls(monkeypatch, ens.data, "assemble_features")
     ens.predict(SMILES[:4], context=ctx)
     assert calls == []
 

@@ -5,10 +5,10 @@ from functools import partial
 import numpy as np
 import pytest
 
-from fusion_fixtures import CELLS, SEQS, SMILES, build_ensemble
+from fusion_fixtures import DEFAULT_BLOCKS, CELLS, SEQS, SMILES, build_ensemble
 from tackai.fusion.data import FusionData
 from tackai.fusion.ensemble import FusionEnsemble, FusionPrediction
-from tackai.fusion.models import GPInteraction, XGBoostFusion
+from tackai.fusion.gp import GPInteraction
 
 CTX = {"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0], "cell_id": CELLS[0],
        "assay": "western blot", "assay_time": 24.0}
@@ -20,11 +20,7 @@ def data(fake_cache, tiny_csv):
 
 
 def fast_gp(**kw):
-    return GPInteraction(n_restarts=1, n_iter=5, max_hyper_points=40, **kw)
-
-
-def fast_xgb(**kw):
-    return XGBoostFusion(n_estimators=20, max_depth=3, reg_lambda=5.0, **kw)
+    return GPInteraction(**{"blocks": DEFAULT_BLOCKS, **kw}, n_restarts=1, n_iter=5, max_hyper_points=40)
 
 
 def test_fit_produces_the_requested_number_of_members(data):
@@ -45,26 +41,17 @@ def test_predict_is_the_weighted_mean_of_the_members(data):
 def test_context_path_agrees_with_the_ordinary_path(data):
     """The whole point of the context cache: the same numbers for much less work.
 
-    Agreement is to 1e-10, not bit-for-bit: with a fixed context the GP collapses its six
-    context-only kernel terms into two vectors, which sums the same quantities in a different
-    order. Bitwise equality would mean the fast path was not actually taking a shortcut.
+    Agreement is to float32 precision, not bit-for-bit: with a fixed context the GP collapses
+    its six context-only kernel terms into two vectors, which sums the same quantities in a
+    different order. Bitwise equality would mean the fast path was not actually taking a shortcut.
     """
-    ens = build_ensemble(partial(fast_gp, dtype="float64"), data, task="pdc50", n_members=2, n_folds=3)
-    ctx = ens.transform_context(CTX)
-    fast = ens.predict(SMILES[:4], context=ctx)
-    slow = ens.predict([{"smiles": s, **CTX} for s in SMILES[:4]])
-    assert np.allclose(fast.mean, slow.mean, rtol=1e-10, atol=1e-12)
-    assert np.allclose(fast.std, slow.std, rtol=1e-10, atol=1e-12)
-    assert all(fold is not None for fold in ctx.folds), "GP members should fold their context"
-
-
-def test_context_path_agrees_with_the_ordinary_path_in_float32(data):
     ens = build_ensemble(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
     ctx = ens.transform_context(CTX)
     fast = ens.predict(SMILES[:4], context=ctx)
     slow = ens.predict([{"smiles": s, **CTX} for s in SMILES[:4]])
     assert np.allclose(fast.mean, slow.mean, rtol=1e-3, atol=1e-3)
     assert np.allclose(fast.std, slow.std, atol=2e-3)
+    assert all(fold is not None for fold in ctx.folds), "GP members should fold their context"
 
 
 def test_std_combines_member_variance_and_member_spread(data):
@@ -77,33 +64,10 @@ def test_std_combines_member_variance_and_member_spread(data):
     assert np.allclose(pred.std, expected)
 
 
-def test_std_falls_back_to_member_spread_without_predictive_variance(data):
-    ens = build_ensemble(fast_xgb, data, task="pdc50", n_members=3, n_folds=3)
-    pred = ens.predict(SMILES[:3], context=ens.transform_context(CTX))
-    means = np.array(list(pred.member_predictions.values()))
-    w = np.array(list(ens.weights.values()))[:, None]
-    assert np.allclose(pred.std, np.sqrt((w * (means - pred.mean) ** 2).sum(0)))
-
-
 def test_confidence_interval_brackets_the_mean(data):
     ens = build_ensemble(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
     pred = ens.predict(SMILES[:3], context=ens.transform_context(CTX))
     assert (pred.ci_lower_95 <= pred.mean).all() and (pred.mean <= pred.ci_upper_95).all()
-
-
-def test_members_may_mix_estimator_classes(data):
-    """Generic over members: the same input serves all of them."""
-    ens = build_ensemble([fast_gp, fast_xgb, fast_gp], data, task="pdc50", n_folds=3)
-    assert len(ens.members) == 3
-    pred = ens.predict(SMILES[:2], context=ens.transform_context(CTX))
-    assert pred.mean.shape == (2,) and np.isfinite(pred.mean).all()
-
-
-def test_binary_task_predicts_probabilities(data):
-    ens = build_ensemble(fast_xgb, data, task="activity", n_members=2, n_folds=3)
-    pred = ens.predict(SMILES[:3], context=ens.transform_context(CTX))
-    assert ((pred.mean >= 0) & (pred.mean <= 1)).all()
-    assert pred.label_name
 
 
 def test_save_and_from_pretrained_round_trip(data, tmp_path):
@@ -122,6 +86,29 @@ def test_manifest_records_the_block_layout(data, tmp_path):
     assert manifest["task"] == "pdc50"
     assert manifest["block_dims"]["fingerprint"] == 1024
     assert manifest["n_members"] == 1 and "tackai" in manifest["versions"]
+
+
+def test_push_to_hub_saves_then_uploads_the_saved_directory(data, tmp_path, monkeypatch):
+    ens = build_ensemble(fast_gp, data, task="pdc50", n_members=1, n_folds=3)
+    calls = {}
+
+    class FakeApi:
+        def create_repo(self, repo_id, repo_type, exist_ok, private):
+            calls["create_repo"] = (repo_id, repo_type, exist_ok, private)
+
+        def upload_folder(self, repo_id, repo_type, folder_path, commit_message):
+            calls["upload_folder"] = (repo_id, repo_type, folder_path, commit_message)
+            return type("Commit", (), {"oid": "abc123"})()
+
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda: FakeApi())
+    staging = tmp_path / "staged"
+    sha = ens.push_to_hub("ailab-bio/TACK-fusion-ensemble", staging_dir=staging,
+                         commit_message="test commit")
+    assert sha == "abc123"
+    assert calls["create_repo"] == ("ailab-bio/TACK-fusion-ensemble", "model", True, False)
+    assert calls["upload_folder"] == ("ailab-bio/TACK-fusion-ensemble", "model", str(staging),
+                                      "test commit")
+    assert (staging / "manifest.json").exists()
 
 
 def test_invalid_smiles_yields_nan_not_an_exception(data):  # Review Focus 2
@@ -245,39 +232,24 @@ def test_calibrate_refuses_an_empty_set(data):
         ens.calibrate(X[:0], np.zeros(0))
 
 
-def test_calibrate_refuses_an_all_native_ensemble(data):
-    _, X, y, _ = data.task_rows("activity")
-    ens = _activity_ensemble(data, partial(fast_xgb, task_type="binary"))
-    with pytest.raises(ValueError, match="nothing to calibrate"):
-        ens.calibrate(X, y)
-
-
-def test_calibrate_scores_through_the_path_predict_uses(data):
-    """Calibrating through member.pre_ would fit the map on a different scale than predict's."""
+def test_calibrate_fits_the_map_on_the_scores_predict_applies_it_to(data):
     from sklearn.linear_model import LogisticRegression
     _, X, y, _ = data.task_rows("activity")
     ens = _activity_ensemble(data, partial(fast_gp, task_type="binary"))
-    real, calls = ens._iter_member_blocks, []
-    ens._iter_member_blocks = lambda rows: (calls.append(len(rows)), real(rows))[1]
     ens.calibrate(X, y)
-    assert calls == [len(X)], "calibrate must score through _iter_member_blocks"
-    for member, Z in zip(ens.members, real(X)):
-        score = member._predict_model(member.model_, Z)
+    for member in ens.members:
+        score = member._predict_model(member.model_, X)
         expected = LogisticRegression(C=1e4).fit(score[:, None], y.astype(int))
         assert np.allclose(member.calibrator_.coef_, expected.coef_)
         assert np.allclose(member.calibrator_.intercept_, expected.intercept_)
-
-
-def test_astype_keeps_the_calibrator(data):
-    _, X, y, _ = data.task_rows("activity")
-    ens = _activity_ensemble(data, partial(fast_gp, task_type="binary", dtype="float64"),
-                             n_members=1)
-    ens.calibrate(X, y)
-    before = ens.members[0].calibrator_
-    ens.astype("float32")
-    assert ens.members[0].calibrator_ is before
     pred = ens.predict_matrix(X)
     assert ((pred.mean >= 0) & (pred.mean <= 1)).all()
+
+
+def test_promoted_reports_one_flag_per_member(data):
+    ens = build_ensemble(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
+    assert len(ens.promoted) == len(ens.members)
+    assert all(isinstance(flag, bool) for flag in ens.promoted)
 
 
 def test_an_unknown_task_is_refused_at_construction(data):

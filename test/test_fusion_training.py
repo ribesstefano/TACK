@@ -62,19 +62,14 @@ def test_validation_split_refuses_a_single_group():
         validation_split(np.zeros(40, dtype=int))
 
 
-from functools import partial
-
-from tackai.fusion.models import GPInteraction, XGBoostFusion
+from fusion_fixtures import DEFAULT_BLOCKS
+from tackai.fusion.gp import GPInteraction
 from tackai.fusion.training import fit_member
 from test_fusion_models import synth      # pytest puts test/ on sys.path
 
 
 def fast_gp(**kw):
-    return GPInteraction(n_restarts=1, n_iter=15, max_hyper_points=60, **kw)
-
-
-def fast_xgb(**kw):
-    return XGBoostFusion(n_estimators=40, **kw)
+    return GPInteraction(**{"blocks": DEFAULT_BLOCKS, **kw}, n_restarts=1, n_iter=15, max_hyper_points=60)
 
 
 def test_fit_member_trains_on_the_given_rows_only():
@@ -100,43 +95,6 @@ def test_fit_member_refuses_bad_training_labels_before_fitting():
         fit_member(fast_gp, X, y, random_state=0)
 
 
-def test_fit_member_needs_groups_for_early_stopping():
-    X, y, g = synth()
-    with pytest.raises(ValueError, match="groups"):
-        fit_member(fast_xgb, X, y, early_stopping=True, random_state=0)
-
-
-def test_fit_member_early_stops_an_xgboost_member():
-    X, y, g = synth(n=150)
-    est = fit_member(fast_xgb, X, y, groups=g, early_stopping=True, random_state=0)
-    assert est.model_.best_iteration is not None       # a validation set was actually used
-    assert 1 <= est.n_trees_ <= 40
-
-
-def test_fit_member_without_early_stopping_uses_every_round():
-    """The `validation is None` branch must fit n_estimators rounds, not stop at one."""
-    X, y, g = synth(n=150)
-    est = fit_member(fast_xgb, X, y, random_state=0)
-    assert est.n_trees_ == 40
-
-
-def test_fit_member_refuses_a_single_class_validation_set():
-    """A validation set with one class makes XGBoost's eval metric undefined.
-
-    `fit_member` with no `train` splits `validation_split(g)` for every row, so the same call
-    here names exactly the rows it will hold out.
-    """
-    X, y, g = synth(n=150, binary=True)
-    inner, val = validation_split(g, random_state=0)
-    y = y.copy()
-    y[val] = 1.0                                       # the validation fold loses its negatives
-    y[inner[:len(inner) // 2]] = 0.0                   # training rows stay mixed
-    y[inner[len(inner) // 2:]] = 1.0
-    with pytest.raises(ValueError, match="validation labels"):
-        fit_member(partial(fast_xgb, task_type="binary"), X, y, groups=g,
-                   early_stopping=True, random_state=0)
-
-
 def test_fit_is_reproducible_for_a_seed():
     X, y, g = synth()
     a = fit_member(fast_gp, X, y, random_state=3).predict(X)
@@ -158,24 +116,3 @@ def test_fit_member_does_not_starve_a_model_that_cannot_early_stop():
     assert est.model_.n_train_ == len(y)
 
 
-def test_fit_member_accepts_a_constant_regression_validation_set():
-    """A constant validation target still has a measurable error; only a classifier needs two."""
-    X, y, g = synth(n=150)
-    _, val = validation_split(g, random_state=0)
-    y = y.copy()
-    y[val] = 3.5
-    est = fit_member(fast_xgb, X, y, groups=g, early_stopping=True, random_state=0)
-    assert est.model_.best_iteration is not None
-
-
-def test_fit_member_checks_the_rows_it_actually_fits():
-    """Mixed overall, but the rows left after the validation split are all one class."""
-    X, y, g = synth(n=150, binary=True)
-    inner, val = validation_split(g, random_state=0)
-    y = y.copy()
-    y[inner] = 1.0
-    y[val[: len(val) // 2]] = 0.0
-    y[val[len(val) // 2:]] = 1.0
-    with pytest.raises(ValueError, match="training labels"):
-        fit_member(partial(fast_xgb, task_type="binary"), X, y, groups=g,
-                   early_stopping=True, random_state=0)

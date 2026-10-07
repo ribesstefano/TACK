@@ -1,21 +1,16 @@
-"""Regressions found by the whole-branch review of the float32 / shared-context work."""
-import pickle
+"""Contracts of the stateless design: a member's layout, the GP's own scaling, the assay-time default."""
 from functools import partial
 
 import numpy as np
 import pytest
-import torch
-from sklearn.base import clone
 
-from fusion_fixtures import CELLS, SEQS, SMILES, build_ensemble
-from tackai.fusion.blocks import BlockPreprocessor, block_index
+from fusion_fixtures import CELLS, DEFAULT_BLOCKS, SEQS, SMILES, build_ensemble
+from tackai.fusion.context import ASSAY_TIME_DEFAULT
 from tackai.fusion.data import FusionData
 from tackai.fusion.ensemble import FusionEnsemble
 from tackai.fusion.gp import AdditiveProductGP
-from tackai.fusion.models import GPInteraction
+from tackai.fusion.gp import GPInteraction
 
-from test_fusion_blocks import make_X
-from test_fusion_dtype import design
 from test_fusion_gp import dims_of, toy
 
 CTX = {"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0], "cell_id": CELLS[0],
@@ -24,7 +19,8 @@ RECORDS = [{"smiles": s, **CTX} for s in SMILES[:4]]
 
 
 def fast_gp(**kw):
-    return GPInteraction(n_restarts=1, n_iter=5, max_hyper_points=40, **kw)
+    return GPInteraction(**{"blocks": DEFAULT_BLOCKS, **kw}, n_restarts=1, n_iter=5,
+                         max_hyper_points=40)
 
 
 @pytest.fixture
@@ -33,80 +29,73 @@ def data(fake_cache, tiny_csv):
 
 
 @pytest.fixture
-def ens64(data):
-    return build_ensemble(partial(fast_gp, dtype="float64"), data, task="pdc50",
-                              n_members=2, n_folds=3)
+def ens(data):
+    return build_ensemble(fast_gp, data, task="pdc50", n_members=2, n_folds=3)
 
 
-# -- an artifact pickled before ``dtype`` existed must stay a well-behaved sklearn object --------
+# -- the GP applies 1/sqrt(width) itself, so callers hand it raw blocks ----------------------------
 
-def test_a_preprocessor_pickled_before_dtype_existed_supports_repr_and_clone():  # Review Focus 1
-    X, _ = make_X()
-    pre = BlockPreprocessor().fit(X)
-    del pre.dtype                                     # what the old code wrote
-    loaded = pickle.loads(pickle.dumps(pre))
-    assert loaded.dtype == "float64" and loaded.get_params()["dtype"] == "float64"
-    assert "BlockPreprocessor" in repr(loaded)
-    assert clone(loaded).dtype == "float64"
-
-
-# -- an unsupported precision must be refused before anything is changed --------------------------
-
-def test_gp_refuses_an_unsupported_dtype_before_changing_anything():
+def test_the_gp_divides_every_non_linear_block_by_sqrt_width():
     Z, y = toy()
-    with pytest.raises(ValueError, match="float32"):
-        AdditiveProductGP(dims_of(Z), dtype="float16")
     gp = AdditiveProductGP(dims_of(Z))
     gp.fit(Z, y, n_restarts=1, n_iter=5, seed=0)
-    before = gp.predict(Z)
-    with pytest.raises(ValueError, match="float32"):
-        gp.astype("float16")
-    assert gp.dtype is torch.float32 and gp.Z_train_["poi"].dtype == torch.float32
-    assert np.array_equal(gp.predict(Z), before)
+    for block, width in dims_of(Z).items():
+        want = np.asarray(Z[block], dtype=np.float32)
+        if block not in gp.linear_blocks:
+            want = want / np.float32(np.sqrt(width))
+        assert np.allclose(gp.Z_train_[block].numpy(), want, rtol=1e-6), block
 
 
-def test_ensemble_astype_refuses_an_unsupported_dtype_before_changing_anything(ens64):
-    before = ens64.predict(RECORDS).mean
-    with pytest.raises(ValueError, match="float32"):
-        ens64.astype("float16")
-    for member in ens64.members:
-        assert member.dtype == "float64" and member.pre_.dtype == "float64"
-        assert member.model_.dtype is torch.float64
-    assert ens64.context_pre_.dtype == "float64"
-    assert np.array_equal(ens64.predict(RECORDS).mean, before)
+def test_the_linear_block_is_left_at_its_own_scale():
+    Z, y = toy()
+    gp = AdditiveProductGP(dims_of(Z))
+    gp.fit(Z, y, n_restarts=1, n_iter=5, seed=0)
+    assert "assay_time" in gp.linear_blocks
+    assert np.array_equal(gp.Z_train_["assay_time"].numpy(), np.asarray(Z["assay_time"], np.float32))
 
 
-# -- a member with its own column layout is scored through that layout on every path --------------
+# -- a member must have been fitted on the layout of the data the ensemble is built on -------------
 
-def test_a_member_with_its_own_descriptor_order_is_scored_correctly_from_a_cached_context(data):
-    """The descriptor kernel is ARD, so the order of its columns changes the prediction."""
-    blocks = block_index(data.dims)
-    blocks["descriptors"] = blocks["descriptors"][::-1].copy()
-    ens = build_ensemble(partial(fast_gp, blocks=blocks, dtype="float64"), data,
-                             task="pdc50", n_members=2, n_folds=3)
-    from_context = ens.predict(SMILES[:4], context=ens.transform_context(CTX))
-    from_records = ens.predict(RECORDS)
-    assert np.allclose(from_context.mean, from_records.mean, rtol=1e-8, atol=1e-8)
-    assert np.allclose(from_context.std, from_records.std, rtol=1e-6, atol=1e-8)
+def test_an_ensemble_refuses_a_member_fitted_on_another_layout(data, ens):
+    from tackai.fusion.training import fit_member
+    other = data.blocks_indexes
+    other["descriptors"] = other["descriptors"][::-1].copy()
+    _, X, y, _ = data.task_rows("pdc50")
+    odd = fit_member(partial(fast_gp, blocks=other), X, y)
+    with pytest.raises(ValueError, match="block layout"):
+        FusionEnsemble(list(ens.members) + [odd], data, "pdc50")
 
 
-# -- save / load must not silently change which context transform is used -------------------------
-
-def test_save_records_whether_the_context_is_shared(data, ens64, tmp_path):
-    own = FusionEnsemble(ens64.members, data, "pdc50", shared_context=False)
-    own.save(tmp_path / "own")
-    assert FusionEnsemble.from_pretrained(tmp_path / "own").shared_context is False
-    ens64.save(tmp_path / "shared")
-    assert FusionEnsemble.from_pretrained(tmp_path / "shared").shared_context is True
-    assert FusionEnsemble.from_pretrained(tmp_path / "own", shared_context=True).shared_context
-    assert FusionEnsemble.from_pretrained(tmp_path / "shared",
-                                          shared_context=False).shared_context is False
+def test_the_estimators_take_their_layout_from_the_data(data):
+    _, X, y, _ = data.task_rows("pdc50")
+    est = fast_gp(blocks=data.blocks_indexes).fit(X, y)
+    assert est.dims_ == data.dims
 
 
-def test_a_manifest_without_shared_context_defaults_to_shared(data, ens64, tmp_path):
-    import json
-    ens64.save(tmp_path / "old")
-    manifest = json.loads((tmp_path / "old" / "manifest.json").read_text())
-    manifest.pop("shared_context", None)
-    (tmp_path / "old" / "manifest.json").write_text(json.dumps(manifest))
-    assert FusionEnsemble.from_pretrained(tmp_path / "old").shared_context is True
+def test_a_gp_cannot_be_built_without_a_layout():
+    with pytest.raises(TypeError):
+        GPInteraction()
+
+
+# -- a missing assay duration is the constant 24 h, never learned ----------------------------------
+
+def test_a_missing_assay_time_becomes_the_constant_default(data):
+    col = data.index["assay_time"][0]
+    rows = [{"smiles": SMILES[0], **{k: v for k, v in CTX.items() if k != "assay_time"}},
+            {"smiles": SMILES[0], **{**CTX, "assay_time": float("nan")}},
+            {"smiles": SMILES[0], **{**CTX, "assay_time": 6.0}}]
+    X = data.encode(rows)
+    assert X[0, col] == X[1, col] == ASSAY_TIME_DEFAULT == 24.0 and X[2, col] == 6.0
+    assert np.isfinite(X).all()
+
+
+def test_the_training_matrix_holds_no_nan(data):
+    assert np.isfinite(data.X).all()
+
+
+def test_an_estimator_refuses_a_matrix_with_nan(data):
+    _, X, y, _ = data.task_rows("pdc50")
+    X = X.copy()
+    X[0, 0] = np.nan
+    with pytest.raises(ValueError, match="NaN"):
+        fast_gp(blocks=data.blocks_indexes).fit(X, y)

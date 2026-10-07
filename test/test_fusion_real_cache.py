@@ -62,11 +62,12 @@ def test_development_table_encodes_end_to_end():
     assert data.dropped["total"] / data.dropped["read"] < 0.06    # ~4.6% on this snapshot
     assert len(data.table) == data.dropped["read"] - data.dropped["total"]
 
-    # Every embedding block is complete; assay_time is the one block allowed to be missing
-    # (not every paper reports a timepoint), and the preprocessor imputes it inside each fold.
-    for block in ("e3", "cell", "poi", "assay"):
-        assert np.isfinite(data.X[:, data.index[block]]).all(), f"{block} has missing values"
-    assert np.isnan(data.X[:, data.index["assay_time"]]).any()
+    # The matrix is complete. Not every paper reports a timepoint; those rows carry the
+    # constant default of 24 h, which nothing learned from the data.
+    assert np.isfinite(data.X).all()
+    unreported = data.table["assay_time"].isna().to_numpy()
+    print(f"assay_time unreported in {unreported.sum()} of {len(unreported)} rows")
+    assert (data.X[unreported, data.index["assay_time"][0]] == 24.0).all()
 
     for task, floor in [("dmax", 4000), ("pdc50", 6500), ("activity", 4000)]:
         idx, X, y, groups = data.task_rows(task)
@@ -88,13 +89,13 @@ def test_gp_member_fits_the_real_dmax_fold():
     from sklearn.metrics import r2_score
 
     from tackai.fusion.data import FusionData
-    from tackai.fusion.models import GPInteraction
+    from tackai.fusion.gp import GPInteraction
 
     data = FusionData.from_csv(DEV_FILES)
     _, X, y, groups = data.task_rows("dmax")
     train, test = data.splits("dmax", n_repeats=1, n_folds=5)[0][0]
 
-    gp = GPInteraction(random_state=0).fit(X[train], y[train])
+    gp = GPInteraction(blocks=data.blocks_indexes, random_state=0).fit(X[train], y[train])
     mean, std = gp.predict(X[test], return_std=True)
     assert np.isfinite(mean).all() and (std > 0).all()
     assert gp.model_.noise_ >= 1e-3

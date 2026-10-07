@@ -40,27 +40,14 @@ def test_predict_returns_std_and_it_is_smaller_on_training_points():
     assert std_far.mean() > std_train.mean() * 2
 
 
-def test_variance_matches_the_textbook_formula():
-    """var = k** - ks' (K + sI)^-1 ks, assembled independently from the fitted kernel."""
-    Z, y = toy(n=40)
-    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
-    gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
-    _, std = gp.predict(Z, return_std=True)
-    K = gp.kernel_matrix(Z, Z)
-    Kn = K + np.eye(len(y)) * gp.noise_
-    naive = np.sqrt(np.clip(np.diag(K) - np.einsum("ij,jk,ki->i", K, np.linalg.inv(Kn), K),
-                            0, None))
-    assert np.allclose(std, naive, rtol=1e-5, atol=1e-7)
-
-
 def test_cached_distances_equal_a_naive_recomputation():
     Z, y = toy()
-    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
+    gp = AdditiveProductGP(dims_of(Z))
     state = gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
     cached = gp.predict(Z)
-    fresh = AdditiveProductGP(dims_of(Z), dtype="float64")
+    fresh = AdditiveProductGP(dims_of(Z))
     fresh.load_state(state, Z, y)
-    assert np.allclose(cached, fresh.predict(Z), rtol=1e-10, atol=1e-12)
+    assert np.allclose(cached, fresh.predict(Z), rtol=1e-5, atol=1e-6)
 
 
 def test_ard_block_learns_one_lengthscale_per_column():
@@ -98,11 +85,11 @@ def test_interactions_are_configurable_including_mol_x_e3():
 
 def test_fit_is_reproducible_for_a_seed():
     Z, y = toy()
-    a = AdditiveProductGP(dims_of(Z), dtype="float64")
+    a = AdditiveProductGP(dims_of(Z))
     a.fit(Z, y, n_restarts=2, n_iter=20, seed=7)
-    b = AdditiveProductGP(dims_of(Z), dtype="float64")
+    b = AdditiveProductGP(dims_of(Z))
     b.fit(Z, y, n_restarts=2, n_iter=20, seed=7)
-    assert np.allclose(a.predict(Z), b.predict(Z), rtol=1e-10, atol=1e-12)
+    assert np.allclose(a.predict(Z), b.predict(Z), rtol=1e-5, atol=1e-6)
 
 
 def test_hyper_fit_subsamples_but_conditions_on_all_rows():
@@ -170,31 +157,6 @@ def test_singular_kernel_with_vanishing_noise_still_fits(monkeypatch):
     assert np.isfinite(gp.predict(Z)).all()
 
 
-def test_rbf_self_covariance_is_one_at_any_column_scale():
-    """RBF(x, x) must be exactly 1 however large the raw column values are.
-
-    The descriptor block is raw by design and Ipc reaches 1e20. Computing squared distances
-    as |a|^2 + |b|^2 - 2a.b then loses the diagonal: its true value is 0, but the absolute
-    error of the cancellation is ~1e19, so exp(-d2/2l^2) returns 0 where it must return 1.
-    On the real dmax data that gave rbf:descriptors a minimum eigenvalue of -3.7 and the
-    conditioning Cholesky failed outright.
-    """
-    import torch
-
-    for scale in (1.0, 1e9, 1e18):
-        Z, y = toy(n=50)
-        Z["descriptors"] = Z["descriptors"] * scale
-        gp = AdditiveProductGP(dims_of(Z), dtype="float64")
-        gp.fit(Z, y, n_restarts=1, n_iter=5, seed=0)
-        Zt = gp._to_tensor(Z)
-        cached = gp._cache_distances(Zt, Zt)
-        with torch.no_grad():
-            for block in gp.rbf_blocks:
-                diag = gp._rbf(block, gp.params_, Zt, Zt, cached).diagonal().numpy()
-                assert np.allclose(diag, 1.0, atol=1e-12), (
-                    f"scale {scale:.0e}: RBF({block}, x, x) = {diag.min():.6f}, not 1")
-
-
 def test_raw_descriptor_scale_gives_a_positive_definite_kernel():
     """The assembled kernel of a 1e18-scale block must still be factorisable."""
     Z, y = toy(n=120)
@@ -209,30 +171,6 @@ def test_raw_descriptor_scale_gives_a_positive_definite_kernel():
     assert np.isfinite(mean).all() and np.isfinite(std).all()
 
 
-def test_folded_context_matches_the_full_kernel():
-    """With a fixed context, the context-only kernel terms collapse to two vectors.
-
-    Six of the ten terms (four context RBFs, the linear block, and poi*cell) do not depend on
-    the molecule at all, and mol*poi / mol*cell are the molecular kernel times a per-training-
-    row scalar. Folding them means a batch only pays for the two molecular distance matrices.
-    """
-    Z, y = toy(n=80)
-    Z["e3"] = np.random.default_rng(1).normal(size=(80, 3))
-    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
-    gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
-
-    context = {b: Z[b][:1] for b in ("e3", "poi", "cell", "assay_time")}
-    mols = {b: Z[b][:12] for b in ("fingerprint", "descriptors")}
-    fold = gp.fold_context(context)
-
-    folded_mean, folded_std = gp.predict_in_context(mols, fold, return_std=True)
-
-    full = {**{b: np.repeat(context[b], 12, axis=0) for b in context}, **mols}
-    mean, std = gp.predict(full, return_std=True)
-    assert np.allclose(folded_mean, mean, rtol=1e-10, atol=1e-12)
-    assert np.allclose(folded_std, std, rtol=1e-10, atol=1e-12)
-
-
 def test_folded_context_rejects_a_molecule_only_interaction():
     """A product of two molecular kernels cannot be folded into a per-row scalar."""
     Z, y = toy(n=40)
@@ -240,37 +178,6 @@ def test_folded_context_rejects_a_molecule_only_interaction():
     gp.fit(Z, y, n_restarts=1, n_iter=5, seed=0)
     with pytest.raises(ValueError, match="mol"):
         gp.fold_context({b: Z[b][:1] for b in ("poi", "cell", "assay_time")})
-
-
-@pytest.mark.parametrize("interactions", [
-    ("mol*poi", "mol*cell", "poi*cell"),
-    ("fingerprint*poi",),
-    ("descriptors*cell",),
-    ("fingerprint*poi", "mol*cell", "poi*cell"),
-    ("mol*e3",),
-    ("poi*poi",),
-    (),
-])
-def test_folded_context_matches_the_full_kernel_for_any_interactions(interactions):
-    """The fold must be algebraically exact for every interaction, not just the defaults.
-
-    A side naming a single molecular block (fingerprint*poi) is not the same term as mol*poi:
-    the molecular kernel of a fold is RBF_fp + RBF_desc, so folding a bare block against the
-    shared molecular weight silently adds the other block's kernel to the term.
-    """
-    Z, y = toy(n=80)
-    Z["e3"] = np.random.default_rng(1).normal(size=(80, 3))
-    gp = AdditiveProductGP(dims_of(Z), interactions=interactions, dtype="float64")
-    gp.fit(Z, y, n_restarts=1, n_iter=15, seed=0)
-
-    context = {b: Z[b][:1] for b in ("e3", "poi", "cell", "assay_time")}
-    mols = {b: Z[b][:12] for b in ("fingerprint", "descriptors")}
-    folded_mean, folded_std = gp.predict_in_context(mols, gp.fold_context(context),
-                                                    return_std=True)
-    full = {**{b: np.repeat(context[b], 12, axis=0) for b in context}, **mols}
-    mean, std = gp.predict(full, return_std=True)
-    assert np.allclose(folded_mean, mean, rtol=1e-10, atol=1e-12)
-    assert np.allclose(folded_std, std, rtol=1e-10, atol=1e-12)
 
 
 def test_cholesky_with_zero_jitter_raises_instead_of_hanging():
@@ -285,7 +192,7 @@ def test_cholesky_with_zero_jitter_raises_instead_of_hanging():
 import torch
 
 
-def test_default_dtype_is_float32():
+def test_the_gp_runs_in_float32():
     Z, y = toy()
     gp = AdditiveProductGP(dims_of(Z))
     gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
@@ -295,18 +202,10 @@ def test_default_dtype_is_float32():
     assert gp.predict(Z).dtype == np.float32
 
 
-def test_float64_is_still_available():
-    Z, y = toy()
-    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
-    gp.fit(Z, y, n_restarts=1, n_iter=10, seed=0)
-    assert gp.dtype is torch.float64 and gp.predict(Z).dtype == np.float64
-    assert gp.promoted_ is False
-
-
 def test_jitter_ladder_depends_on_the_dtype():
     dims = {"fingerprint": 2, "descriptors": 2, "assay_time": 1}
     assert AdditiveProductGP(dims)._base_jitter() == 1e-5
-    assert AdditiveProductGP(dims, dtype="float64")._base_jitter() == 1e-6
+    assert AdditiveProductGP(dims)._base_jitter(torch.float64) == 1e-6
     assert AdditiveProductGP(dims, jitter=3e-7)._base_jitter() == 3e-7
 
 
@@ -349,19 +248,6 @@ def test_prediction_works_with_a_promoted_float64_factor():
     gp.chol_, gp.promoted_ = gp.chol_.double(), True
     mean2, std2 = gp.predict(Z, return_std=True)
     assert np.allclose(mean, mean2, atol=1e-6) and np.allclose(std, std2, atol=1e-4)
-
-
-def test_astype_reconditions_in_the_new_precision():
-    Z, y = toy(n=80)
-    gp = AdditiveProductGP(dims_of(Z), dtype="float64")
-    gp.fit(Z, y, n_restarts=1, n_iter=20, seed=0)
-    mean64, std64 = gp.predict(Z, return_std=True)
-    assert gp.astype("float32") is gp
-    assert gp.dtype is torch.float32 and gp.Z_train_["poi"].dtype == torch.float32
-    assert gp.params_["mean"].dtype == torch.float32
-    mean32, std32 = gp.predict(Z, return_std=True)
-    assert np.allclose(mean32, mean64, rtol=1e-2, atol=1e-2)
-    assert np.allclose(std32, std64, rtol=5e-2, atol=2e-2)
 
 
 @pytest.mark.parametrize("scale", [1e9, 1e18, 1e20])
@@ -447,7 +333,7 @@ def test_folded_context_matches_the_full_kernel_for_any_interactions_in_float32(
     assert np.allclose(folded_std, std, atol=2e-3)
 
 
-def test_variance_matches_the_textbook_formula_in_float32():
+def test_variance_matches_the_textbook_formula():
     """Float32 agrees with the float64 textbook formula to ~4e-5 relative (rtol 1e-3 allows for conditioning)."""
     Z, y = toy(n=40)
     gp = AdditiveProductGP(dims_of(Z))

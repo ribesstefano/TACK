@@ -1,9 +1,9 @@
 """Everything around a fit that is not the fit itself.
 
-The estimators in :mod:`tackai.fusion.models` only train: they take the rows they are given,
-in the units they are given, with the hyper-parameters they were constructed with. Choosing
-those rows -- which fold a member trains on, which of them early-stop it -- and refusing the
-ones no model can learn from is this module's job.
+The estimators, such as :class:`~tackai.fusion.gp.GPInteraction`, only train: they take the
+rows they are given, in the units they are given, with the hyper-parameters they were
+constructed with. Choosing those rows -- which fold a member trains on, which of them
+early-stop it -- and refusing the ones no model can learn from is this module's job.
 """
 import numpy as np
 from sklearn.model_selection import GroupShuffleSplit

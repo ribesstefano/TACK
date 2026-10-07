@@ -5,6 +5,14 @@ in ``test/`` (which pytest puts on ``sys.path``) rather than a ``test`` package,
 ``test`` is a standard-library package name and importing ``test.conftest`` would shadow it.
 """
 
+from tackai.fusion.data import BLOCK_ORDER, block_index  # noqa: F401  (re-exported for tests)
+
+#: Widths of a FusionData built on the synthetic cache below and the default featuriser.
+#: ``test_fusion_data.py`` checks that they agree with what the library discovers.
+BLOCK_DIMS = {"fingerprint": 1024, "descriptors": 217, "e3": 7, "cell": 47, "poi": 51,
+              "assay": 8, "assay_time": 1}
+DEFAULT_BLOCKS = block_index(BLOCK_DIMS)
+
 CELL_FILE = "cell_embeddings_model=sentence-transformer_pooling=mean_pca47.npz"
 POI_FILE = ("protein_embeddings_esm_model=facebook-esm2_t30_150M_UR50D_layer=18"
             "_pooling=lse_window=1022_block=poi_pca51.npz")

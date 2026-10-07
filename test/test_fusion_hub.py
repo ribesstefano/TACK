@@ -12,7 +12,7 @@ import publish_fusion_context as pfc  # noqa: E402
 
 from fusion_fixtures import (ASSAY_FILE, ASSAY_PCA_FILE, CELL_FILE, COMBINED_FILE, E3_FILE,
                              POI_FILE)
-from tackai.fusion.context import CONTEXT_FILES
+from tackai.fusion.context import CONTEXT_FILES, ContextEncoder
 from tackai.fusion.data import FusionData
 
 
@@ -262,3 +262,93 @@ def test_from_pretrained_uses_snapshot_download_for_a_repo_id(fake_cache, tmp_pa
                                       cache_dir=tmp_path / "fresh_cache")
     assert calls["args"] == ("ailab-bio/TACK-fusion-context", "dataset", None, None)
     assert data.dims["cell"] == 47
+
+
+# ---------------------------------------------------------------------- push_to_hub
+
+
+class _FakeHubApi:
+    """Records create_repo/upload_folder calls instead of touching the network."""
+
+    def __init__(self, calls):
+        self.calls = calls
+
+    def whoami(self):
+        return {"name": "test-user"}
+
+    def create_repo(self, repo_id, repo_type, exist_ok, private):
+        self.calls["create_repo"] = (repo_id, repo_type, exist_ok, private)
+
+    def upload_folder(self, repo_id, repo_type, folder_path, commit_message):
+        self.calls["upload_folder"] = (repo_id, repo_type, folder_path, commit_message)
+        return type("Commit", (), {"oid": "abc123"})()
+
+
+def test_push_to_hub_stages_to_a_given_directory_and_uploads(fake_cache, tmp_path, monkeypatch):
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache))
+    calls = {}
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda: _FakeHubApi(calls))
+    staged = tmp_path / "staged"
+
+    sha = data.push_to_hub("ailab-bio/TACK-fusion-context", commit_message="test commit",
+                           staging_dir=staged)
+
+    assert sha == "abc123"
+    for name in _all_context_filenames():
+        assert (staged / name).exists()
+    assert (staged / "manifest.json").exists()
+    assert calls["create_repo"] == ("ailab-bio/TACK-fusion-context", "dataset", True, False)
+    assert calls["upload_folder"][2] == str(staged)
+    assert calls["upload_folder"][3] == "test commit"
+
+
+def test_push_to_hub_without_staging_dir_uses_and_cleans_up_a_temp_directory(
+        fake_cache, monkeypatch):
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache))
+    calls = {}
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda: _FakeHubApi(calls))
+
+    data.push_to_hub("ailab-bio/TACK-fusion-context")
+
+    staged_path = Path(calls["upload_folder"][2])
+    assert not staged_path.exists(), "the temporary staging directory must not survive the call"
+
+
+def test_push_to_hub_dry_run_stages_without_uploading(fake_cache, tmp_path, monkeypatch):
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache))
+    calls = {}
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda: _FakeHubApi(calls))
+    staged = tmp_path / "staged"
+
+    result = data.push_to_hub("ailab-bio/TACK-fusion-context", staging_dir=staged, dry_run=True)
+
+    assert result is None
+    assert calls == {}
+    for name in _all_context_filenames():
+        assert (staged / name).exists()
+
+
+def test_push_to_hub_dry_run_requires_a_staging_dir(fake_cache):
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache))
+    with pytest.raises(ValueError, match="staging_dir"):
+        data.push_to_hub("ailab-bio/TACK-fusion-context", dry_run=True)
+
+
+def test_push_to_hub_refuses_an_existing_staging_dir(fake_cache, tmp_path):
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache))
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    with pytest.raises(SystemExit):
+        data.push_to_hub("ailab-bio/TACK-fusion-context", staging_dir=staged)
+
+
+def test_push_to_hub_output_round_trips_through_from_pretrained(fake_cache, tmp_path,
+                                                                 monkeypatch):
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache))
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda: _FakeHubApi({}))
+    staged = tmp_path / "staged"
+
+    data.push_to_hub("ailab-bio/TACK-fusion-context", staging_dir=staged)
+    reloaded = FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache")
+
+    assert reloaded.dims == data.dims

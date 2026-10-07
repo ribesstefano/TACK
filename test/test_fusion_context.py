@@ -94,10 +94,10 @@ def test_encode_context_returns_every_context_block(fake_cache):
     assert row["poi"].shape == (1, 51) and row["assay_time"].shape == (1, 1)
 
 
-def test_missing_assay_time_is_nan_not_an_error(fake_cache):
+def test_missing_assay_time_is_the_24h_default_not_an_error(fake_cache):
     row = ContextEncoder().encode_context({"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
                                            "cell_id": CELLS[0], "assay": "htrf"})
-    assert np.isnan(row["assay_time"]).all()
+    assert (row["assay_time"] == 24.0).all()
 
 
 def test_tables_are_loaded_once(fake_cache):
@@ -115,6 +115,15 @@ def test_pandas_na_counts_as_missing(fake_cache):
     enc = ContextEncoder()
     row = enc.encode_context({"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
                               "cell_id": pd.NA, "assay": pd.NA, "assay_time": pd.NA})
-    assert np.isnan(row["assay_time"]).all()
+    assert (row["assay_time"] == 24.0).all()
     assert np.array_equal(row["cell"], enc.encode("cell", [ContextEncoder.NOT_FOUND]))
     assert np.array_equal(row["assay"], enc.encode("assay", ["unknown"]))
+
+
+def test_dims_are_discovered_from_the_cached_tables(fake_cache):
+    from tackai.fusion.context import CONTEXT_BLOCKS
+    per_block = ContextEncoder().dims
+    assert list(per_block) == list(CONTEXT_BLOCKS)
+    assert per_block == {"e3": 7, "cell": 47, "poi": 51, "assay": 8, "assay_time": 1}
+    combined = ContextEncoder(protein_space="combined").dims
+    assert combined["e3"] == combined["poi"] == 52 and combined["cell"] == 47

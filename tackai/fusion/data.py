@@ -9,6 +9,7 @@ screening loop can score molecules that did not exist when the models were fitte
 import hashlib
 import json
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -20,7 +21,8 @@ from sklearn.model_selection import StratifiedGroupKFold
 
 from tackai.data.utils import get_cache_dir
 from tackai.fusion.context import (CONTEXT_BLOCKS, CONTEXT_FILES, DEFAULT_CONTEXT_REPO,
-                                   SEQUENCE_BLOCKS, ContextEncoder, assay_time_or_default)
+                                   SEQUENCE_BLOCKS, ContextEncoder, assay_time_or_default,
+                                   stage_context_tables, upload_context_tables)
 from tackai.fusion.mol_encoder import (DESCRIPTOR_NAMES, FP_RADIUS, FP_SIZE, MOL_BLOCKS,
                                        MolEncoder)
 
@@ -440,6 +442,51 @@ class FusionData:
                 "different PCA fit; clear them from the cache or point cache_dir elsewhere."
             )
         return data
+
+    def push_to_hub(self, repo_id: Union[str, Path] = DEFAULT_CONTEXT_REPO, *,
+                    private: bool = False,
+                    commit_message: str = "Update fusion context embeddings",
+                    staging_dir: Optional[Union[str, Path]] = None,
+                    dry_run: bool = False) -> Optional[str]:
+        """Publish this instance's context tables to the Hub, the inverse of :meth:`from_pretrained`.
+
+        Stages the :data:`~tackai.fusion.context.CONTEXT_FILES` tables read out of
+        :attr:`encoder`'s own cache directory and uploads them, so the published repo always
+        matches what this instance actually encodes with — never :attr:`table`, :attr:`X`,
+        the targets or the splits (see the module-level rationale in
+        ``tackai/fusion/context.py`` for why those stay out of this artifact).
+
+        Args:
+            repo_id: Hugging Face Hub dataset repo id to create (if needed) and upload to.
+            private: Create the repo as private if it does not exist yet.
+            commit_message: Commit message for the upload.
+            staging_dir: Directory to stage the files into; refused if it already exists, so
+                a previous staging attempt is never silently mixed with a fresh one. Left on
+                disk afterwards for inspection. Default: a temporary directory removed once
+                the upload finishes.
+            dry_run: Stage the files and return without uploading. Requires ``staging_dir``,
+                since there would otherwise be nothing left to inspect afterwards.
+
+        Returns:
+            The commit sha ``upload_folder`` reports, or ``None`` if ``dry_run``.
+
+        Raises:
+            ValueError: If ``dry_run`` is set without ``staging_dir``.
+            SystemExit: If ``staging_dir`` already exists, or the encoder's cache is missing
+                one of the required context files.
+        """
+        if dry_run and staging_dir is None:
+            raise ValueError("dry_run requires staging_dir, otherwise the staged files would "
+                             "be thrown away unseen")
+        if staging_dir is not None:
+            stage_context_tables(self.encoder.cache_dir, staging_dir)
+            if dry_run:
+                return None
+            return upload_context_tables(staging_dir, repo_id, private, commit_message)
+        with tempfile.TemporaryDirectory() as tmp:
+            staged = Path(tmp) / "fusion_context"
+            stage_context_tables(self.encoder.cache_dir, staged)
+            return upload_context_tables(staged, repo_id, private, commit_message)
 
     def _drop_unencodable(self, verbose: bool = False) -> None:
         """Remove rows whose context the cached tables cannot encode, counting them by block."""

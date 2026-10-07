@@ -11,12 +11,12 @@ import ensemble_inference_bench as bench  # noqa: E402
 
 from tackai.fusion.data import FusionData  # noqa: E402
 from tackai.fusion.ensemble import FusionEnsemble  # noqa: E402
-from tackai.fusion.models import GPInteraction  # noqa: E402
-from fusion_fixtures import build_ensemble
+from tackai.fusion.gp import GPInteraction  # noqa: E402
+from fusion_fixtures import DEFAULT_BLOCKS, build_ensemble
 
 
 def fast_gp(**kw):
-    return GPInteraction(n_restarts=1, n_iter=5, max_hyper_points=40, **kw)
+    return GPInteraction(**{"blocks": DEFAULT_BLOCKS, **kw}, n_restarts=1, n_iter=5, max_hyper_points=40)
 
 
 @pytest.fixture
@@ -46,12 +46,11 @@ def test_stage_timer_attributes_time_and_restores_the_methods(small):
     data, ens = small
     record, pool = bench.context_record(data), bench.smiles_pool(data, 4)
     ctx = ens.transform_context(record)
-    pre = ens.members[0].pre_
     with bench.StageTimer(ens) as timer:
         ens.predict(pool, context=ctx)
-    assert {"featurise", "transform", "model", "aggregate"} <= set(timer.seconds)
+    assert {"featurise", "model", "aggregate"} <= set(timer.seconds)
     assert all(v >= 0 for v in timer.seconds.values())
-    assert "transform_blocks" not in vars(pre) and "featurize" not in vars(data.featurizer)
+    assert "_predict_model" not in vars(ens.members[0]) and "featurize" not in vars(data.featurizer)
 
 
 def test_stage_breakdown_accounts_for_the_whole_wall_time(small):
@@ -63,19 +62,11 @@ def test_stage_breakdown_accounts_for_the_whole_wall_time(small):
         assert 0.98 <= part["share"].sum() <= 1.02, path
 
 
-def test_redundancy_costs_cover_every_item(small):
-    data, ens = small
-    frame = bench.redundancy_costs(ens, bench.context_record(data),
-                                   bench.smiles_pool(data, 8), repeat=2)
-    assert list(frame["item"]) == ["R1", "R2", "R3", "R4", "R5", "R6", "R7"]
-    assert (frame["seconds"] >= 0).all() and (frame["share_of_predict"] >= 0).all()
-
-
 def test_capture_baseline_writes_stamped_files(small, tmp_path):
     data, ens = small
     bench.capture_baseline({"pdc50": ens}, data, tmp_path, pool_size=8, batch_sizes=(1, 4),
                            breakdown_batch=4, repeat=1, heldout_folds=3)
-    for name in ("scaling", "breakdown", "redundancy", "setup", "featurise", "heldout"):
+    for name in ("scaling", "breakdown", "setup", "featurise", "heldout"):
         frame = pd.read_csv(tmp_path / f"baseline_{name}.csv")
         assert len(frame) > 0 and frame["commit"].astype(str).str.len().gt(0).all(), name
     assert (pd.read_csv(tmp_path / "baseline_scaling.csv")["task"] == "pdc50").all()
