@@ -255,7 +255,13 @@ def select_lambda_regression(F: np.ndarray, S: np.ndarray, y: np.ndarray, *, lam
     Returns:
         ``(best_lambda, cv_log)`` where ``cv_log`` maps each candidate lambda to its mean
         held-out unpenalized NLL across folds.
+
+    Raises:
+        ValueError: If ``D_fit`` has fewer than 2 rows, so no K-fold split is possible at all.
     """
+    if len(y) < 2:
+        raise ValueError(f"D_fit needs at least 2 rows to select lambda by cross-validation, "
+                         f"got {len(y)}")
     n_splits = max(2, min(n_splits, len(y)))
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
     cv_log = {}
@@ -287,8 +293,18 @@ def select_lambda_classification(P: np.ndarray, y: np.ndarray, *, lambdas, seed:
     Returns:
         ``(best_lambda, cv_log)`` where ``cv_log`` maps each candidate lambda to its mean
         held-out log loss across folds.
+
+    Raises:
+        ValueError: If ``D_fit`` has fewer than 2 rows, or fewer than 2 rows of its
+            minority class, so no stratified K-fold split is possible at all.
     """
+    if len(y) < 2:
+        raise ValueError(f"D_fit needs at least 2 rows to select lambda by cross-validation, "
+                         f"got {len(y)}")
     minority = int(min(np.sum(y == 0), np.sum(y == 1)))
+    if minority < 2:
+        raise ValueError(f"D_fit's minority class has only {minority} row(s); at least 2 are "
+                         "needed for a stratified cross-validation split")
     n_splits = max(2, min(n_splits, len(y), minority))
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
     cv_log = {}

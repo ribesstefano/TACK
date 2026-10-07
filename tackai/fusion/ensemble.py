@@ -436,7 +436,15 @@ class FusionEnsemble:
                                      "fit_stacking can fix")
         F = np.column_stack([self._stacking_predict(m, X_fit)[0] for m in self.members])
         if task_type == "regression":
-            S = np.column_stack([self._fit_set_sigma(m, X_fit, y_fit) for m in self.members])
+            sigma_columns = [self._fit_set_sigma(m, X_fit, y_fit) for m in self.members]
+            S = np.column_stack(sigma_columns)
+            # Per-member constant used at predict time for a member with no per-row sigma
+            # (an XGBoost regressor): sigma_columns[j] is already that RMSE broadcast across
+            # every row, so sigma_columns[j][0] recovers it without re-deriving anything.
+            self._const_sigma_ = {
+                name: (None if self._stacking_predict(m, X_fit[:1])[1] is not None
+                      else float(col[0]))
+                for name, m, col in zip(self.names, self.members, sigma_columns)}
             sigma_min = 1e-3 * float(np.std(y_fit))
             best_lambda, cv_log = select_lambda_regression(
                 F, S, y_fit, lambdas=lambdas, sigma_min=sigma_min, n_restarts=n_restarts, seed=seed)
@@ -504,19 +512,21 @@ class FusionEnsemble:
     def _mixture_mean_std(self, X) -> "Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
         """Mixture mean/std and their noise/disagreement components (spec §4), regression only.
 
-        An XGBoost regressor member has no per-row sigma: its raw sigma column is exactly 1
-        everywhere, so ``sigma_tilde = s_i * 1 = s_i`` reconstructs the constant RMSE-scale
-        fit_stacking fit for it, without re-deriving the RMSE here.
+        An XGBoost regressor member has no per-row sigma: its raw sigma column is the
+        constant D_fit RMSE ``fit_stacking`` broadcast, stored in ``_const_sigma_``, so
+        ``sigma_tilde = s_i * RMSE`` reconstructs the exact quantity the mixture MLE fit
+        against -- not a bare ``1.0`` sentinel, which would silently scale every XGBoost
+        member's predictive std by a factor of ``1 / RMSE``.
 
         Requires fit_stacking to have been called.
         """
         n = len(X)
         F = np.empty((n, len(self.members)))
         S = np.empty((n, len(self.members)))
-        for j, member in enumerate(self.members):
+        for j, (name, member) in enumerate(zip(self.names, self.members)):
             mean_j, sigma_j = self._stacking_predict(member, X)
             F[:, j] = mean_j
-            S[:, j] = sigma_j if sigma_j is not None else 1.0
+            S[:, j] = sigma_j if sigma_j is not None else self._const_sigma_[name]
         w = np.array([self.weights_[name] for name in self.names])
         s = np.array([self.scales_[name] for name in self.names])
         sigma_tilde = np.maximum(S * s[None, :], self._sigma_min_)
@@ -543,11 +553,19 @@ class FusionEnsemble:
 
         Raises:
             RuntimeError: If called before :meth:`fit_stacking`.
+            ValueError: If only one of ``X_cal``/``y_cal`` is given, if either holds a NaN or
+                infinite value, or if a binary ``y_cal`` has a single class.
         """
         if not hasattr(self, "weights_"):
             raise RuntimeError("call fit_stacking before calibrate_stacking")
+        if (X_cal is None) != (y_cal is None):
+            raise ValueError("pass both X_cal and y_cal, or neither (to use the D_cal "
+                             "fit_stacking stored) -- pairing one override with the other's "
+                             "stored half would score it against the wrong rows")
         X_cal = np.asarray(X_cal) if X_cal is not None else self.X_cal_
         y_cal = np.asarray(y_cal) if y_cal is not None else self.y_cal_
+        self._check_finite(X_cal, "X_cal")
+        self._check_finite(y_cal, "y_cal")
 
         if TASK_TYPES[self.task] == "regression":
             mean, std, _, _ = self._mixture_mean_std(X_cal)
@@ -555,6 +573,9 @@ class FusionEnsemble:
             self.q_hat_ = conformal_quantile(ratio, alpha)
             self.c_ = float(np.sqrt(np.mean(ratio ** 2)))
         else:
+            if len(np.unique(y_cal)) < 2:
+                raise ValueError("y_cal has a single class; nothing to calibrate a "
+                                 "temperature against")
             F = np.column_stack([self._stacking_predict(m, X_cal)[0] for m in self.members])
             P = np.clip(F, 1e-6, 1 - 1e-6)
             w = np.array([self.weights_[name] for name in self.names])
@@ -591,10 +612,12 @@ class FusionEnsemble:
 
         Raises:
             RuntimeError: If called before :meth:`fit_stacking`.
+            ValueError: If ``X`` holds a NaN or infinite value.
         """
         if not hasattr(self, "weights_"):
             raise RuntimeError("call fit_stacking before predict_stacked")
         X = np.asarray(X)
+        self._check_finite(X, "X")
 
         if TASK_TYPES[self.task] == "regression":
             mean, std, noise, disagreement = self._mixture_mean_std(X)
@@ -814,9 +837,12 @@ class FusionEnsemble:
             X: Design matrix of the rows to score.
 
         Returns:
-            ``(mean, sigma)``. ``sigma`` is the GP's own predictive std for a GPInteraction, or
-            None for any XGBoost member -- Option A's constant residual sigma for an XGBoost
-            regressor is computed once from D_fit by the caller (fit_stacking), not here.
+            ``(mean, sigma)``. ``sigma`` is the GP's full predictive std for a regression
+            GPInteraction -- its own ``predict`` returns only the noise-free epistemic std
+            (see ``AdditiveProductGP.predict``'s docstring), so the fitted observation-noise
+            variance ``model_.noise_`` is added back in here, per spec §3. None for any
+            XGBoost member -- Option A's constant residual sigma for an XGBoost regressor is
+            computed once from D_fit by the caller (fit_stacking), not here.
 
         Raises:
             TypeError: If ``member`` is none of the three supported types.
@@ -824,6 +850,8 @@ class FusionEnsemble:
         X = np.asarray(X)
         if isinstance(member, GPInteraction):
             mean, sigma = member.predict(X, return_std=True)
+            if member.task_type == "regression":
+                sigma = np.sqrt(sigma ** 2 + member.model_.noise_)
             return mean, sigma
         if isinstance(member, xgb.XGBClassifier):
             return member.predict_proba(X)[:, 1], None

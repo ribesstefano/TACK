@@ -220,6 +220,16 @@ def test_select_lambda_regression_handles_tiny_fit_set_without_crashing():
     assert best in (0.0, 1.0)
 
 
+def test_select_lambda_regression_raises_a_clear_error_for_a_single_row_fit_set():
+    """len(y) == 1 cannot run any K-fold CV at all; this must raise a clear ValueError
+    naming the cause, not a raw sklearn 'n_splits=2 greater than n_samples=1' error."""
+    y = np.array([0.5])
+    F = np.array([[0.5, 0.4]])
+    S = np.ones_like(F)
+    with pytest.raises(ValueError, match="at least 2"):
+        select_lambda_regression(F, S, y, lambdas=(0.0, 1.0), sigma_min=1e-3, n_restarts=1, seed=0)
+
+
 def test_select_lambda_classification_returns_a_value_from_the_grid():
     rng = np.random.default_rng(9)
     y = rng.integers(0, 2, size=60).astype(float)
@@ -248,6 +258,21 @@ def test_stacking_predict_dispatches_gp_member():
     mean, sigma = ens._stacking_predict(gp, X)
     assert mean.shape == (20,)
     assert sigma is not None and sigma.shape == (20,) and np.all(sigma >= 0)
+
+
+def test_stacking_predict_gp_sigma_includes_observation_noise():
+    """GPInteraction.predict's own std is noise-free (epistemic only, per gp.py's docstring);
+    the stacking fit needs the full predictive std (epistemic + observation noise), spec §3,
+    so _stacking_predict must add the GP's own fitted noise variance back in."""
+    X, y = _tiny_design_matrix(n=30, seed=15)
+    gp = GPInteraction(blocks=DEFAULT_BLOCKS, task_type="regression", n_restarts=1, n_iter=5,
+                       max_hyper_points=30).fit(X, y)
+    ens = FusionEnsemble([gp], data=_fake_data(), task="dmax")
+    _, sigma = ens._stacking_predict(gp, X)
+    epistemic_only = gp.model_.predict(gp.split(X), return_std=True)[1]
+    expected = np.sqrt(epistemic_only ** 2 + gp.model_.noise_)
+    assert np.allclose(sigma, expected)
+    assert np.any(sigma > epistemic_only)  # the noise term must actually move it
 
 
 def test_stacking_predict_dispatches_xgb_regressor():
@@ -329,6 +354,24 @@ def test_fit_stacking_regression_with_explicit_split_sets_fitted_attributes():
     assert ens.X_test_.shape == X[55:].shape
 
 
+def test_predict_stacked_xgboost_std_matches_the_fitted_rmse_scale():
+    """A single XGBoost regressor member's reported std must reconstruct s_i * RMSE_fit,
+    the same quantity fit_stacking's mixture MLE was actually fit against -- not the bare
+    scale s_i alone, which would silently under/over-report uncertainty by a factor of RMSE."""
+    X, y = _tiny_design_matrix(n=60, seed=20)
+    model = xgb.XGBRegressor(n_estimators=15, max_depth=2).fit(X[:20], y[:20])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X_fit=X[20:40], y_fit=y[20:40], X_cal=X[40:50], y_cal=y[40:50], n_restarts=2)
+
+    mean_fit, _ = ens._stacking_predict(model, X[20:40])
+    rmse_fit = float(np.sqrt(np.mean((y[20:40] - mean_fit) ** 2)))
+    name = ens.names[0]
+    expected_sigma_tilde = max(ens.scales_[name] * rmse_fit, ens._sigma_min_)
+
+    out = ens.predict_stacked(X[50:])
+    assert out["std_noise"] == pytest.approx(expected_sigma_tilde, rel=1e-6)
+
+
 def test_fit_stacking_regression_auto_split_without_groups():
     X, y = _tiny_design_matrix(n=90, seed=3)
     model = xgb.XGBRegressor(n_estimators=10, max_depth=2).fit(X[:30], y[:30])
@@ -393,6 +436,51 @@ def test_calibrate_stacking_regression_warns_when_cal_set_too_small():
     with pytest.warns(UserWarning, match="too small"):
         ens.calibrate_stacking(alpha=0.01)
     assert ens.q_hat_ == np.inf
+
+
+def test_calibrate_stacking_rejects_partial_override():
+    """Passing only one of X_cal/y_cal must not silently pair it with the other's stored
+    half of a DIFFERENT split -- that is wrong whether or not the lengths happen to match."""
+    X, y = _tiny_design_matrix(n=90, seed=16)
+    model = xgb.XGBRegressor(n_estimators=10, max_depth=2).fit(X[:30], y[:30])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X=X[30:], y=y[30:], n_restarts=2)
+    with pytest.raises(ValueError, match="both"):
+        ens.calibrate_stacking(X_cal=ens.X_cal_)
+    with pytest.raises(ValueError, match="both"):
+        ens.calibrate_stacking(y_cal=ens.y_cal_)
+
+
+def test_calibrate_stacking_rejects_nan_in_y_cal():
+    X, y = _tiny_design_matrix(n=90, seed=17)
+    model = xgb.XGBRegressor(n_estimators=10, max_depth=2).fit(X[:30], y[:30])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X=X[30:], y=y[30:], n_restarts=2)
+    bad_y_cal = ens.y_cal_.copy()
+    bad_y_cal[0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        ens.calibrate_stacking(X_cal=ens.X_cal_, y_cal=bad_y_cal)
+
+
+def test_calibrate_stacking_classification_rejects_single_class_override():
+    X, y = _tiny_design_matrix(n=60, seed=18)
+    labels = (y > np.median(y)).astype(float)
+    model = xgb.XGBClassifier(n_estimators=15, max_depth=2).fit(X[:20], labels[:20])
+    ens = FusionEnsemble([model], data=_fake_data(), task="activity")
+    ens.fit_stacking(X=X[20:], y=labels[20:])
+    with pytest.raises(ValueError, match="class"):
+        ens.calibrate_stacking(X_cal=ens.X_cal_, y_cal=np.ones_like(ens.y_cal_))
+
+
+def test_predict_stacked_rejects_nan_in_X():
+    X, y = _tiny_design_matrix(n=30, seed=19)
+    model = xgb.XGBRegressor(n_estimators=5, max_depth=2).fit(X[:20], y[:20])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X=X[20:], y=y[20:], n_restarts=1)
+    bad_X = X[:3].copy()
+    bad_X[0, 0] = np.nan
+    with pytest.raises(ValueError, match="finite"):
+        ens.predict_stacked(bad_X)
 
 
 def test_calibrate_stacking_classification_sets_temperature():
@@ -468,3 +556,71 @@ def test_fit_stacking_rejects_nan_in_explicit_split():
     ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
     with pytest.raises(ValueError, match="finite"):
         ens.fit_stacking(X_fit=X_fit, y_fit=y[:10], X_cal=X[20:25], y_cal=y[20:25])
+
+
+def test_fit_stacking_end_to_end_is_deterministic_for_a_fixed_seed():
+    """Acceptance test from the design spec §9: same seed, two full fit_stacking +
+    predict_stacked runs give identical weights/scales AND identical predictions --
+    not just the inner fit_mixture_weights call, which test_fit_mixture_weights_is_
+    deterministic_for_a_fixed_seed already covers in isolation."""
+    X, y = _tiny_design_matrix(n=90, seed=21)
+    train_X, train_y = X[:30], y[:30]
+    stack_X, stack_y = X[30:], y[30:]
+
+    def build_and_fit():
+        good = xgb.XGBRegressor(n_estimators=10, max_depth=2, random_state=0).fit(train_X, train_y)
+        ens = FusionEnsemble([good], data=_fake_data(), task="dmax")
+        ens.fit_stacking(X=stack_X, y=stack_y, n_restarts=3, seed=7)
+        ens.calibrate_stacking(alpha=0.1)
+        return ens
+
+    ens1, ens2 = build_and_fit(), build_and_fit()
+    assert ens1.weights_ == ens2.weights_
+    assert ens1.scales_ == ens2.scales_
+    assert ens1.lambda_ == ens2.lambda_
+    assert ens1.q_hat_ == ens2.q_hat_
+
+    out1, out2 = ens1.predict_stacked(X[:5]), ens2.predict_stacked(X[:5])
+    assert np.array_equal(out1["mean"], out2["mean"])
+    assert np.array_equal(out1["std"], out2["std"])
+    assert np.array_equal(out1["lower"], out2["lower"])
+    assert np.array_equal(out1["upper"], out2["upper"])
+
+
+def test_conformal_coverage_on_simulated_exchangeable_data():
+    """Acceptance test from the design spec §6/§9: marginal coverage of the conformal
+    interval at alpha=0.1 should be at least 0.90 minus roughly two standard errors,
+    averaged over repeated exchangeable draws of D_cal and a fresh test point."""
+    rng = np.random.default_rng(100)
+    alpha = 0.1
+    n_repeats = 200
+    covered = np.zeros(n_repeats, dtype=bool)
+
+    # One member with known, fixed Gaussian noise -- the ensemble/mixture machinery is
+    # exercised exactly as in the other tests, only the data-generating process is simple
+    # enough that true marginal coverage is known analytically (it must be >= 1 - alpha
+    # whenever D_cal and the test point are exchangeable draws from the same process).
+    true_sigma = 0.3
+    for i in range(n_repeats):
+        y_fit = rng.normal(size=20)
+        f_fit = y_fit + rng.normal(scale=true_sigma, size=20)
+        y_cal = rng.normal(size=30)
+        f_cal = y_cal + rng.normal(scale=true_sigma, size=30)
+        y_test = rng.normal()
+        f_test = y_test + rng.normal(scale=true_sigma)
+
+        F_fit, S_fit = f_fit[:, None], np.ones((20, 1))
+        w, s, _ = fit_mixture_weights(F_fit, S_fit, y_fit, lam=0.0, sigma_min=1e-3,
+                                      n_restarts=2, seed=i)
+        sigma_min = 1e-3 * float(np.std(y_fit))
+        sigma_tilde_cal = max(s[0], sigma_min)
+        ratio = np.abs(y_cal - f_cal) / sigma_tilde_cal
+        q_hat = conformal_quantile(ratio, alpha)
+
+        sigma_tilde_test = sigma_tilde_cal
+        lower, upper = f_test - q_hat * sigma_tilde_test, f_test + q_hat * sigma_tilde_test
+        covered[i] = lower <= y_test <= upper
+
+    mean_coverage = covered.mean()
+    se = np.sqrt(mean_coverage * (1 - mean_coverage) / n_repeats)
+    assert mean_coverage >= (1 - alpha) - 2 * se
