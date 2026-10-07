@@ -6,6 +6,7 @@ plain arrays (predictions/sigmas/labels), never a model or a FusionEnsemble, so 
 testable on small synthetic data without fitting anything. FusionEnsemble.fit_stacking /
 calibrate_stacking / predict_stacked are thin orchestration around these functions.
 """
+import warnings
 from typing import Tuple
 
 import numpy as np
@@ -143,3 +144,92 @@ def fit_mixture_weights(F: np.ndarray, S: np.ndarray, y: np.ndarray, *, lam: flo
 
     theta_opt, phi_opt = best[1][:N], best[1][N:]
     return softmax(theta_opt), np.exp(phi_opt), float(best[0])
+
+
+def fit_pooled_weights(P: np.ndarray, y: np.ndarray, *, lam: float,
+                       seed: int = 0) -> Tuple[np.ndarray, float]:
+    """Fit log-loss-pooled weights over clipped member probabilities (spec §5).
+
+    Convex in the weights, so a single L-BFGS run from uniform weights is enough.
+
+    Args:
+        P: Clipped member probabilities, shape ``(M, N)``, values in ``[1e-6, 1 - 1e-6]``.
+        y: Binary labels (0 or 1), shape ``(M,)``.
+        lam: Penalty strength toward uniform weights.
+        seed: Unused (kept for interface symmetry with :func:`fit_mixture_weights`; the
+            problem is convex so the result does not depend on a starting point).
+
+    Returns:
+        ``(w, objective)``: fitted weights (sum to 1) and the objective value at the optimum.
+    """
+    N = P.shape[1]
+
+    def objective(theta):
+        w = softmax(theta)
+        p = P @ w
+        loss = -np.mean(y * np.log(p) + (1 - y) * np.log(1 - p))
+        penalty = lam * np.sum((w - 1.0 / N) ** 2)
+        return loss + penalty
+
+    def grad(theta):
+        w = softmax(theta)
+        p = P @ w
+        dloss_dp = (p - y) / (p * (1 - p)) / len(y)
+        dloss_dw = P.T @ dloss_dp
+        dw_dtheta = w[:, None] * (np.eye(N) - w[None, :])
+        g = dw_dtheta @ dloss_dw
+        g += dw_dtheta @ (2.0 * lam * (w - 1.0 / N))
+        return g
+
+    result = minimize(objective, np.zeros(N), jac=grad, method="L-BFGS-B",
+                      options={"ftol": 1e-10, "gtol": 1e-10})
+    return softmax(result.x), float(result.fun)
+
+
+def binary_entropy(q: np.ndarray) -> np.ndarray:
+    """Binary entropy ``H(q) = -q log q - (1-q) log(1-q)``, 0 at ``q in {0, 1}``."""
+    q = np.asarray(q, dtype=float)
+    out = np.zeros_like(q)
+    mask = (q > 0) & (q < 1)
+    qm = q[mask]
+    out[mask] = -qm * np.log(qm) - (1 - qm) * np.log(1 - qm)
+    return out
+
+
+def entropy_decomposition(P: np.ndarray, w: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Total/aleatoric/epistemic binary-entropy decomposition (spec §5).
+
+    Args:
+        P: Member probabilities, shape ``(M, N)``.
+        w: Member weights, shape ``(N,)``, summing to 1.
+
+    Returns:
+        ``(total, aleatoric, epistemic)``, each shape ``(M,)``. ``epistemic`` is clamped at 0
+        to remove floating-point noise; it is non-negative by concavity of ``H``.
+    """
+    pooled = P @ w
+    total = binary_entropy(pooled)
+    aleatoric = binary_entropy(P) @ w
+    epistemic = np.maximum(total - aleatoric, 0.0)
+    return total, aleatoric, epistemic
+
+
+def conformal_quantile(residual_ratio: np.ndarray, alpha: float) -> float:
+    """Finite-sample conformal quantile of normalized residuals (spec §6).
+
+    Args:
+        residual_ratio: ``|y - mu(x)| / sigma(x)`` on the calibration set.
+        alpha: Miscoverage level (e.g. 0.1 for 90% coverage).
+
+    Returns:
+        The ``ceil((n+1)(1-alpha))``-th smallest value, or ``inf`` (with a ``UserWarning``)
+        if that index exceeds ``n`` — the calibration set is too small for this ``alpha``.
+    """
+    n = len(residual_ratio)
+    k = int(np.ceil((n + 1) * (1 - alpha)))
+    if k > n:
+        warnings.warn(
+            f"calibration set too small (n={n}) for alpha={alpha}; returning an infinite "
+            "interval. Use a larger D_cal or a larger alpha.", UserWarning, stacklevel=2)
+        return np.inf
+    return float(np.sort(residual_ratio)[k - 1])

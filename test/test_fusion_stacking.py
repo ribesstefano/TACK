@@ -6,7 +6,9 @@ design spec's instruction to keep these tests fast and focused on the stacking m
 import numpy as np
 import pytest
 
-from tackai.fusion.stacking import fit_mixture_weights, mixture_nll, mixture_nll_grad, softmax
+from tackai.fusion.stacking import (binary_entropy, conformal_quantile,
+                                    entropy_decomposition, fit_mixture_weights,
+                                    fit_pooled_weights, mixture_nll, mixture_nll_grad, softmax)
 
 
 def test_softmax_sums_to_one_and_matches_definition():
@@ -136,3 +138,54 @@ def test_fit_mixture_weights_is_deterministic_for_a_fixed_seed():
     w2, s2, _ = fit_mixture_weights(F, S, y, lam=0.1, sigma_min=1e-3, n_restarts=5, seed=42)
     assert np.array_equal(w1, w2)
     assert np.array_equal(s1, s2)
+
+
+def test_binary_entropy_is_zero_at_extremes_and_max_at_half():
+    q = np.array([0.0, 1.0, 0.5])
+    h = binary_entropy(q)
+    assert h[0] == pytest.approx(0.0)
+    assert h[1] == pytest.approx(0.0)
+    assert h[2] == pytest.approx(np.log(2))
+
+
+def test_fit_pooled_weights_favors_the_accurate_model():
+    rng = np.random.default_rng(6)
+    y = rng.integers(0, 2, size=200).astype(float)
+    good = np.clip(y * 0.9 + (1 - y) * 0.1 + rng.normal(scale=0.02, size=200), 1e-6, 1 - 1e-6)
+    bad = np.clip(rng.uniform(size=200), 1e-6, 1 - 1e-6)
+    P = np.column_stack([good, bad])
+    w, obj = fit_pooled_weights(P, y, lam=0.0, seed=0)
+    assert w[0] > 0.95
+    assert np.isfinite(obj)
+
+
+def test_entropy_decomposition_sums_exactly_and_epistemic_is_nonnegative():
+    rng = np.random.default_rng(7)
+    P = np.clip(rng.uniform(size=(30, 4)), 1e-6, 1 - 1e-6)
+    w = softmax(rng.normal(size=4))
+    total, aleatoric, epistemic = entropy_decomposition(P, w)
+    assert np.allclose(total, aleatoric + epistemic, atol=1e-10)
+    assert np.all(epistemic >= -1e-12)
+
+
+def test_entropy_decomposition_identical_models_has_zero_epistemic():
+    p = np.array([0.3, 0.6, 0.9])
+    P = np.column_stack([p, p, p])
+    w = np.array([0.2, 0.3, 0.5])
+    total, aleatoric, epistemic = entropy_decomposition(P, w)
+    assert np.allclose(epistemic, 0.0, atol=1e-10)
+    assert np.allclose(total, aleatoric, atol=1e-10)
+
+
+def test_conformal_quantile_basic():
+    residuals = np.array([0.1, 0.5, 0.2, 0.9, 0.3])
+    q = conformal_quantile(residuals, alpha=0.2)
+    # ceil((5+1)*0.8) = 5th smallest (1-indexed) of the 5 values -> the max
+    assert q == pytest.approx(0.9)
+
+
+def test_conformal_quantile_too_few_samples_warns_and_returns_inf():
+    residuals = np.array([0.1, 0.2])
+    with pytest.warns(UserWarning, match="too small"):
+        q = conformal_quantile(residuals, alpha=0.01)
+    assert q == np.inf
