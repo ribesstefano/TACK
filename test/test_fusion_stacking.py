@@ -8,7 +8,9 @@ import pytest
 
 from tackai.fusion.stacking import (binary_entropy, conformal_quantile,
                                     entropy_decomposition, fit_mixture_weights,
-                                    fit_pooled_weights, mixture_nll, mixture_nll_grad, softmax)
+                                    fit_pooled_weights, mixture_nll, mixture_nll_grad,
+                                    select_lambda_classification, select_lambda_regression,
+                                    softmax)
 
 
 def test_softmax_sums_to_one_and_matches_definition():
@@ -189,3 +191,36 @@ def test_conformal_quantile_too_few_samples_warns_and_returns_inf():
     with pytest.warns(UserWarning, match="too small"):
         q = conformal_quantile(residuals, alpha=0.01)
     assert q == np.inf
+
+
+def test_select_lambda_regression_returns_a_value_from_the_grid_and_a_log_per_lambda():
+    rng = np.random.default_rng(8)
+    y = rng.normal(size=60)
+    F = np.column_stack([y + rng.normal(scale=0.1, size=60), rng.normal(size=60)])
+    S = np.ones_like(F)
+    lambdas = (0.0, 0.1, 1.0)
+    best, log = select_lambda_regression(F, S, y, lambdas=lambdas, sigma_min=1e-3, n_restarts=2, seed=0)
+    assert best in lambdas
+    assert set(log.keys()) == set(lambdas)
+    assert all(np.isfinite(v) for v in log.values())
+
+
+def test_select_lambda_regression_handles_tiny_fit_set_without_crashing():
+    """D_fit smaller than n_splits must not raise a sklearn fold-count error."""
+    y = np.array([0.1, 0.5, 0.9])
+    F = np.column_stack([y, y[::-1]])
+    S = np.ones_like(F)
+    best, log = select_lambda_regression(F, S, y, lambdas=(0.0, 1.0), sigma_min=1e-3,
+                                         n_restarts=1, seed=0, n_splits=5)
+    assert best in (0.0, 1.0)
+
+
+def test_select_lambda_classification_returns_a_value_from_the_grid():
+    rng = np.random.default_rng(9)
+    y = rng.integers(0, 2, size=60).astype(float)
+    good = np.clip(y * 0.8 + (1 - y) * 0.2 + rng.normal(scale=0.05, size=60), 1e-6, 1 - 1e-6)
+    P = np.column_stack([good, np.clip(rng.uniform(size=60), 1e-6, 1 - 1e-6)])
+    lambdas = (0.0, 0.1, 1.0)
+    best, log = select_lambda_classification(P, y, lambdas=lambdas, seed=0)
+    assert best in lambdas
+    assert set(log.keys()) == set(lambdas)

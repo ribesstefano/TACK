@@ -11,6 +11,7 @@ from typing import Tuple
 
 import numpy as np
 from scipy.optimize import minimize
+from sklearn.model_selection import KFold, StratifiedKFold
 
 LOG_2PI = float(np.log(2.0 * np.pi))
 
@@ -233,3 +234,71 @@ def conformal_quantile(residual_ratio: np.ndarray, alpha: float) -> float:
             "interval. Use a larger D_cal or a larger alpha.", UserWarning, stacklevel=2)
         return np.inf
     return float(np.sort(residual_ratio)[k - 1])
+
+
+def select_lambda_regression(F: np.ndarray, S: np.ndarray, y: np.ndarray, *, lambdas,
+                             sigma_min: float, n_restarts: int, seed: int = 0,
+                             n_splits: int = 5) -> Tuple[float, dict]:
+    """Pick ``lambda`` by K-fold CV inside ``D_fit``, scoring unpenalized held-out NLL.
+
+    Args:
+        F: Member predictions on ``D_fit``, shape ``(M, N)``.
+        S: Member sigmas on ``D_fit``, shape ``(M, N)``.
+        y: Labels on ``D_fit``, shape ``(M,)``.
+        lambdas: Candidate penalty values.
+        sigma_min: Variance floor.
+        n_restarts: Restarts passed to each inner :func:`fit_mixture_weights` call.
+        seed: Seed for the fold split and the restarts.
+        n_splits: Requested fold count, clamped to ``min(n_splits, len(y))`` so a ``D_fit``
+            smaller than the requested fold count degrades gracefully.
+
+    Returns:
+        ``(best_lambda, cv_log)`` where ``cv_log`` maps each candidate lambda to its mean
+        held-out unpenalized NLL across folds.
+    """
+    n_splits = max(2, min(n_splits, len(y)))
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    cv_log = {}
+    for lam in lambdas:
+        scores = []
+        for train_idx, val_idx in kf.split(y):
+            w, s, _ = fit_mixture_weights(F[train_idx], S[train_idx], y[train_idx], lam=lam,
+                                          sigma_min=sigma_min, n_restarts=n_restarts, seed=seed)
+            theta = np.log(np.maximum(w, 1e-300))
+            phi = np.log(np.maximum(s, 1e-300))
+            scores.append(mixture_nll(theta, phi, F[val_idx], S[val_idx], y[val_idx],
+                                      sigma_min, lam=0.0))
+        cv_log[lam] = float(np.mean(scores))
+    best = min(cv_log, key=cv_log.get)
+    return best, cv_log
+
+
+def select_lambda_classification(P: np.ndarray, y: np.ndarray, *, lambdas, seed: int = 0,
+                                  n_splits: int = 5) -> Tuple[float, dict]:
+    """Pick ``lambda`` by stratified K-fold CV, scoring held-out log loss.
+
+    Args:
+        P: Member probabilities on ``D_fit``, shape ``(M, N)``.
+        y: Binary labels on ``D_fit``, shape ``(M,)``.
+        lambdas: Candidate penalty values.
+        seed: Seed for the fold split.
+        n_splits: Requested fold count, clamped to ``min(n_splits, len(y), minority_count)``.
+
+    Returns:
+        ``(best_lambda, cv_log)`` where ``cv_log`` maps each candidate lambda to its mean
+        held-out log loss across folds.
+    """
+    minority = int(min(np.sum(y == 0), np.sum(y == 1)))
+    n_splits = max(2, min(n_splits, len(y), minority))
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    cv_log = {}
+    for lam in lambdas:
+        scores = []
+        for train_idx, val_idx in skf.split(P, y):
+            w, _ = fit_pooled_weights(P[train_idx], y[train_idx], lam=lam, seed=seed)
+            p = np.clip(P[val_idx] @ w, 1e-6, 1 - 1e-6)
+            yv = y[val_idx]
+            scores.append(float(-np.mean(yv * np.log(p) + (1 - yv) * np.log(1 - p))))
+        cv_log[lam] = float(np.mean(scores))
+    best = min(cv_log, key=cv_log.get)
+    return best, cv_log
