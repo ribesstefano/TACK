@@ -287,3 +287,82 @@ def _fake_data():
     class _Data:
         blocks_indexes = DEFAULT_BLOCKS
     return _Data()
+
+
+def test_fit_stacking_rejects_both_calling_conventions():
+    X, y = _tiny_design_matrix(n=30)
+    model = xgb.XGBRegressor(n_estimators=5, max_depth=2).fit(X, y)
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    with pytest.raises(ValueError, match="both"):
+        ens.fit_stacking(X=X, y=y, X_fit=X[:10], y_fit=y[:10], X_cal=X[10:20], y_cal=y[10:20])
+
+
+def test_fit_stacking_rejects_neither_calling_convention():
+    X, y = _tiny_design_matrix(n=30)
+    model = xgb.XGBRegressor(n_estimators=5, max_depth=2).fit(X, y)
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    with pytest.raises(ValueError, match="neither"):
+        ens.fit_stacking()
+
+
+def test_fit_stacking_rejects_nan_in_y():
+    X, y = _tiny_design_matrix(n=30)
+    y[0] = np.nan
+    model = xgb.XGBRegressor(n_estimators=5, max_depth=2).fit(X[1:], y[1:])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    with pytest.raises(ValueError, match="finite"):
+        ens.fit_stacking(X=X, y=y)
+
+
+def test_fit_stacking_regression_with_explicit_split_sets_fitted_attributes():
+    X, y = _tiny_design_matrix(n=60, seed=1)
+    good = xgb.XGBRegressor(n_estimators=20, max_depth=2).fit(X[:30], y[:30])
+    bad = xgb.XGBRegressor(n_estimators=1, max_depth=1).fit(X[:30], np.random.default_rng(2).normal(size=30))
+    ens = FusionEnsemble([good, bad], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X_fit=X[30:45], y_fit=y[30:45], X_cal=X[45:55], y_cal=y[45:55],
+                     X_test=X[55:], y_test=y[55:], n_restarts=2)
+    assert set(ens.weights_.keys()) == set(ens.names)
+    assert sum(ens.weights_.values()) == pytest.approx(1.0, abs=1e-6)
+    assert ens.weights_[ens.names[0]] > ens.weights_[ens.names[1]]  # "good" outweighs "bad"
+    assert ens.lambda_ in (0.0, 0.01, 0.1, 1.0, 10.0)
+    assert ens.X_cal_.shape == X[45:55].shape
+    assert ens.X_test_.shape == X[55:].shape
+
+
+def test_fit_stacking_regression_auto_split_without_groups():
+    X, y = _tiny_design_matrix(n=90, seed=3)
+    model = xgb.XGBRegressor(n_estimators=10, max_depth=2).fit(X[:30], y[:30])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X=X[30:], y=y[30:], n_restarts=2)
+    assert ens.weights_[ens.names[0]] == pytest.approx(1.0, abs=1e-6)  # single member
+    assert ens.X_cal_ is not None and ens.X_test_ is not None
+    # 60 rows split 60/20/20 -> roughly 36/12/12; allow rounding slack
+    assert 8 <= len(ens.X_cal_) <= 16
+
+
+def test_fit_stacking_classification_with_explicit_split():
+    X, y = _tiny_design_matrix(n=60, seed=4)
+    labels = (y > np.median(y)).astype(float)
+    good = xgb.XGBClassifier(n_estimators=20, max_depth=2).fit(X[:30], labels[:30])
+    ens = FusionEnsemble([good], data=_fake_data(), task="activity")
+    ens.fit_stacking(X_fit=X[30:40], y_fit=labels[30:40], X_cal=X[40:50], y_cal=labels[40:50])
+    assert ens.weights_[ens.names[0]] == pytest.approx(1.0, abs=1e-6)
+    assert ens.scales_ == {}
+
+
+@pytest.mark.skip(reason="predict_stacked added in Task 7")
+def test_fit_stacking_runs_end_to_end_with_mixed_gp_and_xgboost_membership():
+    """Acceptance test from the design spec §9: fit_stacking must handle an ensemble
+    whose members are a mix of GPInteraction and XGBRegressor."""
+    X, y = _tiny_design_matrix(n=60, seed=13)
+    gp = GPInteraction(blocks=DEFAULT_BLOCKS, task_type="regression", n_restarts=1, n_iter=5,
+                       max_hyper_points=20).fit(X[:20], y[:20])
+    tree = xgb.XGBRegressor(n_estimators=10, max_depth=2).fit(X[:20], y[:20])
+    ens = FusionEnsemble([gp, tree], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X_fit=X[20:35], y_fit=y[20:35], X_cal=X[35:45], y_cal=y[35:45], n_restarts=2)
+    assert set(ens.weights_.keys()) == set(ens.names)
+    assert sum(ens.weights_.values()) == pytest.approx(1.0, abs=1e-6)
+    assert all(np.isfinite(v) for v in ens.scales_.values())
+    out = ens.predict_stacked(X[45:])
+    assert out["mean"].shape == (15,)
+    assert np.all(np.isfinite(out["mean"])) and np.all(out["std"] >= 0)

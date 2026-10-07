@@ -19,11 +19,14 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from tackai.fusion.context import ContextEncoder
 from tackai.fusion.data import BLOCK_ORDER, TASK_LABELS, TASK_SUPPORT, TASK_TYPES, FusionData
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES, MolEncoder
 from tackai.fusion.gp import GPInteraction
+from tackai.fusion.stacking import (fit_mixture_weights, fit_pooled_weights,
+                                    select_lambda_classification, select_lambda_regression)
 from tackai.fusion.training import check_labels
 
 Z95 = 1.959963984540054          # two-sided 95% normal quantile
@@ -356,6 +359,146 @@ class FusionEnsemble:
             score = member._predict_model(member.model_, X)
             member.calibrator_ = LogisticRegression(C=1e4).fit(score[:, None], labels)
         return self
+
+    def fit_stacking(self, X=None, y=None, *, groups=None, X_fit=None, y_fit=None,
+                     X_cal=None, y_cal=None, X_test=None, y_test=None,
+                     lambdas=(0.0, 0.01, 0.1, 1.0, 10.0), n_restarts: int = 5,
+                     seed: int = 0) -> "FusionEnsemble":
+        """Fit stacking weights (and, for regression, per-member scales) on a held-out set.
+
+        Learns weights by maximum likelihood of a Gaussian mixture (regression) or by minimizing
+        log loss on pooled probabilities (classification), per
+        docs/superpowers/specs/2026-10-07-fusion-stacked-ensemble-design.md. The rows passed here
+        must already be held out from every member's own training data -- this method has no
+        record of what the members were trained on and cannot check that invariant.
+
+        Two mutually exclusive calling conventions:
+
+        * Auto-split: pass ``X``/``y`` (and optionally ``groups``); this method splits them
+          60/20/20 into D_fit/D_cal/D_test internally.
+        * Explicit split: pass ``X_fit``/``y_fit``/``X_cal``/``y_cal`` (and optionally
+          ``X_test``/``y_test``) directly, skipping the internal split.
+
+        Args:
+            X: Design matrix for the auto-split path.
+            y: Labels for the auto-split path.
+            groups: Optional scaffold group id per row, for the auto-split path; when given, the
+                split uses GroupShuffleSplit so D_fit/D_cal/D_test share no group.
+            X_fit, y_fit, X_cal, y_cal: Explicit D_fit/D_cal rows, for the explicit-split path.
+            X_test, y_test: Optional explicit D_test rows, kept on ``self`` for a future reporting
+                method but unused by this one.
+            lambdas: Candidate penalty values for the held-out lambda selection.
+            n_restarts: Random restarts for the regression mixture fit.
+            seed: Seed for the split, the restarts, and the lambda-selection folds.
+
+        Returns:
+            self, with ``weights_``, ``scales_``, ``lambda_``, ``stacking_cv_log_``, ``X_cal_``,
+            ``y_cal_``, ``X_test_``, ``y_test_`` set.
+
+        Raises:
+            ValueError: If both or neither calling convention is given, or if ``X``/``y`` (in
+                either convention) hold a NaN or infinite value.
+        """
+        auto_given = X is not None or y is not None
+        explicit_given = any(v is not None for v in (X_fit, y_fit, X_cal, y_cal))
+        if auto_given and explicit_given:
+            raise ValueError("pass either (X, y[, groups]) or (X_fit, y_fit, X_cal, y_cal, ...), "
+                             "not both")
+        if not auto_given and not explicit_given:
+            raise ValueError("pass either (X, y[, groups]) or (X_fit, y_fit, X_cal, y_cal, ...); "
+                             "neither was given")
+
+        if auto_given:
+            if X is None or y is None:
+                raise ValueError("both X and y are required for the auto-split path")
+            X, y = np.asarray(X), np.asarray(y)
+            self._check_finite(X, "X")
+            self._check_finite(y, "y")
+            X_fit, X_cal, X_test, y_fit, y_cal, y_test = self._split_stacking_set(X, y, groups, seed)
+        else:
+            if X_fit is None or y_fit is None or X_cal is None or y_cal is None:
+                raise ValueError("X_fit, y_fit, X_cal and y_cal are all required for the explicit "
+                                 "split path")
+            X_fit, y_fit = np.asarray(X_fit), np.asarray(y_fit)
+            X_cal, y_cal = np.asarray(X_cal), np.asarray(y_cal)
+            for arr, name in ((X_fit, "X_fit"), (y_fit, "y_fit"), (X_cal, "X_cal"), (y_cal, "y_cal")):
+                self._check_finite(arr, name)
+            X_test = np.asarray(X_test) if X_test is not None else None
+            y_test = np.asarray(y_test) if y_test is not None else None
+
+        task_type = TASK_TYPES[self.task]
+        if task_type == "binary":
+            for arr, name in ((y_fit, "y_fit"), (y_cal, "y_cal")):
+                if len(np.unique(arr)) < 2:
+                    raise ValueError(f"{name} has a single class; nothing to learn a pooled "
+                                     "weight from. This is a split problem, not something "
+                                     "fit_stacking can fix")
+        F = np.column_stack([self._stacking_predict(m, X_fit)[0] for m in self.members])
+        if task_type == "regression":
+            S = np.column_stack([self._fit_set_sigma(m, X_fit, y_fit) for m in self.members])
+            sigma_min = 1e-3 * float(np.std(y_fit))
+            best_lambda, cv_log = select_lambda_regression(
+                F, S, y_fit, lambdas=lambdas, sigma_min=sigma_min, n_restarts=n_restarts, seed=seed)
+            w, s, _ = fit_mixture_weights(F, S, y_fit, lam=best_lambda, sigma_min=sigma_min,
+                                          n_restarts=n_restarts, seed=seed)
+            self.weights_ = {name: float(wi) for name, wi in zip(self.names, w)}
+            self.scales_ = {name: float(si) for name, si in zip(self.names, s)}
+            self._sigma_min_ = sigma_min
+        else:
+            P = np.clip(F, 1e-6, 1 - 1e-6)
+            best_lambda, cv_log = select_lambda_classification(P, y_fit, lambdas=lambdas, seed=seed)
+            w, _ = fit_pooled_weights(P, y_fit, lam=best_lambda, seed=seed)
+            self.weights_ = {name: float(wi) for name, wi in zip(self.names, w)}
+            self.scales_ = {}
+
+        self.lambda_ = float(best_lambda)
+        self.stacking_cv_log_ = cv_log
+        self.X_cal_, self.y_cal_ = X_cal, y_cal
+        self.X_test_, self.y_test_ = X_test, y_test
+        self.temperature_ = 1.0
+        self.q_hat_ = None
+        self.c_ = None
+        return self
+
+    @staticmethod
+    def _check_finite(arr: np.ndarray, name: str) -> None:
+        """Raise ValueError naming ``name`` if ``arr`` holds a NaN or infinite value."""
+        if not np.all(np.isfinite(arr)):
+            raise ValueError(f"{name} contains NaN or infinite value(s)")
+
+    def _fit_set_sigma(self, member, X_fit, y_fit) -> np.ndarray:
+        """Per-row sigma column for one member on D_fit (spec §3): the GP's own predictive
+        std, or a constant RMSE broadcast across every row for an XGBoost regressor."""
+        mean, sigma = self._stacking_predict(member, X_fit)
+        if sigma is not None:
+            return sigma
+        rmse = float(np.sqrt(np.mean((y_fit - mean) ** 2)))
+        return np.full(len(y_fit), rmse)
+
+    @staticmethod
+    def _split_stacking_set(X: np.ndarray, y: np.ndarray, groups, seed: int):
+        """60/20/20 split into (X_fit, X_cal, X_test, y_fit, y_cal, y_test).
+
+        Uses GroupShuffleSplit twice when ``groups`` is given (so no group crosses a split
+        boundary), else train_test_split, stratified by ``y`` for a binary-looking target
+        (exactly two distinct values).
+        """
+        n = len(y)
+        if groups is not None:
+            groups = np.asarray(groups)
+            splitter1 = GroupShuffleSplit(n_splits=1, test_size=0.4, random_state=seed)
+            fit_idx, rest_idx = next(splitter1.split(np.zeros(n), groups=groups))
+            splitter2 = GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=seed)
+            cal_idx, test_idx = next(splitter2.split(np.zeros(len(rest_idx)), groups=groups[rest_idx]))
+            cal_idx, test_idx = rest_idx[cal_idx], rest_idx[test_idx]
+        else:
+            stratify = y if len(np.unique(y)) == 2 else None
+            fit_idx, rest_idx = train_test_split(np.arange(n), test_size=0.4, random_state=seed,
+                                                 stratify=stratify)
+            rest_stratify = y[rest_idx] if stratify is not None else None
+            cal_idx, test_idx = train_test_split(rest_idx, test_size=0.5, random_state=seed,
+                                                 stratify=rest_stratify)
+        return (X[fit_idx], X[cal_idx], X[test_idx], y[fit_idx], y[cal_idx], y[test_idx])
 
     @property
     def available_tasks(self) -> List[str]:
