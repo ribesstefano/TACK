@@ -448,3 +448,23 @@ def test_predict_stacked_classification_gives_entropy_decomposition():
     assert np.allclose(out["entropy_total"], out["entropy_aleatoric"] + out["entropy_epistemic"],
                        atol=1e-9)
     assert np.all(out["entropy_epistemic"] >= -1e-12)
+
+
+def test_fit_stacking_classification_single_class_in_fit_set_raises():
+    X, y = _tiny_design_matrix(n=30, seed=11)
+    labels = np.ones(30)  # single class
+    model = xgb.XGBClassifier(n_estimators=5, max_depth=2).fit(
+        X[:10], (np.arange(10) % 2).astype(float))  # trained on a valid, disjoint slice
+    ens = FusionEnsemble([model], data=_fake_data(), task="activity")
+    with pytest.raises(ValueError, match="class"):
+        ens.fit_stacking(X_fit=X[10:20], y_fit=labels[10:20], X_cal=X[20:], y_cal=labels[20:])
+
+
+def test_fit_stacking_rejects_nan_in_explicit_split():
+    X, y = _tiny_design_matrix(n=30, seed=12)
+    X_fit = X[:10].copy()
+    X_fit[0, 0] = np.nan
+    model = xgb.XGBRegressor(n_estimators=5, max_depth=2).fit(X[10:20], y[10:20])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    with pytest.raises(ValueError, match="finite"):
+        ens.fit_stacking(X_fit=X_fit, y_fit=y[:10], X_cal=X[20:25], y_cal=y[20:25])
