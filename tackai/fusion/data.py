@@ -300,6 +300,7 @@ class FusionData:
     def from_pretrained(cls, repo_id: Union[str, Path] = DEFAULT_CONTEXT_REPO, *,
                         revision: Optional[str] = None,
                         token: Optional[str] = None,
+                        subfolder: Optional[str] = None,
                         cache_dir: Optional[Union[str, Path]] = None,
                         force_download: bool = False,
                         protein_space: str = "per_block",
@@ -319,6 +320,8 @@ class FusionData:
                 :data:`~tackai.fusion.context.DEFAULT_CONTEXT_REPO`).
             revision: Hub revision, for a repo id.
             token: Hub token, for a private repo.
+            subfolder: Subdirectory within ``repo_id`` holding this context table set, for a
+                repo that hosts several published snapshots side by side.
             cache_dir: Directory to install the tables into (default: ``TACKAI_CACHE`` via
                 :func:`get_cache_dir`). Created if it does not exist.
             force_download: Overwrite a cached file whose content differs from the published
@@ -351,8 +354,12 @@ class FusionData:
                     "huggingface_hub is required to download from the Hub; install it, or "
                     "pass a local directory to from_pretrained() instead."
                 ) from e
+            allow_patterns = [f"{subfolder}/*"] if subfolder else None
             source = Path(snapshot_download(repo_id=str(repo_id), repo_type="dataset",
-                                            revision=revision, token=token))
+                                            revision=revision, token=token,
+                                            allow_patterns=allow_patterns))
+        if subfolder:
+            source = source / subfolder
 
         manifest_path = source / "manifest.json"
         if not manifest_path.exists():
@@ -447,6 +454,7 @@ class FusionData:
                     private: bool = False,
                     commit_message: str = "Update fusion context embeddings",
                     staging_dir: Optional[Union[str, Path]] = None,
+                    subfolder: Optional[str] = None,
                     dry_run: bool = False) -> Optional[str]:
         """Publish this instance's context tables to the Hub, the inverse of :meth:`from_pretrained`.
 
@@ -464,6 +472,8 @@ class FusionData:
                 a previous staging attempt is never silently mixed with a fresh one. Left on
                 disk afterwards for inspection. Default: a temporary directory removed once
                 the upload finishes.
+            subfolder: Subdirectory within the repo to upload this context table set into, so
+                several published snapshots can share one repo without colliding.
             dry_run: Stage the files and return without uploading. Requires ``staging_dir``,
                 since there would otherwise be nothing left to inspect afterwards.
 
@@ -482,11 +492,13 @@ class FusionData:
             stage_context_tables(self.encoder.cache_dir, staging_dir)
             if dry_run:
                 return None
-            return upload_context_tables(staging_dir, repo_id, private, commit_message)
+            return upload_context_tables(staging_dir, repo_id, private, commit_message,
+                                         subfolder=subfolder)
         with tempfile.TemporaryDirectory() as tmp:
             staged = Path(tmp) / "fusion_context"
             stage_context_tables(self.encoder.cache_dir, staged)
-            return upload_context_tables(staged, repo_id, private, commit_message)
+            return upload_context_tables(staged, repo_id, private, commit_message,
+                                         subfolder=subfolder)
 
     def _drop_unencodable(self, verbose: bool = False) -> None:
         """Remove rows whose context the cached tables cannot encode, counting them by block."""
@@ -641,7 +653,7 @@ class FusionData:
 
     # ---------------------------------------------------------------- inference
 
-    def encode(self, records: Union[Sequence[dict], pd.DataFrame], return_ok: bool = False):
+    def transform(self, records: Union[Sequence[dict], pd.DataFrame], return_ok: bool = False):
         """Encode inference records into rows of the design matrix.
 
         Molecular features are computed on the fly; context blocks are looked up in the
@@ -676,7 +688,7 @@ class FusionData:
         X = np.concatenate([blocks[b] for b in BLOCK_ORDER], axis=1).astype(np.float32)
         return (X, ok) if return_ok else X
 
-    def encode_context(self, record: dict) -> np.ndarray:
+    def transform_context(self, record: dict) -> np.ndarray:
         """Encode one experimental context, for reuse across many molecules.
 
         Args:

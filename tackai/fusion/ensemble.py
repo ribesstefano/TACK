@@ -162,7 +162,7 @@ class FusionEnsemble:
 
     @classmethod
     def from_pretrained(cls, model_id: Union[str, Path], *, revision: Optional[str] = None,
-                        token: Optional[str] = None,
+                        token: Optional[str] = None, subfolder: Optional[str] = None,
                         data: Optional[FusionData] = None) -> "FusionEnsemble":
         """Load a saved ensemble from a local directory or a Hugging Face Hub repo.
 
@@ -170,6 +170,8 @@ class FusionEnsemble:
             model_id: Directory written by :meth:`save`, or a Hub repo id.
             revision: Hub revision, for a repo id.
             token: Hub token, for a private repo.
+            subfolder: Subdirectory within ``model_id`` holding this ensemble, for a repo
+                that hosts several ensembles (e.g. one per task) side by side.
             data: Reuse this :class:`FusionData` instead of rebuilding an encoder-only one
                 from the manifest (inference needs only the encoder and the layout).
 
@@ -181,7 +183,11 @@ class FusionEnsemble:
         path = Path(model_id)
         if not path.exists():
             from huggingface_hub import snapshot_download
-            path = Path(snapshot_download(repo_id=str(model_id), revision=revision, token=token))
+            allow_patterns = [f"{subfolder}/*"] if subfolder else None
+            path = Path(snapshot_download(repo_id=str(model_id), revision=revision, token=token,
+                                          allow_patterns=allow_patterns))
+        if subfolder:
+            path = path / subfolder
         manifest = json.loads((path / "manifest.json").read_text())
         members = [joblib.load(path / name) for name in manifest["member_files"]]
         if data is None:
@@ -264,7 +270,8 @@ class FusionEnsemble:
 
     def push_to_hub(self, repo_id: str, *, private: bool = False,
                     commit_message: str = "Update fusion ensemble",
-                    staging_dir: Optional[Union[str, Path]] = None) -> str:
+                    staging_dir: Optional[Union[str, Path]] = None,
+                    subfolder: Optional[str] = None) -> str:
         """Save this ensemble and upload it to a Hugging Face Hub model repo.
 
         The inverse of :meth:`from_pretrained` with a Hub ``model_id``.
@@ -275,6 +282,8 @@ class FusionEnsemble:
             commit_message: Commit message for the upload.
             staging_dir: Directory to write the saved ensemble into before uploading.
                 Default: a temporary directory removed once the upload finishes.
+            subfolder: Subdirectory within the repo to upload this ensemble into, so several
+                ensembles (e.g. one per task) can share one repo without colliding.
 
         Returns:
             The commit sha ``upload_folder`` reports.
@@ -284,17 +293,19 @@ class FusionEnsemble:
         else:
             with tempfile.TemporaryDirectory() as tmp:
                 return self._upload(self.save(Path(tmp) / "fusion_ensemble"), repo_id,
-                                    private, commit_message)
-        return self._upload(directory, repo_id, private, commit_message)
+                                    private, commit_message, subfolder)
+        return self._upload(directory, repo_id, private, commit_message, subfolder)
 
     @staticmethod
-    def _upload(directory: Path, repo_id: str, private: bool, commit_message: str) -> str:
+    def _upload(directory: Path, repo_id: str, private: bool, commit_message: str,
+               subfolder: Optional[str] = None) -> str:
         """Create (if needed) the model repo and upload every file in ``directory``."""
         from huggingface_hub import HfApi
         api = HfApi()
         api.create_repo(repo_id, repo_type="model", exist_ok=True, private=private)
         commit = api.upload_folder(repo_id=repo_id, repo_type="model",
-                                   folder_path=str(directory), commit_message=commit_message)
+                                   folder_path=str(directory), path_in_repo=subfolder,
+                                   commit_message=commit_message)
         return getattr(commit, "oid", str(commit))
 
     def set_weights(self, weights: Optional[Union[Sequence[float], Dict[str, float]]]) -> None:
@@ -537,7 +548,7 @@ class FusionEnsemble:
         return mean, std, noise, disagreement
 
     def calibrate_stacking(self, *, X_cal=None, y_cal=None, alpha: float = 0.1) -> "FusionEnsemble":
-        """Calibrate the stacking uncertainty on a held-out set (spec §6).
+        """Calibrate the stacking uncertainty on a held-out set.
 
         Must be called after :meth:`fit_stacking`. Defaults to the D_cal split
         ``fit_stacking`` stored; pass ``X_cal``/``y_cal`` to use a different set instead.

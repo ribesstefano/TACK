@@ -188,7 +188,7 @@ def stage_context_tables(cache_dir: Union[str, Path], out_dir: Union[str, Path])
 
 
 def upload_context_tables(staged_dir: Union[str, Path], repo_id: str, private: bool,
-                          commit_message: str) -> str:
+                          commit_message: str, subfolder: Optional[str] = None) -> str:
     """Create (if needed) the dataset repo and upload every file in ``staged_dir``.
 
     Args:
@@ -196,6 +196,8 @@ def upload_context_tables(staged_dir: Union[str, Path], repo_id: str, private: b
         repo_id: Hugging Face Hub repo id.
         private: Create the repo as private if it does not exist yet.
         commit_message: Commit message for the upload.
+        subfolder: Subdirectory within the repo to upload into, so several published
+            snapshots can share one repo without colliding.
 
     Returns:
         The commit sha ``upload_folder`` reports.
@@ -205,9 +207,10 @@ def upload_context_tables(staged_dir: Union[str, Path], repo_id: str, private: b
     print(f"Authenticated as: {api.whoami()['name']}")
     print(f"Creating (if needed) dataset repo {repo_id} ...")
     api.create_repo(repo_id, repo_type="dataset", exist_ok=True, private=private)
-    print(f"Uploading {staged_dir} -> {repo_id} ...")
-    commit = api.upload_folder(repo_id=repo_id, repo_type="dataset",
-                               folder_path=str(staged_dir), commit_message=commit_message)
+    destination = f"{repo_id}/{subfolder}" if subfolder else repo_id
+    print(f"Uploading {staged_dir} -> {destination} ...")
+    commit = api.upload_folder(repo_id=repo_id, repo_type="dataset", folder_path=str(staged_dir),
+                               path_in_repo=subfolder, commit_message=commit_message)
     sha = getattr(commit, "oid", str(commit))
     print(f"Done: https://huggingface.co/datasets/{repo_id} (commit {sha})")
     return sha
