@@ -13,10 +13,11 @@ import json
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import xgboost as xgb
 from sklearn.linear_model import LogisticRegression
 
 from tackai.fusion.context import ContextEncoder
@@ -526,6 +527,36 @@ class FusionEnsemble:
             return member.predict(X), None
         score, std = result if wants_std else (result, None)
         return member.report(score, std)
+
+    def _stacking_predict(self, member, X) -> "Tuple[np.ndarray, Optional[np.ndarray]]":
+        """(mean, sigma) for one member, in its own reported units, for the stacking fit.
+
+        Used only by fit_stacking/calibrate_stacking/predict_stacked — predict()/predict_matrix()
+        are unaffected and remain GP-only, as documented in the design spec.
+
+        Args:
+            member: A GPInteraction, xgboost.XGBRegressor, or xgboost.XGBClassifier.
+            X: Design matrix of the rows to score.
+
+        Returns:
+            ``(mean, sigma)``. ``sigma`` is the GP's own predictive std for a GPInteraction, or
+            None for any XGBoost member -- Option A's constant residual sigma for an XGBoost
+            regressor is computed once from D_fit by the caller (fit_stacking), not here.
+
+        Raises:
+            TypeError: If ``member`` is none of the three supported types.
+        """
+        X = np.asarray(X)
+        if isinstance(member, GPInteraction):
+            mean, sigma = member.predict(X, return_std=True)
+            return mean, sigma
+        if isinstance(member, xgb.XGBClassifier):
+            return member.predict_proba(X)[:, 1], None
+        if isinstance(member, xgb.XGBRegressor):
+            return member.predict(X), None
+        raise TypeError(
+            f"unsupported stacking member type {type(member).__name__!r} for {member!r}; "
+            "expected GPInteraction, xgboost.XGBRegressor, or xgboost.XGBClassifier")
 
     def _aggregate(self, per_member, ok, smiles, return_individual: bool) -> FusionPrediction:
         """Weighted mean, and the law of total variance over the members."""

@@ -5,7 +5,12 @@ design spec's instruction to keep these tests fast and focused on the stacking m
 """
 import numpy as np
 import pytest
+import xgboost as xgb
 
+from fusion_fixtures import DEFAULT_BLOCKS
+from tackai.fusion.data import FusionData
+from tackai.fusion.ensemble import FusionEnsemble
+from tackai.fusion.gp import GPInteraction
 from tackai.fusion.stacking import (binary_entropy, conformal_quantile,
                                     entropy_decomposition, fit_mixture_weights,
                                     fit_pooled_weights, mixture_nll, mixture_nll_grad,
@@ -224,3 +229,61 @@ def test_select_lambda_classification_returns_a_value_from_the_grid():
     best, log = select_lambda_classification(P, y, lambdas=lambdas, seed=0)
     assert best in lambdas
     assert set(log.keys()) == set(lambdas)
+
+
+def _tiny_design_matrix(n=20, seed=0):
+    """A design matrix shaped like FusionData's layout, with a trivial GP-friendly signal."""
+    rng = np.random.default_rng(seed)
+    width = sum(len(idx) for idx in DEFAULT_BLOCKS.values())
+    X = rng.normal(size=(n, width)).astype(np.float32)
+    y = X[:, 0] * 0.5 + rng.normal(scale=0.05, size=n)
+    return X, y
+
+
+def test_stacking_predict_dispatches_gp_member():
+    X, y = _tiny_design_matrix()
+    gp = GPInteraction(blocks=DEFAULT_BLOCKS, task_type="regression", n_restarts=1, n_iter=5,
+                       max_hyper_points=20).fit(X, y)
+    ens = FusionEnsemble([gp], data=_fake_data(), task="dmax")
+    mean, sigma = ens._stacking_predict(gp, X)
+    assert mean.shape == (20,)
+    assert sigma is not None and sigma.shape == (20,) and np.all(sigma >= 0)
+
+
+def test_stacking_predict_dispatches_xgb_regressor():
+    X, y = _tiny_design_matrix()
+    model = xgb.XGBRegressor(n_estimators=5, max_depth=2).fit(X, y)
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    mean, sigma = ens._stacking_predict(model, X)
+    assert mean.shape == (20,)
+    assert sigma is None
+
+
+def test_stacking_predict_dispatches_xgb_classifier():
+    X, y = _tiny_design_matrix()
+    labels = (y > np.median(y)).astype(int)
+    model = xgb.XGBClassifier(n_estimators=5, max_depth=2).fit(X, labels)
+    ens = FusionEnsemble([model], data=_fake_data(), task="activity")
+    mean, sigma = ens._stacking_predict(model, X)
+    assert mean.shape == (20,)
+    assert np.all((mean >= 0) & (mean <= 1))
+    assert sigma is None
+
+
+def test_stacking_predict_raises_for_unknown_member_type():
+    X, _ = _tiny_design_matrix()
+    ens = FusionEnsemble([object()], data=_fake_data(), task="dmax")
+    with pytest.raises(TypeError, match="object"):
+        ens._stacking_predict(ens.members[0], X)
+
+
+def _fake_data():
+    """A minimal stand-in exposing just what FusionEnsemble.__init__/_check_members read.
+
+    FusionEnsemble only reads `.blocks_indexes` (for the GP block-layout check, which a
+    bare XGBoost member skips entirely since it has no `.blocks` attribute); it does not
+    need a real FusionData for these dispatch-only tests.
+    """
+    class _Data:
+        blocks_indexes = DEFAULT_BLOCKS
+    return _Data()
