@@ -25,7 +25,8 @@ from tackai.fusion.context import ContextEncoder
 from tackai.fusion.data import BLOCK_ORDER, TASK_LABELS, TASK_SUPPORT, TASK_TYPES, FusionData
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES, MolEncoder
 from tackai.fusion.gp import GPInteraction
-from tackai.fusion.stacking import (conformal_quantile, fit_mixture_weights, fit_pooled_weights,
+from tackai.fusion.stacking import (conformal_quantile, entropy_decomposition,
+                                    fit_mixture_weights, fit_pooled_weights,
                                     select_lambda_classification, select_lambda_regression)
 from tackai.fusion.training import check_labels
 
@@ -571,6 +572,49 @@ class FusionEnsemble:
             se = float(np.std(diffs))
             self.temperature_ = best_T if (uncalibrated_loss - best_loss) > se else 1.0
         return self
+
+    def predict_stacked(self, X) -> dict:
+        """Score new rows with the fitted stacking weights and calibrated uncertainty.
+
+        Must be called after :meth:`fit_stacking` (and, for a calibrated interval,
+        :meth:`calibrate_stacking`).
+
+        Args:
+            X: Design matrix of the rows to score.
+
+        Returns:
+            For regression: ``{"mean", "std", "std_noise", "std_disagreement", "lower",
+            "upper"}`` — ``lower``/``upper`` are ``None`` if :meth:`calibrate_stacking` has not
+            been called yet (the predictive distribution is a mixture, not a Gaussian, so no
+            interval is reported without the conformal quantile). For classification:
+            ``{"proba", "entropy_total", "entropy_aleatoric", "entropy_epistemic"}``.
+
+        Raises:
+            RuntimeError: If called before :meth:`fit_stacking`.
+        """
+        if not hasattr(self, "weights_"):
+            raise RuntimeError("call fit_stacking before predict_stacked")
+        X = np.asarray(X)
+
+        if TASK_TYPES[self.task] == "regression":
+            mean, std, noise, disagreement = self._mixture_mean_std(X)
+            q_hat = getattr(self, "q_hat_", None)
+            lower = mean - q_hat * std if q_hat is not None else None
+            upper = mean + q_hat * std if q_hat is not None else None
+            return {"mean": mean, "std": std, "std_noise": noise, "std_disagreement": disagreement,
+                   "lower": lower, "upper": upper}
+
+        F = np.column_stack([self._stacking_predict(m, X)[0] for m in self.members])
+        P = np.clip(F, 1e-6, 1 - 1e-6)
+        w = np.array([self.weights_[name] for name in self.names])
+        pooled = np.clip(P @ w, 1e-6, 1 - 1e-6)
+        temperature = getattr(self, "temperature_", 1.0)
+        if temperature != 1.0:
+            logit = np.log(pooled / (1 - pooled))
+            pooled = np.clip(1.0 / (1.0 + np.exp(-logit / temperature)), 1e-6, 1 - 1e-6)
+        total, aleatoric, epistemic = entropy_decomposition(P, w)
+        return {"proba": pooled, "entropy_total": total, "entropy_aleatoric": aleatoric,
+               "entropy_epistemic": epistemic}
 
     @staticmethod
     def _bootstrap_loss_diffs(y, pooled, T, n_boot: int, seed: int) -> np.ndarray:

@@ -350,7 +350,6 @@ def test_fit_stacking_classification_with_explicit_split():
     assert ens.scales_ == {}
 
 
-@pytest.mark.skip(reason="predict_stacked added in Task 7")
 def test_fit_stacking_runs_end_to_end_with_mixed_gp_and_xgboost_membership():
     """Acceptance test from the design spec §9: fit_stacking must handle an ensemble
     whose members are a mix of GPInteraction and XGBRegressor."""
@@ -404,3 +403,48 @@ def test_calibrate_stacking_classification_sets_temperature():
     ens.fit_stacking(X=X[20:], y=labels[20:])
     ens.calibrate_stacking()
     assert ens.temperature_ > 0
+
+
+def test_predict_stacked_raises_before_fit_stacking():
+    X, _ = _tiny_design_matrix(n=10)
+    model = xgb.XGBRegressor(n_estimators=5, max_depth=2).fit(X, np.zeros(10))
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    with pytest.raises(RuntimeError, match="fit_stacking"):
+        ens.predict_stacked(X)
+
+
+def test_predict_stacked_regression_without_calibration_omits_interval():
+    X, y = _tiny_design_matrix(n=60, seed=8)
+    model = xgb.XGBRegressor(n_estimators=15, max_depth=2).fit(X[:20], y[:20])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X=X[20:], y=y[20:])
+    out = ens.predict_stacked(X[:5])
+    assert set(out) == {"mean", "std", "std_noise", "std_disagreement", "lower", "upper"}
+    assert out["mean"].shape == (5,)
+    assert np.all(out["std"] >= 0)
+    assert out["lower"] is None and out["upper"] is None
+
+
+def test_predict_stacked_regression_with_calibration_gives_interval():
+    X, y = _tiny_design_matrix(n=90, seed=9)
+    model = xgb.XGBRegressor(n_estimators=15, max_depth=2).fit(X[:30], y[:30])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X=X[30:], y=y[30:])
+    ens.calibrate_stacking(alpha=0.1)
+    out = ens.predict_stacked(X[:5])
+    assert out["lower"] is not None and out["upper"] is not None
+    assert np.all(out["upper"] >= out["lower"])
+    assert np.allclose(out["upper"] - out["mean"], ens.q_hat_ * out["std"])
+
+
+def test_predict_stacked_classification_gives_entropy_decomposition():
+    X, y = _tiny_design_matrix(n=60, seed=10)
+    labels = (y > np.median(y)).astype(float)
+    model = xgb.XGBClassifier(n_estimators=15, max_depth=2).fit(X[:20], labels[:20])
+    ens = FusionEnsemble([model], data=_fake_data(), task="activity")
+    ens.fit_stacking(X=X[20:], y=labels[20:])
+    out = ens.predict_stacked(X[:5])
+    assert set(out) == {"proba", "entropy_total", "entropy_aleatoric", "entropy_epistemic"}
+    assert np.allclose(out["entropy_total"], out["entropy_aleatoric"] + out["entropy_epistemic"],
+                       atol=1e-9)
+    assert np.all(out["entropy_epistemic"] >= -1e-12)
