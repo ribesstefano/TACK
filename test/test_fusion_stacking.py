@@ -366,3 +366,41 @@ def test_fit_stacking_runs_end_to_end_with_mixed_gp_and_xgboost_membership():
     out = ens.predict_stacked(X[45:])
     assert out["mean"].shape == (15,)
     assert np.all(np.isfinite(out["mean"])) and np.all(out["std"] >= 0)
+
+
+def test_calibrate_stacking_raises_before_fit_stacking():
+    X, y = _tiny_design_matrix(n=10)
+    model = xgb.XGBRegressor(n_estimators=5, max_depth=2).fit(X, y)
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    with pytest.raises(RuntimeError, match="fit_stacking"):
+        ens.calibrate_stacking()
+
+
+def test_calibrate_stacking_regression_sets_q_hat_and_c():
+    X, y = _tiny_design_matrix(n=90, seed=5)
+    model = xgb.XGBRegressor(n_estimators=15, max_depth=2).fit(X[:30], y[:30])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X=X[30:], y=y[30:], n_restarts=2)
+    ens.calibrate_stacking(alpha=0.1)
+    assert ens.q_hat_ is not None and ens.q_hat_ > 0
+    assert ens.c_ is not None and ens.c_ > 0
+
+
+def test_calibrate_stacking_regression_warns_when_cal_set_too_small():
+    X, y = _tiny_design_matrix(n=20, seed=6)
+    model = xgb.XGBRegressor(n_estimators=5, max_depth=2).fit(X[:5], y[:5])
+    ens = FusionEnsemble([model], data=_fake_data(), task="dmax")
+    ens.fit_stacking(X_fit=X[5:10], y_fit=y[5:10], X_cal=X[10:12], y_cal=y[10:12], n_restarts=1)
+    with pytest.warns(UserWarning, match="too small"):
+        ens.calibrate_stacking(alpha=0.01)
+    assert ens.q_hat_ == np.inf
+
+
+def test_calibrate_stacking_classification_sets_temperature():
+    X, y = _tiny_design_matrix(n=60, seed=7)
+    labels = (y > np.median(y)).astype(float)
+    model = xgb.XGBClassifier(n_estimators=15, max_depth=2).fit(X[:20], labels[:20])
+    ens = FusionEnsemble([model], data=_fake_data(), task="activity")
+    ens.fit_stacking(X=X[20:], y=labels[20:])
+    ens.calibrate_stacking()
+    assert ens.temperature_ > 0

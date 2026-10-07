@@ -25,7 +25,7 @@ from tackai.fusion.context import ContextEncoder
 from tackai.fusion.data import BLOCK_ORDER, TASK_LABELS, TASK_SUPPORT, TASK_TYPES, FusionData
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES, MolEncoder
 from tackai.fusion.gp import GPInteraction
-from tackai.fusion.stacking import (fit_mixture_weights, fit_pooled_weights,
+from tackai.fusion.stacking import (conformal_quantile, fit_mixture_weights, fit_pooled_weights,
                                     select_lambda_classification, select_lambda_regression)
 from tackai.fusion.training import check_labels
 
@@ -499,6 +499,94 @@ class FusionEnsemble:
             cal_idx, test_idx = train_test_split(rest_idx, test_size=0.5, random_state=seed,
                                                  stratify=rest_stratify)
         return (X[fit_idx], X[cal_idx], X[test_idx], y[fit_idx], y[cal_idx], y[test_idx])
+
+    def _mixture_mean_std(self, X) -> "Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]":
+        """Mixture mean/std and their noise/disagreement components (spec §4), regression only.
+
+        An XGBoost regressor member has no per-row sigma: its raw sigma column is exactly 1
+        everywhere, so ``sigma_tilde = s_i * 1 = s_i`` reconstructs the constant RMSE-scale
+        fit_stacking fit for it, without re-deriving the RMSE here.
+
+        Requires fit_stacking to have been called.
+        """
+        n = len(X)
+        F = np.empty((n, len(self.members)))
+        S = np.empty((n, len(self.members)))
+        for j, member in enumerate(self.members):
+            mean_j, sigma_j = self._stacking_predict(member, X)
+            F[:, j] = mean_j
+            S[:, j] = sigma_j if sigma_j is not None else 1.0
+        w = np.array([self.weights_[name] for name in self.names])
+        s = np.array([self.scales_[name] for name in self.names])
+        sigma_tilde = np.maximum(S * s[None, :], self._sigma_min_)
+        mean = F @ w
+        noise = np.sqrt(np.sum(w[None, :] * sigma_tilde ** 2, axis=1))
+        disagreement = np.sqrt(np.sum(w[None, :] * (F - mean[:, None]) ** 2, axis=1))
+        std = np.sqrt(noise ** 2 + disagreement ** 2)
+        return mean, std, noise, disagreement
+
+    def calibrate_stacking(self, *, X_cal=None, y_cal=None, alpha: float = 0.1) -> "FusionEnsemble":
+        """Calibrate the stacking uncertainty on a held-out set (spec §6).
+
+        Must be called after :meth:`fit_stacking`. Defaults to the D_cal split
+        ``fit_stacking`` stored; pass ``X_cal``/``y_cal`` to use a different set instead.
+
+        Args:
+            X_cal: Calibration design matrix (default: the D_cal fit_stacking stored).
+            y_cal: Calibration labels (default: the D_cal fit_stacking stored).
+            alpha: Miscoverage level for the regression conformal interval.
+
+        Returns:
+            self, with ``q_hat_``/``c_`` set for regression, or ``temperature_`` for
+            classification.
+
+        Raises:
+            RuntimeError: If called before :meth:`fit_stacking`.
+        """
+        if not hasattr(self, "weights_"):
+            raise RuntimeError("call fit_stacking before calibrate_stacking")
+        X_cal = np.asarray(X_cal) if X_cal is not None else self.X_cal_
+        y_cal = np.asarray(y_cal) if y_cal is not None else self.y_cal_
+
+        if TASK_TYPES[self.task] == "regression":
+            mean, std, _, _ = self._mixture_mean_std(X_cal)
+            ratio = np.abs(y_cal - mean) / std
+            self.q_hat_ = conformal_quantile(ratio, alpha)
+            self.c_ = float(np.sqrt(np.mean(ratio ** 2)))
+        else:
+            F = np.column_stack([self._stacking_predict(m, X_cal)[0] for m in self.members])
+            P = np.clip(F, 1e-6, 1 - 1e-6)
+            w = np.array([self.weights_[name] for name in self.names])
+            pooled = np.clip(P @ w, 1e-6, 1 - 1e-6)
+            uncalibrated_loss = float(-np.mean(y_cal * np.log(pooled) + (1 - y_cal) * np.log(1 - pooled)))
+            logit = np.log(pooled / (1 - pooled))
+            best_T, best_loss = 1.0, uncalibrated_loss
+            for T in np.geomspace(0.2, 5.0, 25):
+                adjusted = 1.0 / (1.0 + np.exp(-logit / T))
+                adjusted = np.clip(adjusted, 1e-6, 1 - 1e-6)
+                loss = float(-np.mean(y_cal * np.log(adjusted) + (1 - y_cal) * np.log(1 - adjusted)))
+                if loss < best_loss:
+                    best_T, best_loss = T, loss
+            diffs = self._bootstrap_loss_diffs(y_cal, pooled, best_T, n_boot=200, seed=0)
+            se = float(np.std(diffs))
+            self.temperature_ = best_T if (uncalibrated_loss - best_loss) > se else 1.0
+        return self
+
+    @staticmethod
+    def _bootstrap_loss_diffs(y, pooled, T, n_boot: int, seed: int) -> np.ndarray:
+        """Bootstrap standard error of (uncalibrated - calibrated) log loss, for the
+        temperature-acceptance test in calibrate_stacking."""
+        rng = np.random.default_rng(seed)
+        n = len(y)
+        logit = np.log(pooled / (1 - pooled))
+        adjusted = np.clip(1.0 / (1.0 + np.exp(-logit / T)), 1e-6, 1 - 1e-6)
+        diffs = np.empty(n_boot)
+        for b in range(n_boot):
+            idx = rng.integers(0, n, size=n)
+            unc = -np.mean(y[idx] * np.log(pooled[idx]) + (1 - y[idx]) * np.log(1 - pooled[idx]))
+            cal = -np.mean(y[idx] * np.log(adjusted[idx]) + (1 - y[idx]) * np.log(1 - adjusted[idx]))
+            diffs[b] = unc - cal
+        return diffs
 
     @property
     def available_tasks(self) -> List[str]:
