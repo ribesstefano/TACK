@@ -162,6 +162,8 @@ cython_debug/
 
 # Custom files
 
+.worktrees/
+
 data/uniprot2embedding.h5
 data/PROTAC-DB.csv
 data/PROTAC-Pedia.csv
