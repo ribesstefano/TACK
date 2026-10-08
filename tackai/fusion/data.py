@@ -300,10 +300,9 @@ class FusionData:
     def from_pretrained(cls, repo_id: Union[str, Path] = DEFAULT_CONTEXT_REPO, *,
                         revision: Optional[str] = None,
                         token: Optional[str] = None,
-                        subfolder: Optional[str] = None,
                         cache_dir: Optional[Union[str, Path]] = None,
                         force_download: bool = False,
-                        protein_space: str = "per_block",
+                        protein_space: Optional[str] = None,
                         featurizer: Optional[MolEncoder] = None,
                         descriptors: Optional[Sequence[str]] = DESCRIPTOR_NAMES) -> "FusionData":
         """Build an encoder-only FusionData from the published context embedding tables.
@@ -320,14 +319,18 @@ class FusionData:
                 :data:`~tackai.fusion.context.DEFAULT_CONTEXT_REPO`).
             revision: Hub revision, for a repo id.
             token: Hub token, for a private repo.
-            subfolder: Subdirectory within ``repo_id`` holding this context table set, for a
-                repo that hosts several published snapshots side by side.
             cache_dir: Directory to install the tables into (default: ``TACKAI_CACHE`` via
                 :func:`get_cache_dir`). Created if it does not exist.
             force_download: Overwrite a cached file whose content differs from the published
                 one, instead of raising. A mismatch almost always means the cache already
                 holds tables from a different, locally refitted PCA.
-            protein_space: Passed to :class:`ContextEncoder`.
+            protein_space: Passed to :class:`ContextEncoder`. ``None`` (the default) reads the
+                space the manifest's publisher recorded (:meth:`push_to_hub` always records
+                its own encoder's), falling back to ``"per_block"`` for a manifest staged
+                without one (e.g. by the maintainer CLI over a whole cache). Passing an
+                explicit value that contradicts a manifest which *does* record one raises —
+                that combination almost always means a context vector of the wrong width is
+                about to be handed to a model trained in the other space.
             featurizer: Molecular featuriser (default: a fresh :class:`MolEncoder`).
             descriptors: RDKit descriptor names for the default featuriser, or ``None`` for
                 fingerprints only.
@@ -342,8 +345,9 @@ class FusionData:
                 expects (a version mismatch between the published repo and this library), if
                 a source file's content does not match its own manifest (a corrupt download
                 or staged copy), if a cached file's content differs from the manifest's
-                record of it (and ``force_download`` is false), or if the installed tables'
-                widths disagree with the manifest's ``block_dims``.
+                record of it (and ``force_download`` is false), if an explicit
+                ``protein_space`` contradicts the one the manifest records, or if the
+                installed tables' widths disagree with the manifest's ``block_dims``.
         """
         source = Path(repo_id)
         if not source.exists():
@@ -354,12 +358,8 @@ class FusionData:
                     "huggingface_hub is required to download from the Hub; install it, or "
                     "pass a local directory to from_pretrained() instead."
                 ) from e
-            allow_patterns = [f"{subfolder}/*"] if subfolder else None
             source = Path(snapshot_download(repo_id=str(repo_id), repo_type="dataset",
-                                            revision=revision, token=token,
-                                            allow_patterns=allow_patterns))
-        if subfolder:
-            source = source / subfolder
+                                            revision=revision, token=token))
 
         manifest_path = source / "manifest.json"
         if not manifest_path.exists():
@@ -384,6 +384,24 @@ class FusionData:
                 f"version expects: {missing_from_manifest}. The published repo and this "
                 "tackai version disagree about the context table layout — pass revision= to "
                 "pin an older snapshot of the repo, or upgrade tackai."
+            )
+
+        # The manifest records which protein_space the publishing encoder actually used
+        # (None for a manifest staged over a whole cache rather than one encoder's, e.g. by
+        # scripts/publish_fusion_context.py) — both spaces' tables are staged either way, so
+        # they are otherwise indistinguishable from the files alone. An explicit argument
+        # must agree with a manifest that commits to one; the fallback for no manifest
+        # opinion and no explicit argument is "per_block", matching ContextEncoder's own
+        # default.
+        manifest_protein_space = manifest.get("protein_space")
+        if protein_space is None:
+            protein_space = manifest_protein_space or "per_block"
+        elif manifest_protein_space is not None and protein_space != manifest_protein_space:
+            raise ValueError(
+                f"protein_space={protein_space!r} was requested, but {source} was published "
+                f"with protein_space={manifest_protein_space!r}. Loading the wrong space "
+                "would hand downstream models a context vector of the wrong width — pass "
+                f"protein_space={manifest_protein_space!r} (or omit it) instead."
             )
 
         target = Path(cache_dir) if cache_dir is not None else Path(get_cache_dir())
@@ -450,11 +468,10 @@ class FusionData:
             )
         return data
 
-    def push_to_hub(self, repo_id: Union[str, Path] = DEFAULT_CONTEXT_REPO, *,
+    def push_to_hub(self, repo_id: str = DEFAULT_CONTEXT_REPO, *,
                     private: bool = False,
                     commit_message: str = "Update fusion context embeddings",
                     staging_dir: Optional[Union[str, Path]] = None,
-                    subfolder: Optional[str] = None,
                     dry_run: bool = False) -> Optional[str]:
         """Publish this instance's context tables to the Hub, the inverse of :meth:`from_pretrained`.
 
@@ -462,7 +479,9 @@ class FusionData:
         :attr:`encoder`'s own cache directory and uploads them, so the published repo always
         matches what this instance actually encodes with — never :attr:`table`, :attr:`X`,
         the targets or the splits (see the module-level rationale in
-        ``tackai/fusion/context.py`` for why those stay out of this artifact).
+        ``tackai/fusion/context.py`` for why those stay out of this artifact). The manifest
+        also records :attr:`encoder`'s own ``protein_space``, so :meth:`from_pretrained`
+        reproduces it by default instead of guessing.
 
         Args:
             repo_id: Hugging Face Hub dataset repo id to create (if needed) and upload to.
@@ -472,8 +491,6 @@ class FusionData:
                 a previous staging attempt is never silently mixed with a fresh one. Left on
                 disk afterwards for inspection. Default: a temporary directory removed once
                 the upload finishes.
-            subfolder: Subdirectory within the repo to upload this context table set into, so
-                several published snapshots can share one repo without colliding.
             dry_run: Stage the files and return without uploading. Requires ``staging_dir``,
                 since there would otherwise be nothing left to inspect afterwards.
 
@@ -489,16 +506,16 @@ class FusionData:
             raise ValueError("dry_run requires staging_dir, otherwise the staged files would "
                              "be thrown away unseen")
         if staging_dir is not None:
-            stage_context_tables(self.encoder.cache_dir, staging_dir)
+            stage_context_tables(self.encoder.cache_dir, staging_dir, repo_id=repo_id,
+                                 protein_space=self.encoder.protein_space)
             if dry_run:
                 return None
-            return upload_context_tables(staging_dir, repo_id, private, commit_message,
-                                         subfolder=subfolder)
+            return upload_context_tables(staging_dir, repo_id, private, commit_message)
         with tempfile.TemporaryDirectory() as tmp:
             staged = Path(tmp) / "fusion_context"
-            stage_context_tables(self.encoder.cache_dir, staged)
-            return upload_context_tables(staged, repo_id, private, commit_message,
-                                         subfolder=subfolder)
+            stage_context_tables(self.encoder.cache_dir, staged, repo_id=repo_id,
+                                 protein_space=self.encoder.protein_space)
+            return upload_context_tables(staged, repo_id, private, commit_message)
 
     def _drop_unencodable(self, verbose: bool = False) -> None:
         """Remove rows whose context the cached tables cannot encode, counting them by block."""
@@ -702,12 +719,12 @@ class FusionData:
         return np.concatenate([blocks[b] for b in BLOCK_ORDER if b in CONTEXT_BLOCKS],
                               axis=1).astype(np.float32)
 
-    def assemble(self, context_row: np.ndarray, smiles: Sequence[str]) -> np.ndarray:
+    def assemble(self, smiles: Sequence[str], context: np.ndarray) -> np.ndarray:
         """Combine one encoded context with freshly featurised molecules.
 
         Args:
-            context_row: Output of :meth:`encode_context`.
             smiles: SMILES strings to featurise on the fly.
+            context: Output of :meth:`encode_context`.
 
         Returns:
             Array of shape ``(len(smiles), n_columns)``, ``float32``.
@@ -716,14 +733,14 @@ class FusionData:
         if not smiles:
             return np.empty((0, self.n_columns), dtype=np.float32)
         fp, desc, _ = self.featurizer.featurize(smiles)
-        return self.assemble_features(context_row, fp, desc)
+        return self.assemble_features(context, fp, desc)
 
-    def assemble_features(self, context_row: np.ndarray, fp: np.ndarray,
+    def assemble_features(self, context: np.ndarray, fp: np.ndarray,
                           desc: np.ndarray) -> np.ndarray:
         """Combine one encoded context with molecular features that are already computed.
 
         Args:
-            context_row: Output of :meth:`encode_context`.
+            context: Output of :meth:`encode_context`.
             fp: Fingerprints, shape ``(n, fp_size)``.
             desc: Descriptors, shape ``(n, n_descriptors)``.
 
@@ -733,5 +750,5 @@ class FusionData:
         X = np.empty((len(fp), self.n_columns), dtype=np.float32)
         X[:, self.index["fingerprint"]] = fp
         X[:, self.index["descriptors"]] = desc
-        X[:, self.context_columns] = np.asarray(context_row, dtype=np.float32)
+        X[:, self.context_columns] = np.asarray(context, dtype=np.float32)
         return X

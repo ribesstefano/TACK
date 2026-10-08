@@ -43,6 +43,22 @@ def test_stage_copies_all_ten_files_and_writes_a_manifest(fake_cache, tmp_path):
     assert manifest["combined_dim"] == 52
 
 
+def test_stage_writes_a_readme_mentioning_the_repo_and_from_pretrained(fake_cache, tmp_path):
+    out = tmp_path / "staged"
+    pfc.stage(fake_cache, out, repo_id="ailab-bio/TACK-fusion-context")
+    readme = (out / "README.md").read_text()
+    assert "ailab-bio/TACK-fusion-context" in readme
+    assert "from_pretrained" in readme
+
+
+def test_stage_readme_defaults_to_the_default_context_repo(fake_cache, tmp_path):
+    from tackai.fusion.context import DEFAULT_CONTEXT_REPO
+    out = tmp_path / "staged"
+    pfc.stage(fake_cache, out)
+    readme = (out / "README.md").read_text()
+    assert DEFAULT_CONTEXT_REPO in readme
+
+
 def test_stage_hashes_match_the_staged_bytes(fake_cache, tmp_path):
     out = tmp_path / "staged"
     manifest = pfc.stage(fake_cache, out)
@@ -118,9 +134,9 @@ def test_from_pretrained_can_encode_a_context(fake_cache, tmp_path, tiny_records
     pfc.stage(fake_cache, staged)
     data = FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache")
     row = tiny_records[0]
-    ctx = data.encode_context({"poi_seq": row["poi_seq"], "e3_seq": row["e3_seq"],
-                               "cell_id": row["cell_id"], "assay": row["assay"],
-                               "assay_time": row["assay_time"]})
+    ctx = data.transform_context({"poi_seq": row["poi_seq"], "e3_seq": row["e3_seq"],
+                                  "cell_id": row["cell_id"], "assay": row["assay"],
+                                  "assay_time": row["assay_time"]})
     assert ctx.shape == (1, len(data.context_columns))
 
 
@@ -148,6 +164,72 @@ def test_from_pretrained_supports_the_combined_protein_space(fake_cache, tmp_pat
     data = FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache",
                                       protein_space="combined")
     assert data.dims["poi"] == 52 and data.dims["e3"] == 52
+
+
+def test_stage_with_no_protein_space_leaves_the_manifest_key_none(fake_cache, tmp_path):
+    """The maintainer CLI stages a whole cache, not one encoder's choice, so it must not
+    commit to a space the manifest didn't actually observe."""
+    staged = tmp_path / "staged"
+    manifest = pfc.stage(fake_cache, staged)
+    assert manifest["protein_space"] is None
+
+
+def test_push_to_hub_records_the_encoders_protein_space_in_the_manifest(fake_cache, tmp_path):
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache, protein_space="combined"))
+    staged = tmp_path / "staged"
+
+    data.push_to_hub("ailab-bio/TACK-fusion-context", staging_dir=staged, dry_run=True)
+
+    manifest = json.loads((staged / "manifest.json").read_text())
+    assert manifest["protein_space"] == "combined"
+
+
+def test_from_pretrained_defaults_to_the_manifests_recorded_protein_space(fake_cache, tmp_path):
+    """The bug this guards against: pushing a 'combined' encoder and loading it back with no
+    protein_space argument must reproduce 'combined', not silently fall back to 'per_block'
+    and hand back a context vector of the wrong width."""
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache, protein_space="combined"))
+    staged = tmp_path / "staged"
+    data.push_to_hub("ailab-bio/TACK-fusion-context", staging_dir=staged, dry_run=True)
+
+    reloaded = FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache")
+
+    assert reloaded.encoder.protein_space == "combined"
+    assert reloaded.dims == data.dims
+    assert len(reloaded.context_columns) == len(data.context_columns)
+
+
+def test_from_pretrained_rejects_a_protein_space_contradicting_the_manifest(fake_cache, tmp_path):
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache, protein_space="combined"))
+    staged = tmp_path / "staged"
+    data.push_to_hub("ailab-bio/TACK-fusion-context", staging_dir=staged, dry_run=True)
+
+    with pytest.raises(ValueError, match="per_block"):
+        FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache",
+                                   protein_space="per_block")
+
+
+def test_from_pretrained_accepts_an_explicit_protein_space_matching_the_manifest(
+        fake_cache, tmp_path):
+    data = FusionData(encoder=ContextEncoder(cache_dir=fake_cache, protein_space="combined"))
+    staged = tmp_path / "staged"
+    data.push_to_hub("ailab-bio/TACK-fusion-context", staging_dir=staged, dry_run=True)
+
+    reloaded = FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache",
+                                          protein_space="combined")
+    assert reloaded.encoder.protein_space == "combined"
+
+
+def test_from_pretrained_falls_back_to_per_block_for_a_manifest_without_the_key(
+        fake_cache, tmp_path):
+    """A manifest staged before this fix (or by the maintainer CLI, which never commits to a
+    space) has no 'protein_space' key at all; from_pretrained must not choke on it."""
+    staged = tmp_path / "staged"
+    pfc.stage(fake_cache, staged)  # the CLI path: protein_space stays None in the manifest
+
+    data = FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache")
+
+    assert data.encoder.protein_space == "per_block"
 
 
 def test_from_pretrained_rejects_a_tampered_cached_file(fake_cache, tmp_path):
@@ -297,6 +379,7 @@ def test_push_to_hub_stages_to_a_given_directory_and_uploads(fake_cache, tmp_pat
     for name in _all_context_filenames():
         assert (staged / name).exists()
     assert (staged / "manifest.json").exists()
+    assert "ailab-bio/TACK-fusion-context" in (staged / "README.md").read_text()
     assert calls["create_repo"] == ("ailab-bio/TACK-fusion-context", "dataset", True, False)
     assert calls["upload_folder"][2] == str(staged)
     assert calls["upload_folder"][3] == "test commit"
