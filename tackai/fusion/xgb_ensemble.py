@@ -9,17 +9,18 @@ classification. The task is inferred from the models' objective.
     out = ens.predict(X_new)                 # uniform weights until fitted
     ens.fit(X_fit, y_fit).calibrate(X_cal, y_cal)
     out = ens.predict(X_new)                 # dict of arrays
-    ens.push_to_hub("user/my-ensemble")
-    ens = XGBStackedEnsemble.from_pretrained("user/my-ensemble")
+    ens.push_to_hub("user/my-ensembles", subfolder="subtask-a")
+    ens = XGBStackedEnsemble.from_pretrained("user/my-ensembles", subfolder="subtask-a")
 """
 from __future__ import annotations
 
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 import xgboost as xgb
-from huggingface_hub import ModelHubMixin, snapshot_download
+from huggingface_hub import HfApi, ModelHubMixin, snapshot_download
 from scipy.optimize import minimize, minimize_scalar
 from scipy.special import expit, log_expit, log_softmax, logit, logsumexp, softmax, xlog1py, xlogy
 
@@ -107,7 +108,7 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
     Weights are uniform until `fit` is called. Before fitting, the regression
     noise term is unknown and set to zero, so `std` is model disagreement only.
 
-    `X` is anything `xgboost.DMatrix` accepts. Fit on data disjoint from the
+    `X` is anything the models' `predict` accepts (array, DataFrame). Fit on data disjoint from the
     models' training data, and calibrate on data disjoint from both.
     """
 
@@ -181,10 +182,10 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
     # ----------------------------- prediction ------------------------------ #
     def _base_predictions(self, X):
         """Matrix (samples, models) of base predictions; probabilities are clipped."""
-        # data = xgb.DMatrix(X)
-        # preds = np.column_stack([m.get_booster().predict(data) for m in self.models]).astype(float)
-        preds = np.column_stack([m.predict(X) for m in self.models]).astype(float)
-        return np.clip(preds, EPS, 1 - EPS) if self.task == "classification" else preds
+        if self.task == "classification":  # probability of the positive class, not labels
+            preds = np.column_stack([m.predict_proba(X)[:, 1] for m in self.models]).astype(float)
+            return np.clip(preds, EPS, 1 - EPS)
+        return np.column_stack([m.predict(X) for m in self.models]).astype(float)
 
     def predict(self, X):
         """Return a dict of arrays: the mean prediction and its uncertainty decomposition."""
@@ -207,7 +208,24 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
                     entropy_epistemic=np.maximum(_entropy(pooled) - aleatoric, 0.0))
 
     # ------------------------- Hugging Face Hub ---------------------------- #
-    # ModelHubMixin builds save_pretrained, from_pretrained and push_to_hub on these two hooks.
+    # ModelHubMixin builds save_pretrained and from_pretrained on the two hooks below.
+    # push_to_hub is overridden only to add `subfolder`, so one repo can hold many ensembles.
+    def push_to_hub(self, repo_id, *, subfolder=None, commit_message=None, private=None,
+                    token=None, branch=None, create_pr=None, model_card_kwargs=None, config=None):
+        """Upload the ensemble to `repo_id`, under `subfolder` if given.
+
+        `config` is accepted for `ModelHubMixin` compatibility and ignored.
+        """
+        api = HfApi(token=token)
+        repo_id = api.create_repo(repo_id, private=private, exist_ok=True).repo_id
+        with TemporaryDirectory() as tmp:
+            self.save_pretrained(tmp, model_card_kwargs=model_card_kwargs)
+            return api.upload_folder(
+                repo_id=repo_id, folder_path=tmp, path_in_repo=subfolder, revision=branch, create_pr=create_pr,
+                commit_message=commit_message or f"Push ensemble to {subfolder or 'repository root'}",
+                delete_patterns="model_*.ubj",  # drop stale models left by a previous, larger ensemble
+            )
+
     def _save_pretrained(self, save_directory: Path) -> None:
         for i, model in enumerate(self.models):
             model.save_model(save_directory / f"model_{i:03d}.ubj")
@@ -218,12 +236,18 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
 
     @classmethod
     def _from_pretrained(cls, *, model_id, revision=None, cache_dir=None, force_download=False,
-                         local_files_only=False, token=None, **kwargs):
-        """Load from a local directory of models, a saved ensemble, or a Hub repo."""
+                         local_files_only=False, token=None, subfolder=None, **kwargs):
+        """Load from a local directory of models, a saved ensemble, or a Hub repo.
+
+        `subfolder` selects one ensemble inside the directory or repo; only that
+        folder is downloaded.
+        """
         path = Path(model_id)
         if not path.is_dir():
             path = Path(snapshot_download(model_id, revision=revision, cache_dir=cache_dir, token=token,
-                                          force_download=force_download, local_files_only=local_files_only))
+                                          force_download=force_download, local_files_only=local_files_only,
+                                          allow_patterns=f"{subfolder}/*" if subfolder else None))
+        path = path / (subfolder or "")
         files = sorted(f for f in path.iterdir() if f.suffix in MODEL_SUFFIXES and f.name != CONFIG)
         if not files:
             raise FileNotFoundError(f"No model files ({', '.join(sorted(MODEL_SUFFIXES))}) in {path}")
