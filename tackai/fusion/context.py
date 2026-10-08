@@ -86,9 +86,9 @@ CONTEXT_FILES: Dict[str, Dict[str, str]] = {
 #: Hugging Face Hub dataset repo published by scripts/publish_fusion_context.py and read by
 #: FusionData.from_pretrained(). A dataset repo, not a model repo: these tables are an input
 #: to every fusion model, never the output of one.
-DEFAULT_CONTEXT_REPO = "ailab-bio/TACK-fusion-context"
+DEFAULT_CONTEXT_REPO = "ailab-bio/TACK-Context-Encoding"
 
-MANIFEST_FORMAT = "tack-fusion-context/v1"
+MANIFEST_FORMAT = "tack-context-encoding/v1"
 
 
 def sha256_of(path: Path) -> str:
