@@ -207,3 +207,4 @@ ensembles/fusion_*/
 *.pkl
 *.json
 *.csv
+models/

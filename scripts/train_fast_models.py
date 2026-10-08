@@ -44,6 +44,13 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from tackai.fusion.context import ContextEncoder
 from tackai.fusion.data import DEFAULT_CONTEXT_REPO, FusionData
 
+# Load HF_TOKEN / TACKAI_CACHE from the repo's .env before any tackai/huggingface_hub call.
+# Anchored on this file rather than the cwd so it also works from a SLURM job submitted
+# from elsewhere; variables already in the environment take precedence.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(REPO_ROOT / ".env")
+load_dotenv(find_dotenv(usecwd=True))
+
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
@@ -166,7 +173,7 @@ def parse_args() -> argparse.Namespace:
                          help="Passed to ContextEncoder.")
     parser.add_argument("--n-repeats", type=int, default=5, help="Outer CV repeats.")
     parser.add_argument("--n-folds", type=int, default=5, help="Outer CV folds per repeat.")
-    parser.add_argument("--n-trials", type=int, default=5, help="Optuna trials per fold.")
+    parser.add_argument("--n-trials", type=int, default=50, help="Optuna trials per fold.")
     parser.add_argument("--n-inner", type=int, default=3, help="Inner CV folds used inside the Optuna objective.")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed.")
     parser.add_argument("--push-context-to-hub", action="store_true",
@@ -182,7 +189,9 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    load_dotenv(find_dotenv(usecwd=True))
+    if not os.environ.get("HF_TOKEN"):
+        logger.warning("HF_TOKEN is not set (looked in %s and the cwd); private Hub repos will fail.",
+                       REPO_ROOT / ".env")
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     outdir = Path(args.output_dir)
