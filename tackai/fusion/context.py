@@ -32,8 +32,12 @@ reconstructed at all:
 * **cell** — a missing or blank accession gets the table's ``"Unknown cell line."`` vector;
   an accession that is simply absent raises, because silently substituting "unknown" for a
   real cell line would hide the mistake.
-* **assay** — free text is canonised, and an unseen canonical type is embedded on the fly
-  with the same sentence-transformer and projected through the cached PCA.
+* **assay** — free text is canonised, and an unseen canonical type falls back to the table's
+  ``"unknown"`` vector (part of the fixed vocabulary — see ``notebooks/assay_embeddings.ipynb``)
+  with a one-time warning listing the types the table does hold, rather than embedding it on
+  the fly: the canonical vocabulary is small and closed enough that an unrecognised assay is
+  almost always a typo or a new abbreviation worth adding to :func:`normalize_assay`, not a
+  genuinely novel measurement technique.
 * **poi / e3** — an unseen sequence raises. It cannot be fixed on the fly: the winning
   poolings are ``lse`` (not yet in :class:`~tackai.data.embeddings.protein_embeddings.ProteinEmbedding`)
   and ``mean_rm_pc2``, which is fitted over a whole vocabulary and therefore undefined for a
@@ -44,6 +48,7 @@ import json
 import re
 import shutil
 import unicodedata
+import warnings
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple, Union
 
@@ -379,7 +384,7 @@ class ContextEncoder:
         self.cache_dir = Path(cache_dir or get_cache_dir())
         self.protein_space = protein_space
         self._tables: Dict[str, Dict[str, np.ndarray]] = {}
-        self._sentence_model = None
+        self._warned_assay_misses: set = set()
 
     def files(self, block: str) -> Dict[str, str]:
         """The cached table and PCA side-file names backing a block.
@@ -427,13 +432,6 @@ class ContextEncoder:
         """``(mean_, components_)`` of the block's cached PCA."""
         side = np.load(self.cache_dir / self.files(block)["pca_model"])
         return side["mean_"], side["components_"]
-
-    def _encode_texts(self, texts: Sequence[str]) -> np.ndarray:
-        """Embed free text with the same sentence-transformer the assay table was built with."""
-        if self._sentence_model is None:
-            from sentence_transformers import SentenceTransformer
-            self._sentence_model = SentenceTransformer(ASSAY_MODEL, device="cpu")
-        return np.asarray(self._sentence_model.encode(list(texts)), dtype=np.float32)
 
     def register_sequence(self, block: str, sequence: str, embedding: np.ndarray) -> None:
         """Add a sequence to a protein table by projecting its full ESM embedding.
@@ -496,8 +494,8 @@ class ContextEncoder:
         """Which keys of a block this encoder can turn into a vector.
 
         Lets a caller building a training table drop the rows it cannot encode instead of
-        hitting the :meth:`encode` exception. Assay text is always encodable, because unseen
-        types fall back to an on-the-fly embedding.
+        hitting the :meth:`encode` exception. Assay text is always encodable, because an
+        unseen canonical type falls back to the table's ``"unknown"`` vector.
 
         Args:
             block: Context block name.
@@ -518,17 +516,20 @@ class ContextEncoder:
         return np.array(out, dtype=bool)
 
     def _encode_assay(self, raws: Sequence) -> np.ndarray:
-        """Assay vectors, embedding canonical types the table does not hold."""
+        """Assay vectors; a canonical type the table does not hold resolves to ``"unknown"``."""
         table = self.table("assay")
         names = [normalize_assay(r) for r in raws]
-        misses = sorted({n for n in names if n not in table})
+        misses = sorted({n for n in names if n not in table} - self._warned_assay_misses)
         if misses:
-            mean_, components_ = self._pca("assay")
-            projected = (self._encode_texts(misses).astype(np.float64) - mean_) @ components_.T
-            fallback = dict(zip(misses, projected.astype(np.float32)))
-        else:
-            fallback = {}
-        return np.stack([table.get(n, fallback.get(n)) for n in names]).astype(np.float32)
+            available = ", ".join(sorted(table))
+            warnings.warn(
+                f"assay type(s) not in the cached table, falling back to \"unknown\": "
+                f"{', '.join(misses)}. Available assay types: {available}",
+                stacklevel=2,
+            )
+            self._warned_assay_misses.update(misses)
+        return np.stack([table[n] if n in table else table["unknown"]
+                         for n in names]).astype(np.float32)
 
     def encode_context(self, record: dict) -> Dict[str, np.ndarray]:
         """Encode one experimental context into its blocks.

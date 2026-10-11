@@ -10,8 +10,6 @@ import pickle
 from pathlib import Path
 from typing import Optional, List, Dict
 
-import gdown
-import h5py
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
@@ -54,6 +52,7 @@ def download_file(url: str, dest: Path, hash: Optional[str] = None):
         logging.debug(f"Created directory {dest.parent} for downloading file.")
 
     if not dest.exists():
+        import gdown
         gdown.download(url, output=str(dest), quiet=False)
         logging.debug(f"Downloaded {url} to {dest}")
 
@@ -87,6 +86,7 @@ def load_protein2embedding(
                 dest=embeddings_path,
             )
             logging.debug(f"Downloaded protein embeddings to: {embeddings_path}")
+    import h5py
     protein2embedding = {}
     with h5py.File(embeddings_path, "r") as file:
         for sequence_id in file.keys():

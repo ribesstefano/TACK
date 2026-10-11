@@ -1,4 +1,6 @@
 """Context embeddings read from the cached, already PCA-reduced npz tables."""
+import warnings
+
 import numpy as np
 import pytest
 
@@ -55,19 +57,16 @@ def test_known_assay_comes_from_the_table(fake_cache):
     assert np.array_equal(enc.encode("assay", ["Western blot"]), enc.encode("assay", ["western blot"]))
 
 
-def test_unseen_assay_is_embedded_on_the_fly_and_projected(fake_cache, monkeypatch):
-    """A canonical type absent from the table uses the sentence-transformer and cached PCA."""
-    calls = []
-
-    def fake_encode_texts(texts):
-        calls.append(list(texts))
-        return np.ones((len(texts), 768), dtype=np.float32)
-
+def test_unseen_assay_falls_back_to_unknown_with_one_warning(fake_cache):
+    """A canonical type absent from the table resolves to the table's "unknown" vector."""
     enc = ContextEncoder()
-    monkeypatch.setattr(enc, "_encode_texts", fake_encode_texts)
-    out = enc.encode("assay", ["a brand new readout"])
-    assert out.shape == (1, 8) and np.isfinite(out).all()
-    assert calls == [["a brand new readout"]]
+    with pytest.warns(UserWarning, match="a brand new readout"):
+        out = enc.encode("assay", ["a brand new readout"])
+    assert np.array_equal(out, enc.encode("assay", ["unknown"]))
+    # The same miss does not warn again.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        enc.encode("assay", ["a brand new readout"])
 
 
 def test_register_sequence_projects_a_full_embedding(fake_cache):
