@@ -38,7 +38,7 @@ uv pip install -e .
 from tackai.fusion import FusionData, XGBStackedEnsemble
 
 context_encoder = FusionData.from_pretrained("ailab-bio/TACK-Context-Encoding")
-model = XGBStackedEnsemble.from_pretrained("ailab-bio/TACK-FastEnsemble", subfolder="dmax")
+model = XGBStackedEnsemble.from_pretrained("ailab-bio/TACK-Fast-Ensemble", subfolder="dmax")
 
 X = context_encoder.transform([{
     "smiles": "N#Cc1cccc(-c2ccc(=O)n(Cc3cccc(-c4ncc(OCC5CCN(CCCCC(=O)Nc6cccc7c6C(=O)N(C6CCC(=O)NC6=O)C7=O)CC5)cn4)c3)n2)c1",
