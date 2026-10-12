@@ -42,6 +42,14 @@ dependencies = [
 gp = [
     "torch>=2.0.0",
 ]
+# `tack serve` — the HTTP inference server in `tackai/serve/`, which lets a client in
+# another environment (e.g. REINVENT) score molecules over localhost. Deliberately on
+# top of the base dependencies only: the server runs the torch-free path
+# (`FusionData` + `XGBStackedEnsemble`), so installing it never drags torch in.
+serve = [
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+]
 # Legacy `tack train`/`tack predict` (Hydra) pipeline — everything
 # `tackai/fusion/` does *not* need — plus the independent `tack_dataset/`
 # curation scripts.
