@@ -1,0 +1,5 @@
+# The Space installs TACK itself from the repository's main branch: the base install pulls
+# FusionData + XGBStackedEnsemble and their dependencies (rdkit, xgboost, huggingface_hub)
+# without torch, which is the whole point of the fast ensembles.
+tackai @ git+https://github.com/ribesstefano/TACK.git@main
+gradio==6.28.0

@@ -208,3 +208,6 @@ ensembles/fusion_*/
 *.json
 *.csv
 models/
+# The demo Space's dropdown vocabulary is generated (demo/build_vocab.py) but committed:
+# the Space is deployed as a file copy of demo/ and cannot run the build step itself.
+!demo/vocab.json
