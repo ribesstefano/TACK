@@ -157,8 +157,10 @@ class StageTimer:
         self._wrap(ens.data.featurizer, "featurize", "featurise")
         self._wrap(ens, "_aggregate", "aggregate")
         for member in ens.members:
-            for name in ("transform", "transform_blocks", "transform_block"):
-                self._wrap(member.pre_, name, "transform")
+            pre = getattr(member, "pre_", None)
+            if pre is not None:
+                for name in ("transform", "transform_blocks", "transform_block"):
+                    self._wrap(pre, name, "transform")
             self._wrap(member, "_predict_model", "model")
             model = getattr(member, "model_", None)
             if model is not None:
