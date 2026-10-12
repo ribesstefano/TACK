@@ -162,6 +162,8 @@ cython_debug/
 
 # Custom files
 
+.worktrees/
+
 data/uniprot2embedding.h5
 data/PROTAC-DB.csv
 data/PROTAC-Pedia.csv
@@ -199,3 +201,10 @@ hf_staging/
 # mkdocs: notebook copied into the docs tree by docs/hooks.py at build time
 # (notebooks/ stays the single source of truth, see mkdocs.yml `hooks:`)
 docs/tutorial/*.ipynb
+
+# Fitted fusion surrogate ensembles (regenerate with notebooks/fusion_surrogates.ipynb)
+ensembles/fusion_*/
+*.pkl
+*.json
+*.csv
+models/

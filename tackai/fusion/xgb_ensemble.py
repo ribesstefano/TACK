@@ -1,0 +1,369 @@
+"""Stacked XGBoost ensemble with uncertainty, for regression and binary classification.
+
+Weights over fitted XGBoost models start uniform, so the ensemble predicts
+without fitting. `fit` learns simplex weights on a held-out stacking set: a
+Gaussian mixture likelihood for regression, a linear pool with log loss for
+classification. The task is inferred from the models' objective.
+
+    ens = XGBStackedEnsemble.from_pretrained("path/to/models")     # *.json / *.ubj
+    out = ens.predict(X_new)                 # uniform weights until fitted
+    ens.fit(X_fit, y_fit).calibrate(X_cal, y_cal)
+    out = ens.predict(X_new)                 # dict of arrays
+    ens.push_to_hub("user/my-ensembles", subfolder="subtask-a")
+    ens = XGBStackedEnsemble.from_pretrained("user/my-ensembles", subfolder="subtask-a")
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import numpy as np
+import xgboost as xgb
+from huggingface_hub import HfApi, ModelHubMixin, snapshot_download
+from scipy.optimize import minimize, minimize_scalar
+from scipy.special import expit, log_expit, log_softmax, logit, logsumexp, softmax, xlog1py, xlogy
+
+EPS = 1e-6  # probability clipping
+CONFIG = "config.json"
+MODEL_SUFFIXES = {".json", ".ubj"}
+HPARAMS = ("lambdas", "n_restarts", "n_folds", "sigma_floor_ratio", "alpha", "seed")
+STATE = ("weights_", "sigmas_", "lambda_", "q_hat_", "temperature_")
+
+
+# --------------------------------------------------------------------------- #
+# Objectives: each returns (loss, gradient) for scipy's `jac=True`.
+# --------------------------------------------------------------------------- #
+def _shrinkage(w, lam):
+    """Penalty lam * ||w - 1/N||^2 and its gradient with respect to w."""
+    g = w - 1 / w.size
+    return lam * g @ g, 2 * lam * g
+
+
+def _through_softmax(w, grad_w):
+    """Chain rule from a gradient in w to one in theta, with w = softmax(theta)."""
+    return w * (grad_w - w @ grad_w)
+
+
+def _regression_loss(params, F, y, lam):
+    """Penalised mean NLL of sum_i w_i N(y; f_i, sigma_i^2); params = [theta, log sigma]."""
+    theta, log_sigma = np.split(params, 2)
+    w = softmax(theta)
+    z = (y[:, None] - F) / np.exp(log_sigma)
+    log_comp = log_softmax(theta) - 0.5 * z**2 - log_sigma - 0.5 * np.log(2 * np.pi)
+    log_mix = logsumexp(log_comp, axis=1, keepdims=True)
+    resp = np.exp(log_comp - log_mix)  # responsibilities
+    penalty, penalty_grad = _shrinkage(w, lam)
+    grad_theta = w - resp.mean(0) + _through_softmax(w, penalty_grad)
+    grad_log_sigma = -(resp * (z**2 - 1)).mean(0)
+    return penalty - log_mix.mean(), np.concatenate([grad_theta, grad_log_sigma])
+
+
+def _classification_loss(theta, P, y, lam):
+    """Penalised log loss of the linear pool p = P w."""
+    w = softmax(theta)
+    p = P @ w
+    penalty, penalty_grad = _shrinkage(w, lam)
+    loss = -np.mean(xlogy(y, p) + xlog1py(1 - y, -p)) + penalty
+    grad_w = P.T @ ((p - y) / (p * (1 - p))) / y.size + penalty_grad
+    return loss, _through_softmax(w, grad_w)
+
+
+def _entropy(q):
+    """Binary entropy in nats."""
+    return -(xlogy(q, q) + xlog1py(1 - q, -q))
+
+
+LOSSES = {"regression": _regression_loss, "classification": _classification_loss}
+
+
+def _load_model(path):
+    """Load a saved model as an `XGBRegressor` or `XGBClassifier`, whichever it was saved as."""
+    for estimator in (xgb.XGBRegressor, xgb.XGBClassifier):
+        model = estimator()
+        try:
+            model.load_model(path)
+            return model
+        except TypeError:  # XGBoost refuses to load a file saved by the other estimator type
+            continue
+    raise TypeError(f"{path} is neither an XGBoost regressor nor a classifier.")
+
+
+def _infer_task(models):
+    objectives = {m.get_xgb_params()["objective"] for m in models}
+    if objectives == {"binary:logistic"}:
+        return "classification"
+    if all(str(o).startswith("reg:") for o in objectives):
+        return "regression"
+    raise ValueError(f"Need all 'binary:logistic' or all 'reg:*' models, got {objectives}")
+
+
+# --------------------------------------------------------------------------- #
+# Ensemble
+# --------------------------------------------------------------------------- #
+class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost", "ensemble", "uncertainty"]):
+    """Weighted ensemble of scikit-learn API XGBoost models (`XGBRegressor`,
+    `XGBClassifier`, `XGBModel`) returning a mean and an uncertainty.
+
+    Weights are uniform until `fit` is called. Before fitting, the regression
+    noise term is unknown and set to zero, so `std` is model disagreement only.
+
+    `X` is anything the models' `predict` accepts (array, DataFrame). Fit on data disjoint from the
+    models' training data, and calibrate on data disjoint from both.
+    """
+
+    def __init__(self, models, *, sigma="constant", lambdas=(0.0, 0.01, 0.1, 1.0, 10.0),
+                 n_restarts=5, n_folds=5, sigma_floor_ratio=1e-3, alpha=0.1, seed=0):
+        if sigma != "constant":
+            # TODO: input-dependent sigma_i(x): quantile pair (B), residual model (C),
+            # distributional boosting (D). They would enter as s_i * sigma_i(x).
+            raise NotImplementedError("Only sigma='constant' (option A) is implemented.")
+        self.models = list(models)
+        self.task = _infer_task(self.models)
+        self.lambdas, self.n_restarts, self.n_folds = list(lambdas), n_restarts, n_folds
+        self.sigma_floor_ratio, self.alpha, self.seed = sigma_floor_ratio, alpha, seed
+        n = len(self.models)
+        self.weights_, self.sigmas_ = np.full(n, 1 / n), np.zeros(n)  # uniform, unknown noise
+        self.lambda_ = self.q_hat_ = self.temperature_ = None
+
+    # --------------------------- introspection ------------------------------ #
+    def help(self, show_extras: bool = False) -> dict:
+        """Describe what `predict` returns: the task and its output dict's keys.
+
+        A quick way to see what `predict(X)` hands back without reading its body — the
+        keys depend on `self.task` and whether `calibrate` has been called yet (it adds
+        `"lower"`/`"upper"` for regression; a classification ensemble's keys don't change,
+        only `"proba"`'s values do, once temperature-scaled).
+
+        Args:
+            show_extras: Also return `"hyperparameters"` (the fitted/calibrated state:
+                `lambda_`, and `alpha`/`q_hat_` for regression or `temperature_` for
+                classification) and `"explanations"`, a per-key prose description of what
+                each output means and, where relevant, how a hyperparameter shapes it,
+                e.g., how the fitted `alpha` sets the conformal interval's target coverage.
+
+        Returns:
+            A dict with `"task"` (`"regression"` or `"classification"`) and
+            `"output_keys"` (the keys `predict` currently returns, in the order it builds
+            them); with `show_extras`, also `"hyperparameters"` and `"explanations"`.
+
+        Examples:
+            >>> ens.help()
+            {'task': 'regression', 'output_keys': ['mean', 'std', 'std_noise', 'std_disagreement']}
+
+            >>> ens.calibrate(X_cal, y_cal).help()
+            {'task': 'regression',
+             'output_keys': ['mean', 'std', 'std_noise', 'std_disagreement', 'lower', 'upper']}
+
+            >>> clf_ens.help()
+            {'task': 'classification',
+             'output_keys': ['proba', 'entropy_total', 'entropy_aleatoric', 'entropy_epistemic']}
+
+            >>> ens.calibrate(X_cal, y_cal).help(show_extras=True)
+            {'task': 'regression',
+             'output_keys': ['mean', 'std', 'std_noise', 'std_disagreement', 'lower', 'upper'],
+             'hyperparameters': {'lambda_': 0.1, 'alpha': 0.1, 'q_hat_': 1.8432},
+             'explanations': {
+                 'mean': 'Weighted mean of the base models\' predictions (weights_, uniform '
+                         'until fit()).',
+                 ...,
+                 'lower': "mean - q_hat_ * std, i.e. the lower end of a conformal interval "
+                          "targeting 1 - alpha = 90% coverage (alpha=0.1) on data exchangeable "
+                          "with the calibration set; q_hat_=1.8432 is that set's (1 - alpha)-"
+                          "quantile of |y - mean| / std.",
+                 'upper': "mean + q_hat_ * std, same interval's upper end."}}
+        """
+        if self.task == "regression":
+            keys = ["mean", "std", "std_noise", "std_disagreement"]
+            if self.q_hat_ is not None:
+                keys += ["lower", "upper"]
+        else:
+            keys = ["proba", "entropy_total", "entropy_aleatoric", "entropy_epistemic"]
+        out = {"task": self.task, "output_keys": keys}
+        if show_extras:
+            out["hyperparameters"] = self._help_hyperparameters()
+            out["explanations"] = self._help_explanations(keys)
+        return out
+
+    def _help_hyperparameters(self) -> dict:
+        """The fitted/calibrated state `help(show_extras=True)` explains the outputs against."""
+        out = {"lambda_": self.lambda_}
+        if self.task == "regression":
+            out["alpha"] = self.alpha
+            out["q_hat_"] = self.q_hat_
+        else:
+            out["temperature_"] = self.temperature_
+        return out
+
+    def _help_explanations(self, keys) -> dict:
+        """Prose description of each key in `keys`, referencing the fitted hyperparameters."""
+        if self.task == "regression":
+            coverage = 1 - self.alpha
+            explanations = {
+                "mean": "Weighted mean of the base models' predictions (weights_, uniform "
+                        "until fit()).",
+                "std": "Total predictive uncertainty: sqrt(std_noise**2 + std_disagreement**2).",
+                "std_noise": "Aleatoric term: sqrt(weights_ @ sigmas_**2), a single value shared "
+                             "by every prediction (not per-row) because sigmas_ are per-model "
+                             "constants fit by fit(); zero (hence std_noise=0) before fit().",
+                "std_disagreement": "Epistemic term: the weighted spread of the base models' "
+                                    "predictions around mean — shrinks as the ensemble agrees "
+                                    "with itself, independent of sigmas_.",
+            }
+            if "lower" in keys:
+                explanations["lower"] = (
+                    f"mean - q_hat_ * std, i.e. the lower end of a conformal interval "
+                    f"targeting 1 - alpha = {coverage:.0%} coverage (alpha={self.alpha!r}) on "
+                    f"data exchangeable with the calibration set; q_hat_={self.q_hat_!r} is "
+                    "that set's (1 - alpha)-quantile of |y - mean| / std."
+                )
+                explanations["upper"] = "mean + q_hat_ * std, same interval's upper end."
+            return explanations
+        temp = self.temperature_
+        calibrated = temp is not None
+        return {
+            "proba": ("Linear pool (weights_-weighted average) of the base models' "
+                     f"P(positive)" + (f", temperature-scaled by temperature_={temp!r} "
+                     "(fit by calibrate() to match the calibration set's log-loss)."
+                     if calibrated else
+                     ", not yet temperature-scaled (temperature_=None until calibrate()).")),
+            "entropy_total": "Binary entropy of proba (post-calibration if calibrated) — "
+                            "total predictive uncertainty, in nats.",
+            "entropy_aleatoric": "Weighted average of each base model's own entropy — "
+                                 "irreducible uncertainty the models agree on.",
+            "entropy_epistemic": "entropy_total of the uncalibrated pool minus "
+                                 "entropy_aleatoric, floored at 0 — uncertainty from the base "
+                                 "models disagreeing with each other.",
+        }
+
+    # ------------------------------ fitting -------------------------------- #
+    def fit(self, X, y):
+        """Learn the weights (and per-model sigmas for regression) on the stacking set."""
+        preds, y = self._base_predictions(X), np.asarray(y, float)
+        rng = np.random.default_rng(self.seed)
+        folds = np.array_split(rng.permutation(y.size), self.n_folds)
+        loss = LOSSES[self.task]
+
+        def cv_loss(lam):  # unpenalised held-out loss
+            held_out = []
+            for val in folds:
+                train = np.setdiff1d(np.arange(y.size), val)
+                params = self._optimise(preds[train], y[train], lam, rng)
+                held_out.append(loss(params, preds[val], y[val], 0.0)[0])
+            return np.mean(held_out)
+
+        self.lambda_ = min(self.lambdas, key=cv_loss) if len(self.lambdas) > 1 else self.lambdas[0]
+        params = self._optimise(preds, y, self.lambda_, rng)
+        n = len(self.models)
+        self.weights_, self.sigmas_ = softmax(params[:n]), np.exp(params[n:])
+        self.q_hat_ = self.temperature_ = None
+        return self
+
+    def _optimise(self, preds, y, lam, rng):
+        n = preds.shape[1]
+        if self.task == "regression":  # non-convex in sigma: restarts and a variance floor
+            floor = max(self.sigma_floor_ratio * y.std(), 1e-12)
+            rmse = np.sqrt(np.mean((y[:, None] - preds) ** 2, axis=0))
+            tail, n_starts = np.log(np.maximum(rmse, floor)), self.n_restarts
+            bounds = [(None, None)] * n + [(np.log(floor), None)] * n
+        else:  # convex: one run from uniform weights
+            tail, n_starts, bounds = np.empty(0), 1, None
+        thetas = [np.zeros(n)] + [rng.normal(0, 0.5, n) for _ in range(n_starts - 1)]
+        runs = [minimize(LOSSES[self.task], np.concatenate([theta, tail]), args=(preds, y, lam),
+                         jac=True, method="L-BFGS-B", bounds=bounds) for theta in thetas]
+        return min(runs, key=lambda run: run.fun).x
+
+    def calibrate(self, X, y):
+        """Conformal quantile (regression) or temperature (classification) on a calibration set."""
+        self.q_hat_ = self.temperature_ = None
+        out, y = self.predict(X), np.asarray(y, float)
+        if self.task == "regression":
+            scores = np.sort(np.abs(y - out["mean"]) / out["std"])
+            k = int(np.ceil((y.size + 1) * (1 - self.alpha)))
+            if k > y.size:
+                raise ValueError(f"Calibration set too small for alpha={self.alpha}.")
+            self.q_hat_ = float(scores[k - 1])
+        else:
+            z, sign = logit(out["proba"]), 2 * y - 1
+            log_loss = lambda log_t: -np.mean(log_expit(sign * z / np.exp(log_t)))
+            self.temperature_ = float(np.exp(minimize_scalar(log_loss, bounds=(-3, 3), method="bounded").x))
+        return self
+
+    # ----------------------------- prediction ------------------------------ #
+    def _base_predictions(self, X):
+        """Matrix (samples, models) of base predictions; probabilities are clipped."""
+        if self.task == "classification":  # probability of the positive class, not labels
+            preds = np.column_stack([m.predict_proba(X)[:, 1] for m in self.models]).astype(float)
+            return np.clip(preds, EPS, 1 - EPS)
+        return np.column_stack([m.predict(X) for m in self.models]).astype(float)
+
+    def predict(self, X):
+        """Return a dict of arrays: the mean prediction and its uncertainty decomposition."""
+        preds, w = self._base_predictions(X), self.weights_
+        if self.task == "regression":
+            mean = preds @ w
+            var_noise = np.full_like(mean, w @ self.sigmas_**2)
+            var_disagreement = (preds - mean[:, None]) ** 2 @ w
+            out = dict(mean=mean, std=np.sqrt(var_noise + var_disagreement),
+                       std_noise=np.sqrt(var_noise), std_disagreement=np.sqrt(var_disagreement))
+            if self.q_hat_ is not None:  # conformal interval at level 1 - alpha
+                half_width = self.q_hat_ * out["std"]
+                out.update(lower=mean - half_width, upper=mean + half_width)
+            return out
+        pooled = preds @ w
+        proba = pooled if self.temperature_ is None else expit(logit(pooled) / self.temperature_)
+        aleatoric = _entropy(preds) @ w
+        # Aleatoric and epistemic terms come from the uncalibrated pool, where the split is exact.
+        return dict(proba=proba, entropy_total=_entropy(proba), entropy_aleatoric=aleatoric,
+                    entropy_epistemic=np.maximum(_entropy(pooled) - aleatoric, 0.0))
+
+    # ------------------------- Hugging Face Hub ---------------------------- #
+    # ModelHubMixin builds save_pretrained and from_pretrained on the two hooks below.
+    # push_to_hub is overridden only to add `subfolder`, so one repo can hold many ensembles.
+    def push_to_hub(self, repo_id, *, subfolder=None, commit_message=None, private=None,
+                    token=None, branch=None, create_pr=None, model_card_kwargs=None, config=None):
+        """Upload the ensemble to `repo_id`, under `subfolder` if given.
+
+        `config` is accepted for `ModelHubMixin` compatibility and ignored.
+        """
+        api = HfApi(token=token)
+        repo_id = api.create_repo(repo_id, private=private, exist_ok=True).repo_id
+        with TemporaryDirectory() as tmp:
+            self.save_pretrained(tmp, model_card_kwargs=model_card_kwargs)
+            return api.upload_folder(
+                repo_id=repo_id, folder_path=tmp, path_in_repo=subfolder, revision=branch, create_pr=create_pr,
+                commit_message=commit_message or f"Push ensemble to {subfolder or 'repository root'}",
+                delete_patterns="model_*.ubj",  # drop stale models left by a previous, larger ensemble
+            )
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        for i, model in enumerate(self.models):
+            model.save_model(save_directory / f"model_{i:03d}.ubj")
+        config = {"task": self.task,
+                  "init": {k: getattr(self, k) for k in HPARAMS},
+                  "state": {k: getattr(self, k) for k in STATE}}
+        (save_directory / CONFIG).write_text(json.dumps(config, indent=2, default=lambda a: a.tolist()))
+
+    @classmethod
+    def _from_pretrained(cls, *, model_id, revision=None, cache_dir=None, force_download=False,
+                         local_files_only=False, token=None, subfolder=None, **kwargs):
+        """Load from a local directory of models, a saved ensemble, or a Hub repo.
+
+        `subfolder` selects one ensemble inside the directory or repo; only that
+        folder is downloaded.
+        """
+        path = Path(model_id)
+        if not path.is_dir():
+            path = Path(snapshot_download(model_id, revision=revision, cache_dir=cache_dir, token=token,
+                                          force_download=force_download, local_files_only=local_files_only,
+                                          allow_patterns=f"{subfolder}/*" if subfolder else None))
+        path = path / (subfolder or "")
+files = sorted(f for f in path.iterdir() if f.suffix in MODEL_SUFFIXES and f.name != CONFIG and not f.name.endswith(".params.json"))
+        if not files:
+            raise FileNotFoundError(f"No model files ({', '.join(sorted(MODEL_SUFFIXES))}) in {path}")
+        config = json.loads((path / CONFIG).read_text()) if (path / CONFIG).exists() else {}
+        overrides = {k: v for k, v in kwargs.items() if k in HPARAMS}
+        ensemble = cls([_load_model(f) for f in files], **{**config.get("init", {}), **overrides})
+        for key, value in config.get("state", {}).items():
+            setattr(ensemble, key, np.asarray(value) if isinstance(value, list) else value)
+        return ensemble

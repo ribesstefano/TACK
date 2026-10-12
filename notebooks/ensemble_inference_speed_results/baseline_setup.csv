@@ -1,0 +1,4 @@
+context_setup_s,members,n_train,task,commit,dirty
+0.006471749860793352,5,2627,dmax,26452f3,True
+0.009345917031168938,5,4488,pdc50,26452f3,True
+0.005882833153009415,5,2870,activity,26452f3,True

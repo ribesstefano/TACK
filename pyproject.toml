@@ -14,6 +14,38 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
+    # Covers the default, minimal-dependency path through tackai/fusion/ —
+    # tackai.fusion.data.FusionData + tackai.fusion.xgb_ensemble.XGBStackedEnsemble,
+    # no torch required. The `gp` extra below adds torch for
+    # tackai.fusion.gp / tackai.fusion.ensemble; `training` adds what the
+    # legacy Hydra pipeline needs on top of that.
+    # Chemistry
+    "rdkit>=2024.0.0",
+    # Classical ML
+    "scikit-learn>=1.7.2,<1.8.0",
+    "xgboost>=2.0.0",
+    # Data / numerics
+    "pandas>=2.0.0",
+    "numpy>=2.0.0,<3.0.0",
+    "scipy>=1.12.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    # Hugging Face Hub (EnsemblePredictor.from_pretrained, fusion push/load)
+    "huggingface-hub>=1.13.0",
+]
+
+[project.optional-dependencies]
+# torch, for the GP surrogate (`tackai.fusion.gp.GPInteraction` /
+# `AdditiveProductGP`) and the generic `tackai.fusion.ensemble.FusionEnsemble`
+# that imports it. `tackai.fusion.data.FusionData` and
+# `tackai.fusion.xgb_ensemble.XGBStackedEnsemble` need neither.
+gp = [
+    "torch>=2.0.0",
+]
+# Legacy `tack train`/`tack predict` (Hydra) pipeline — everything
+# `tackai/fusion/` does *not* need — plus the independent `tack_dataset/`
+# curation scripts.
+training = [
     # Deep learning
     "torch>=2.0.0",
     "pytorch-lightning>=2.0.0",
@@ -27,34 +59,26 @@ dependencies = [
     "sentence-transformers>=3.0.0",
     "datasets>=3.0.0",
     # Chemistry
-    "rdkit>=2024.0.0",
     "useful-rdkit-utils>=0.90",
     # Classical ML
-    "scikit-learn>=1.7.2,<1.8.0",
-    "xgboost>=2.0.0",
     "optuna>=4.0.0",
     "optuna-integration>=4.0.0",
     "imbalanced-learn>=0.12.0",
     # Data / numerics
-    "pandas>=2.0.0",
-    "numpy>=2.0.0,<3.0.0",
-    "scipy>=1.12.0",
     "statsmodels>=0.14.0",
-    "h5py>=3.10.0",
     "umap-learn>=0.5.5",
+    "h5py>=3.10.0",
+    "gdown>=5.0.0",
     # Statistics
     "pingouin>=0.5.4",
     "scikit-posthocs>=0.9.0",
-    # Bioinformatics
+    # Bioinformatics (tack_dataset curation: sequence alignment, clustering)
     "biopython>=1.80",
     # Utilities
     "beautifulsoup4>=4.12.0",
     "thefuzz>=0.22.0",
     "rapidfuzz>=3.0.0",
     "tqdm>=4.65.0",
-    "pyyaml>=6.0",
-    "python-dotenv>=1.0.0",
-    "gdown>=5.0.0",
     "requests>=2.31.0",
     "colorlog>=6.8.0",
     "tabulate>=0.9.0",
@@ -63,12 +87,7 @@ dependencies = [
     "hydra-core>=1.3.0",
     # Statistical model comparison (omnibus ranking + critical-difference diagrams)
     "autorank>=1.2.0",
-    "ipykernel>=7.2.0",
-    # Hugging Face Hub (EnsemblePredictor.from_pretrained)
-    "huggingface-hub>=1.13.0",
 ]
-
-[project.optional-dependencies]
 dev = [
     # Plotting
     "matplotlib>=3.8.0",
@@ -77,7 +96,7 @@ dev = [
     # Notebooks
     "jupyter>=1.1.0",
     "jupyterlab>=4.0.0",
-    "ipykernel>=6.29.0",
+    "ipykernel>=7.2.0",
     "ipywidgets>=8.1.0",
     "notebook>=7.0.0",
     # Demo / app
@@ -111,6 +130,9 @@ override-dependencies = ["numpy>=2.0.0,<3.0.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
+markers = [
+    "requires_cache: needs a populated TACKAI_CACHE with the context embedding tables",
+]
 
 [dependency-groups]
 dev = [

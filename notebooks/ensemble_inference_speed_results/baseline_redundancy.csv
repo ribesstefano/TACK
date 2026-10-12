@@ -1,0 +1,22 @@
+item,what,seconds,share_of_predict,batch,members,task,commit,dirty
+R1,"full-width float64 scratch row, plus one fancy-index copy per member",0.0005721249617636204,0.003439336100518017,256,5,dmax,26452f3,True
+R2,"imputer + scaler + divide + contiguous copy, against one copy and an in-place divide, per member",0.004666660679504275,0.028053686898070203,256,5,dmax,26452f3,True
+R3,"train-side row norms and the scaled ARD block, recomputed per batch and member",0.014444584026932716,0.08683379090409507,256,5,dmax,26452f3,True
+R4,the two molecular cross-kernel matmuls in float64 rather than float32,0.02691937959752977,0.16182617477121145,256,5,dmax,26452f3,True
+R5,"torch.any(weight != 0) per molecular block, member and batch",4.912517033517361e-05,0.00029531655332260464,256,5,dmax,26452f3,True
+R6,a second featurize() call just to recover ok,0.00015362491831183434,0.0009235180472816427,256,5,dmax,26452f3,True
+R7,the molecular transform repeated for members that share it,0.00016083568334579468,0.0009668656481575144,256,5,dmax,26452f3,True
+R1,"full-width float64 scratch row, plus one fancy-index copy per member",0.0012607090175151825,0.003637524102047471,256,5,pdc50,26452f3,True
+R2,"imputer + scaler + divide + contiguous copy, against one copy and an in-place divide, per member",0.005815420299768448,0.016779233915243337,256,5,pdc50,26452f3,True
+R3,"train-side row norms and the scaled ARD block, recomputed per batch and member",0.029206042177975178,0.08426820215595096,256,5,pdc50,26452f3,True
+R4,the two molecular cross-kernel matmuls in float64 rather than float32,0.052101045148447156,0.1503271610152163,256,5,pdc50,26452f3,True
+R5,"torch.any(weight != 0) per molecular block, member and batch",6.274995394051075e-05,0.00018105246071044913,256,5,pdc50,26452f3,True
+R6,a second featurize() call just to recover ok,0.0001300000585615635,0.0003750892075137989,256,5,pdc50,26452f3,True
+R7,the molecular transform repeated for members that share it,0.0002548322081565857,0.0007352674457541074,256,5,pdc50,26452f3,True
+R1,"full-width float64 scratch row, plus one fancy-index copy per member",0.0021273749880492687,0.010826859246248797,256,5,activity,26452f3,True
+R2,"imputer + scaler + divide + contiguous copy, against one copy and an in-place divide, per member",0.004561039386317134,0.023212518587300862,256,5,activity,26452f3,True
+R3,"train-side row norms and the scaled ARD block, recomputed per batch and member",0.018527374835684896,0.09429145339928509,256,5,activity,26452f3,True
+R4,the two molecular cross-kernel matmuls in float64 rather than float32,0.02978228498250246,0.15157111903101672,256,5,activity,26452f3,True
+R5,"torch.any(weight != 0) per molecular block, member and batch",4.6833883970975876e-05,0.00023835189966855069,256,5,activity,26452f3,True
+R6,a second featurize() call just to recover ok,0.0003209160640835762,0.0016332395911446953,256,5,activity,26452f3,True
+R7,the molecular transform repeated for members that share it,0.0014249999076128006,0.007252258540366003,256,5,activity,26452f3,True

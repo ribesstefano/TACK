@@ -1,0 +1,4 @@
+score,metric,task,commit,dirty
+0.42582528942960596,R2,dmax,26452f3,True
+0.5987909467627798,R2,pdc50,26452f3,True
+0.8945881848453423,ROC-AUC,activity,26452f3,True
