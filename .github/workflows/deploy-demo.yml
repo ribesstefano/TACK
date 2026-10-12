@@ -1,0 +1,50 @@
+name: deploy-demo
+
+# Mirrors demo/ to the Hugging Face Space ailab-bio/TACK-Demo. The Space's repository holds
+# only what is inside demo/, flattened to its root (app.py, requirements.txt, vocab.json,
+# README.md with the Space's YAML header), so the Space never carries a copy of the training
+# code — it installs tackai from this repository's main branch instead.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'demo/**'
+      - '.github/workflows/deploy-demo.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+# One deployment at a time; a queued run should not race an in-flight push to the Space.
+concurrency:
+  group: hf-space-demo
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Push demo/ to the Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Override by setting the HF_SPACE_ID repository variable, e.g. to deploy the same
+          # demo/ to a personal Space instead of the organization's.
+          SPACE_ID: ${{ vars.HF_SPACE_ID || 'ailab-bio/TACK-Demo' }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "::error::HF_TOKEN secret is not set; add a write token in the repository settings."
+            exit 1
+          fi
+          # The `hf` CLI (which replaced `huggingface-cli`) needs huggingface_hub >= 1.0.
+          pip install --quiet "huggingface_hub[cli]>=1.0,<3"
+          # upload-large-folder/upload are both fine here (demo/ is ~200 KB); a plain upload
+          # with --delete keeps the Space's tree an exact mirror of demo/, so a file removed
+          # from the repository is removed from the Space too.
+          hf upload "$SPACE_ID" demo . \
+            --repo-type=space \
+            --delete="*" \
+            --commit-message="Deploy demo/ from ${GITHUB_SHA::7}" \
+            --token="$HF_TOKEN"
