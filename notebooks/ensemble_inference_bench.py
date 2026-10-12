@@ -22,7 +22,7 @@ from sklearn.metrics import r2_score, roc_auc_score
 
 from tackai.fusion.data import TASK_TYPES, FusionData
 from tackai.fusion.ensemble import FusionEnsemble
-from tackai.fusion.features import MolFeaturizer
+from tackai.fusion.mol_encoder import MolEncoder as MolFeaturizer
 
 REPO = Path(__file__).resolve().parent.parent
 DEV_FILES = [REPO / "data/yaochen/AutoTPDplus-PROTAC-training.csv",
