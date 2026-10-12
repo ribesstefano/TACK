@@ -18,19 +18,24 @@ Exposes four subcommands through the ``tack`` console script:
   per-fold metrics, rank method+data configs via ``autorank`` (on the
   validation set), and write ``report.md``/``ranking.csv``/``metrics.csv``
   plus figures to an output directory.
+
+Every subcommand needs the ``training`` extra (``pip install "tackai[training]"``), which
+a plain ``pip install tackai`` does not bring in. So that ``tack --help`` and the
+argument parsers still work without it, nothing heavier than ``pandas`` is imported at
+module level: each subcommand imports its dependencies on entry, through
+:func:`_training_stack`, which turns a missing one into an actionable install message.
 """
 import argparse
+import contextlib
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING, Iterator, List, Optional
 
 import pandas as pd
-import torch
-from hydra import compose, initialize_config_dir
-from omegaconf import DictConfig, OmegaConf
 
-from tackai.ensemble_predictor import EnsemblePredictor
+if TYPE_CHECKING:
+    from omegaconf import DictConfig
 
 logger = logging.getLogger("tackai.cli")
 
@@ -46,21 +51,43 @@ _COLUMN_CANDIDATES = {
 }
 
 
+@contextlib.contextmanager
+def _training_stack(command: str) -> Iterator[None]:
+    """Turn a missing optional dependency into an actionable install message.
+
+    Wrap the imports a subcommand needs; an ``ImportError`` raised inside becomes a
+    ``SystemExit`` naming the extra to install instead of a bare traceback.
+
+    Args:
+        command: Subcommand name, for the message (e.g. ``"train"``).
+    """
+    try:
+        yield
+    except ImportError as e:
+        raise SystemExit(
+            f"`tack {command}` needs the optional training dependencies ({e}). "
+            'Install them with:  pip install "tackai[training]"'
+        ) from e
+
+
 # ----------------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------------
 
-def train_from_cfg(cfg: DictConfig) -> None:
+def train_from_cfg(cfg: "DictConfig") -> None:
     """Run a cross-validation training experiment from a composed config.
 
     Bridges the Hydra/OmegaConf config to the dict-based training pipeline:
     resolves the ``data`` and ``model`` groups to plain dicts, prepares the
     task dataset, and delegates to :func:`tackai.training.run_cv_experiment`.
     """
-    import pytorch_lightning as pl
+    with _training_stack("train"):
+        import pytorch_lightning as pl
+        import torch
+        from omegaconf import OmegaConf
 
-    from tackai.data.tasks import load_task_dataset
-    from tackai.training import run_cv_experiment
+        from tackai.data.tasks import load_task_dataset
+        from tackai.training import run_cv_experiment
 
     pl.seed_everything(cfg.seed)
     torch.set_float32_matmul_precision("high")
@@ -135,6 +162,9 @@ def train(argv: Optional[List[str]] = None) -> None:
         )
         return
 
+    with _training_stack("train"):
+        from hydra import compose, initialize_config_dir
+
     with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
         cfg = compose(config_name="train", overrides=argv)
     train_from_cfg(cfg)
@@ -177,8 +207,9 @@ def predict(argv: Optional[List[str]] = None) -> None:
                         help="Where to write predictions.")
     parser.add_argument("--weights", default=None,
                         help="Ensemble weights JSON; restricts inference to the listed models.")
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu",
-                        help="Inference device (cuda/cpu).")
+    parser.add_argument("--device", default=None,
+                        help="Inference device (cuda/cpu). Default: cuda if available, "
+                             "else cpu.")
     parser.add_argument("--n-jobs", type=int, default=None,
                         help="Threads for XGBoost inference.")
     parser.add_argument("--smiles-col", default="SMILES",
@@ -194,6 +225,13 @@ def predict(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--treatment-time-col", default=None,
                         help="Treatment time column (auto-detected if omitted).")
     args = parser.parse_args(argv)
+
+    with _training_stack("predict"):
+        import torch
+
+        from tackai.ensemble_predictor import EnsemblePredictor
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     df = pd.read_csv(args.input_csv)
     logger.info(f"Loaded {len(df)} rows from {args.input_csv}")
@@ -219,7 +257,7 @@ def predict(argv: Optional[List[str]] = None) -> None:
         args.checkpoints_dir if args.checkpoints_dir else args.repo_id,
         subfolder=args.subfolder,
         weights_file=args.weights,
-        device=args.device,
+        device=device,
         n_jobs=args.n_jobs,
     )
 
@@ -260,8 +298,6 @@ def predict(argv: Optional[List[str]] = None) -> None:
 
 def collect(argv: Optional[List[str]] = None) -> None:
     """Collapse per-fold prediction CSVs into one file per model/task/config."""
-    from tackai.training import collect_predictions
-
     parser = argparse.ArgumentParser(
         prog="tack collect",
         description="Collapse per-fold preds-*.csv files into one file per "
@@ -276,6 +312,9 @@ def collect(argv: Optional[List[str]] = None) -> None:
                              "after the combined file is written.")
     args = parser.parse_args(argv)
 
+    with _training_stack("collect"):
+        from tackai.training import collect_predictions
+
     collect_predictions(
         predictions_dir=Path(args.predictions_dir),
         remove_sources=not args.keep_sources,
@@ -289,8 +328,6 @@ def collect(argv: Optional[List[str]] = None) -> None:
 
 def evaluate(argv: Optional[List[str]] = None) -> None:
     """Discover runs, compute metrics, rank via autorank, and write a report."""
-    from tackai.evaluation.report import run_evaluation
-
     parser = argparse.ArgumentParser(
         prog="tack evaluate",
         description="Evaluate a training run's predictions: discover model+data "
@@ -323,6 +360,9 @@ def evaluate(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--no-plots", action="store_true",
                         help="Skip rendering figures (boxplots/CD diagrams/ROC-PR).")
     args = parser.parse_args(argv)
+
+    with _training_stack("evaluate"):
+        from tackai.evaluation.report import run_evaluation
 
     result = run_evaluation(
         predictions_dir=args.predictions_dir,

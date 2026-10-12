@@ -3,7 +3,8 @@ import numpy as np
 import pytest
 
 from fusion_fixtures import BLOCK_DIMS, BLOCK_ORDER, CELLS, SEQS, SMILES, block_index
-from tackai.fusion.data import DMAX_THR, PDC50_THR, FusionData, make_targets, scaffold_groups
+from tackai.fusion.data import (DMAX_THR, PDC50_THR, REPEAT_SEEDS, FusionData, make_splits,
+                                make_targets, repeat_seeds, scaffold_groups)
 
 N_COLS = sum(BLOCK_DIMS.values())
 
@@ -28,6 +29,26 @@ def test_activity_needs_both_or_a_decisive_one():
     assert t["activity"][2] == 0.0        # dmax .6 < .8 alone is decisive
     assert np.isnan(t["activity"][3])     # pdc50 = 8 alone cannot decide active
     assert t["activity"][4] == 0.0        # pdc50 = 5 alone is decisive
+
+
+def test_a_lone_measurement_exactly_on_its_threshold_is_inactive():
+    # Active needs strictly > on both, so equality already fails the condition.
+    t = make_targets([80.0, np.nan], [np.nan, 1000.0])    # Dmax == 80 %, pDC50 == 6
+    assert t["dmax"][0] == DMAX_THR and t["pdc50"][1] == PDC50_THR
+    assert list(t["activity"]) == [0.0, 0.0]
+
+
+def test_make_splits_gives_every_requested_repeat():
+    y, groups = np.linspace(0, 1, 60), np.arange(60) // 2
+    assert len(make_splits(y, groups, n_repeats=8, n_folds=3)) == 8
+    assert repeat_seeds(5) == REPEAT_SEEDS and len(set(repeat_seeds(8))) == 8
+    assert len(make_splits(y, groups, n_repeats=2, n_folds=3, seeds=[1, 2, 3])) == 2
+
+
+def test_make_splits_rejects_too_few_seeds():
+    y, groups = np.linspace(0, 1, 60), np.arange(60) // 2
+    with pytest.raises(ValueError, match="needs 3 seeds"):
+        make_splits(y, groups, n_repeats=3, n_folds=3, seeds=[1, 2])
 
 
 def test_thresholds_are_the_documented_ones():
@@ -84,7 +105,7 @@ def test_encode_reproduces_the_training_row_for_identical_inputs(fake_cache, tin
     """The inference path must agree with the training path, with mol features on the fly."""
     data = FusionData.from_csv([tiny_csv], cache=False)
     row = data.table.iloc[0]
-    X_inf = data.encode([{"smiles": row["smiles"], "poi_seq": row["poi_seq"],
+    X_inf = data.transform([{"smiles": row["smiles"], "poi_seq": row["poi_seq"],
                           "e3_seq": row["e3_seq"], "cell_id": row["cell_key"],
                           "assay": row["assay_raw"], "assay_time": row["assay_time"]}])
     assert np.allclose(X_inf[0], data.X[0], rtol=0, atol=0, equal_nan=True)
@@ -92,12 +113,12 @@ def test_encode_reproduces_the_training_row_for_identical_inputs(fake_cache, tin
 
 def test_assemble_broadcasts_one_context_over_many_smiles(fake_cache, tiny_csv):
     data = FusionData.from_csv([tiny_csv], cache=False)
-    ctx = data.encode_context({"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
+    ctx = data.transform_context({"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
                                "cell_id": CELLS[0], "assay": "western blot", "assay_time": 24.0})
     X = data.assemble(ctx, SMILES[:4])
     assert X.shape == (4, N_COLS)
     assert np.array_equal(X[:, data.context_columns], np.repeat(ctx, 4, axis=0))
-    direct = data.encode([{"smiles": s, "poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
+    direct = data.transform([{"smiles": s, "poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
                            "cell_id": CELLS[0], "assay": "western blot", "assay_time": 24.0}
                           for s in SMILES[:4]])
     assert np.allclose(X, direct, equal_nan=True)
@@ -106,13 +127,13 @@ def test_assemble_broadcasts_one_context_over_many_smiles(fake_cache, tiny_csv):
 def test_encode_accepts_a_dataframe(fake_cache, tiny_csv, tiny_records):
     import pandas as pd
     data = FusionData.from_csv([tiny_csv], cache=False)
-    assert np.allclose(data.encode(pd.DataFrame(tiny_records)), data.encode(tiny_records),
+    assert np.allclose(data.transform(pd.DataFrame(tiny_records)), data.transform(tiny_records),
                        equal_nan=True)
 
 
 def test_encode_empty_returns_empty_matrix(fake_cache, tiny_csv):  # Review Focus 5
     data = FusionData.from_csv([tiny_csv], cache=False)
-    assert data.encode([]).shape == (0, N_COLS)
+    assert data.transform([]).shape == (0, N_COLS)
 
 
 def test_context_and_mol_columns_partition_the_matrix(fake_cache, tiny_csv):

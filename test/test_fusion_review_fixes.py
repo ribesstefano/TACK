@@ -84,7 +84,7 @@ def test_a_missing_assay_time_becomes_the_constant_default(data):
     rows = [{"smiles": SMILES[0], **{k: v for k, v in CTX.items() if k != "assay_time"}},
             {"smiles": SMILES[0], **{**CTX, "assay_time": float("nan")}},
             {"smiles": SMILES[0], **{**CTX, "assay_time": 6.0}}]
-    X = data.encode(rows)
+    X = data.transform(rows)
     assert X[0, col] == X[1, col] == ASSAY_TIME_DEFAULT == 24.0 and X[2, col] == 6.0
     assert np.isfinite(X).all()
 

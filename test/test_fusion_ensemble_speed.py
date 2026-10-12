@@ -76,9 +76,9 @@ def test_the_records_path_featurises_once(ens, monkeypatch):
 
 def test_encode_can_also_return_which_rows_parsed(data):
     records = [{"smiles": s, **CTX} for s in (SMILES[0], "not a molecule")]
-    X = data.encode(records)
+    X = data.transform(records)
     assert isinstance(X, np.ndarray)
-    X2, ok = data.encode(records, return_ok=True)
+    X2, ok = data.transform(records, return_ok=True)
     assert np.array_equal(X, X2) and ok.tolist() == [True, False]
-    X0, ok0 = data.encode([], return_ok=True)
+    X0, ok0 = data.transform([], return_ok=True)
     assert X0.shape == (0, data.n_columns) and ok0.shape == (0,)

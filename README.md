@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://arxiv.org/abs/2605.19579"><img src="https://img.shields.io/badge/Paper-KDD%202026-blue" alt="Paper"></a>
   <a href="https://huggingface.co/datasets/ailab-bio/TACK"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Dataset-yellow" alt="Dataset"></a>
-  <a href="https://huggingface.co/ailab-bio/TACK-FastEnsemble"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Models-red" alt="Models"></a>
+  <a href="https://huggingface.co/ailab-bio/TACK-Fast-Ensemble"><img src="https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-Models-red" alt="Models"></a>
   <a href="https://zenodo.org/records/15691822"><img src="https://img.shields.io/badge/Extras-Zenodo-green" alt="Extras"></a>
   <a href="https://ribesstefano.github.io/TACK/"><img src="https://img.shields.io/badge/Docs-mkdocs-informational" alt="Docs"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow" alt="License"></a>

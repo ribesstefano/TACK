@@ -696,7 +696,7 @@ class FusionEnsemble:
             KeyError: If a POI or E3 sequence is not in the cached embedding tables.
         """
         blocks = self.data.encoder.encode_context(record)
-        values = self.data.encode_context(record)
+        values = self.data.transform_context(record)
         folds = [self._fold_member(member, blocks) for member in self.members]
         return FusionContext(values=values, blocks=blocks, source=dict(record), folds=folds)
 
@@ -739,12 +739,14 @@ class FusionEnsemble:
             smiles = [samples] if isinstance(samples, str) else list(samples)
             ok, scores = self._predict_with_context(smiles, context, return_std)
         else:
-            if isinstance(samples, list):
-                smiles = samples
+            if isinstance(samples, str):
+                raise ValueError("a SMILES string needs a context: pass context=, or full "
+                                 "records (dicts with the molecule and its context)")
+            if isinstance(samples, pd.DataFrame):
+                records = samples.to_dict("records")
             else:
-                records = samples.to_dict("records") if isinstance(samples, pd.DataFrame) else list(
-                    [samples] if isinstance(samples, dict) else samples)
-                smiles = [r.get("smiles") for r in records]
+                records = [samples] if isinstance(samples, dict) else list(samples)
+            smiles = [r.get("smiles") for r in records]
             ok, scores = self._predict_from_records(records, return_std)
         return self._aggregate(scores, ok, smiles, return_individual)
 
@@ -806,7 +808,7 @@ class FusionEnsemble:
         if n == 0:
             return np.zeros(0, dtype=bool), [(np.empty(0), np.empty(0)) for _ in self.members]
 
-        X, ok = self.data.encode(records, return_ok=True)
+        X, ok = self.data.transform(records, return_ok=True)
         valid = np.flatnonzero(ok)
         Xv = X if len(valid) == n else X[valid]
         per_member = []

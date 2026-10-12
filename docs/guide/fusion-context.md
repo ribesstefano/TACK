@@ -10,14 +10,14 @@ notebooks that produce them:
 from tackai.fusion import FusionData
 
 data = FusionData.from_pretrained()   # ailab-bio/TACK-fusion-context by default
-ctx = data.encode_context({
+ctx = data.transform_context({
     "poi_seq": "MAGEG...", "e3_seq": "MEPVR...",
     "cell_id": "CVCL_0031", "assay": "western blot", "assay_time": 24.0,
 })
 ```
 
 This installs the tables into `TACKAI_CACHE` (honoring `HF_HOME` for the download itself) and
-returns a `FusionData` with no training table — it is ready for `encode`, `encode_context` and
+returns a `FusionData` with no training table — it is ready for `transform`, `transform_context` and
 `assemble`, but not for `X`, `groups` or `target()` (those need `FusionData.from_csv` and the
 curated CSVs).
 

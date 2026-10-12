@@ -153,7 +153,7 @@ versioned by commit rather than by file content.
 from tackai.fusion.data import FusionData
 
 data = FusionData.from_pretrained("{repo_id}")
-context = data.encode_context({{"poi_seq": ..., "e3_seq": ..., "cell_id": ..., "assay": ...}})
+context = data.transform_context({{"poi_seq": ..., "e3_seq": ..., "cell_id": ..., "assay": ...}})
 ```
 
 `from_pretrained` installs these files into `TACKAI_CACHE` and verifies them against this

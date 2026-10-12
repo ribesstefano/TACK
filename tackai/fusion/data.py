@@ -36,13 +36,13 @@ TASK_LABELS = {"dmax": "Dmax (fraction)", "pdc50": "pDC50", "activity": "P(activ
 TASK_SUPPORT = {"dmax": (0.0, 1.0), "pdc50": None, "activity": (0.0, 1.0)}
 
 N_STRAT_BINS = 5
-REPEAT_SEEDS = [1000 + r for r in range(5)]
+REPEAT_SEEDS = [1000 + r for r in range(5)]   # the first five of repeat_seeds(n)
 CACHE_VERSION = "v2"   # v2: a missing assay_time is stored as ASSAY_TIME_DEFAULT, not NaN
 
 #: Every block of the design matrix, in column order: molecular first, then the context.
 BLOCK_ORDER = [*MOL_BLOCKS, *CONTEXT_BLOCKS]
 
-#: Fields a :meth:`FusionData.transform`/:meth:`FusionData.encode_context` record may set.
+#: Fields a :meth:`FusionData.transform`/:meth:`FusionData.transform_context` record may set.
 RECORD_FIELDS = ("smiles", "poi_seq", "e3_seq", "cell_id", "assay", "assay_time")
 #: Record field -> context block with a fixed, inspectable vocabulary. "smiles" is
 #: featurised on the fly and "assay_time" is a free-form duration, so neither has one.
@@ -74,8 +74,9 @@ def make_targets(dmax_pct, dc50_nM) -> Dict[str, np.ndarray]:
 
     Returns:
         Dict with float arrays ``dmax`` (on a [0, 1] scale), ``pdc50`` and ``activity``
-        (in {0, 1}); NaN marks an undefined target. A single known measurement can still
-        decide *inactive*, but never *active*, which needs both.
+        (in {0, 1}); NaN marks an undefined target. Active needs both measurements strictly
+        above their thresholds, so a single known measurement at or below its threshold
+        already decides *inactive* (the boundary value included), but never *active*.
     """
     dmax_pct = np.asarray(dmax_pct, dtype=float)
     dc50_nM = np.asarray(dc50_nM, dtype=float)
@@ -89,8 +90,8 @@ def make_targets(dmax_pct, dc50_nM) -> Dict[str, np.ndarray]:
     both = d_known & p_known
     activity[both] = ((dmax[both] > DMAX_THR) & (pdc50[both] > PDC50_THR)).astype(float)
     only_d, only_p = d_known & ~p_known, p_known & ~d_known
-    activity[only_d & (dmax < DMAX_THR)] = 0.0
-    activity[only_p & (pdc50 < PDC50_THR)] = 0.0
+    activity[only_d & (dmax <= DMAX_THR)] = 0.0
+    activity[only_p & (pdc50 <= PDC50_THR)] = 0.0
     return {"dmax": dmax, "pdc50": pdc50, "activity": activity}
 
 
@@ -127,6 +128,15 @@ def scaffold_groups(smiles: Sequence[str], verbose: bool = False) -> Tuple[np.nd
     return groups, info
 
 
+def repeat_seeds(n_repeats: int) -> List[int]:
+    """Default seed of each of ``n_repeats`` CV repeats: ``1000, 1001, ...``.
+
+    Extends :data:`REPEAT_SEEDS` rather than being capped by it, so asking for more repeats
+    than the five the experiments use gives that many distinct splits.
+    """
+    return [1000 + r for r in range(n_repeats)]
+
+
 def _strat_labels(y, n_bins: int = N_STRAT_BINS) -> np.ndarray:
     """Stratification variable: quantile bins of a continuous target, labels if few values."""
     y = np.asarray(y)
@@ -144,12 +154,21 @@ def make_splits(y, groups, n_repeats: int = 5, n_folds: int = 5,
         groups: Scaffold group id per row.
         n_repeats: Number of repeats (each with its own seed).
         n_folds: Folds per repeat.
-        seeds: Seeds per repeat (default: :data:`REPEAT_SEEDS`).
+        seeds: Seeds per repeat (default: :func:`repeat_seeds`, which starts with
+            :data:`REPEAT_SEEDS` and continues for as many repeats as requested). Extra
+            seeds beyond ``n_repeats`` are ignored.
 
     Returns:
         ``splits[repeat][fold] = (train_idx, test_idx)``.
+
+    Raises:
+        ValueError: If ``seeds`` holds fewer than ``n_repeats`` entries, which would
+            silently run fewer repeats than requested.
     """
-    seeds = list(seeds if seeds is not None else REPEAT_SEEDS)[:n_repeats]
+    seeds = repeat_seeds(n_repeats) if seeds is None else list(seeds)
+    if len(seeds) < n_repeats:
+        raise ValueError(f"n_repeats={n_repeats} needs {n_repeats} seeds, got {len(seeds)}")
+    seeds = seeds[:n_repeats]
     strat = _strat_labels(y)
     out = []
     for seed in seeds:
@@ -265,7 +284,7 @@ class FusionData:
              return_keys: bool = False) -> Dict[str, object]:
         """Describe what a record may contain: its fields, cached context vocabularies and tasks.
 
-        A way to inspect what :meth:`transform`/:meth:`encode_context` accept and what the
+        A way to inspect what :meth:`transform`/:meth:`transform_context` accept and what the
         cached tables actually know, without reading ``tackai/fusion/context.py`` directly —
         useful both for building an inference record and for checking what a trained model
         supports.
@@ -345,7 +364,7 @@ class FusionData:
         cell line outside Cellosaurus, a row with no ligase sequence at all. On the two
         development CSVs that is about 4.6% of rows. Dropping them with a report is the
         default, because a training table that refuses to build is worse than one that is
-        4.6% smaller; inference (:meth:`encode`) still raises, so a typo in a screening
+        4.6% smaller; inference (:meth:`transform`) still raises, so a typo in a screening
         request is never silently replaced.
 
         Args:
@@ -385,8 +404,8 @@ class FusionData:
 
         Downloads (or reuses a local directory of) the context tables named in
         :data:`~tackai.fusion.context.CONTEXT_FILES`, installs them into the local cache, and
-        returns a :class:`FusionData` with no table — ready for :meth:`encode`,
-        :meth:`encode_context` and :meth:`assemble`, but not for :attr:`X`, :attr:`groups` or
+        returns a :class:`FusionData` with no table — ready for :meth:`transform`,
+        :meth:`transform_context` and :meth:`assemble`, but not for :attr:`X`, :attr:`groups` or
         :meth:`target` (use :meth:`from_csv` for a training table).
 
         Args:
@@ -733,10 +752,14 @@ class FusionData:
             task: Task name.
             n_repeats: Number of repeats.
             n_folds: Folds per repeat.
-            seeds: Seeds per repeat.
+            seeds: Seeds per repeat (default: :func:`repeat_seeds`); at least ``n_repeats``
+                of them.
 
         Returns:
             ``splits[repeat][fold] = (train_idx, test_idx)``, indexing the task's own rows.
+
+        Raises:
+            ValueError: If ``seeds`` holds fewer than ``n_repeats`` entries.
         """
         key = (task, n_repeats, n_folds, tuple(seeds) if seeds is not None else None)
         if key not in self._splits:
@@ -800,7 +823,7 @@ class FusionData:
 
         Args:
             smiles: SMILES strings to featurise on the fly.
-            context: Output of :meth:`encode_context`.
+            context: Output of :meth:`transform_context`.
 
         Returns:
             Array of shape ``(len(smiles), n_columns)``, ``float32``.
@@ -816,7 +839,7 @@ class FusionData:
         """Combine one encoded context with molecular features that are already computed.
 
         Args:
-            context: Output of :meth:`encode_context`.
+            context: Output of :meth:`transform_context`.
             fp: Fingerprints, shape ``(n, fp_size)``.
             desc: Descriptors, shape ``(n, n_descriptors)``.
 
