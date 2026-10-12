@@ -1,0 +1,176 @@
+### REINVENT4 staged learning against a TACK fusion ensemble.
+###
+### Scores every proposed molecule on all three TACK tasks — maximum degradation,
+### potency and the activity classifier — plus a reported-only uncertainty channel.
+### All four endpoints are served by ONE request per population: the server returns
+### every task it loaded in a single response, so the extra endpoints select slices of
+### a reply already in hand rather than triggering more work.
+###
+### Before running:
+###   1. Start the server in the TACK environment, with the context for YOUR target:
+###        tack serve --repo-id ailab-bio/TACK-Fast-Ensemble \
+###                   --context /path/to/TACK/reinvent/example_context.json \
+###                   --port 8777
+###      Do not pass --task: the objective below needs all three.
+###   2. Put the plugin on PYTHONPATH in the REINVENT environment:
+###        export PYTHONPATH=/path/to/TACK/reinvent:$PYTHONPATH
+###        python -c "from reinvent_plugins.components import comp_tack; print('ok')"
+###   3. Point prior_file/agent_file below at your own prior.
+###
+### Then:  reinvent -l staged_learning_tack.log staged_learning_tack.toml
+
+run_type = "staged_learning"
+device = "cuda:0"                      # "cpu" works; the scoring server is separate
+tb_logdir = "tb_tack"
+json_out_config = "_staged_learning_tack.json"
+
+[parameters]
+
+summary_csv_prefix = "tack_degrader"
+use_checkpoint = false
+
+# Replace with your own prior/agent. A PROTAC-shaped run usually starts from a
+# fragment-linking or Mol2Mol prior rather than de-novo Reinvent.
+prior_file = "priors/reinvent.prior"
+agent_file = "priors/reinvent.prior"
+
+batch_size = 256                       # molecules per step = molecules per server call
+unique_sequences = true
+randomize_smiles = false
+
+[learning_strategy]
+
+type = "dap"
+sigma = 128
+rate = 0.0001
+
+
+[[stage]]
+
+chkpt_file = "tack_stage1.chkpt"
+
+termination = "simple"
+max_score = 0.8
+min_steps = 100
+max_steps = 1000
+
+[stage.scoring]
+
+# Geometric mean, so a molecule cannot buy a good total by being excellent on potency
+# while degrading nothing: a near-zero on any weighted component sinks the product.
+type = "geometric_mean"
+
+
+[[stage.scoring.component]]
+[stage.scoring.component.TackDegradation]
+
+# ---------------------------------------------------------------------------------
+# Maximum degradation. Already a fraction in [0, 1], but the transform is what states
+# the objective: ~0.65 is the point of indifference and >0.85 is treated as good.
+# ---------------------------------------------------------------------------------
+[[stage.scoring.component.TackDegradation.endpoint]]
+name = "Dmax"
+weight = 3.0
+
+params.url = "http://127.0.0.1:8777"
+params.task = "dmax"
+# params.key omitted -> the task's point prediction ("mean")
+
+transform.type = "sigmoid"
+transform.low = 0.50
+transform.high = 0.90
+transform.k = 0.5
+
+# ---------------------------------------------------------------------------------
+# Potency, as pDC50 = -log10(DC50 / M). 6.0 is 1 uM, 9.0 is 1 nM. The window below
+# rewards sub-100 nM and saturates around 1 nM.
+# ---------------------------------------------------------------------------------
+[[stage.scoring.component.TackDegradation.endpoint]]
+name = "pDC50"
+weight = 2.0
+
+params.task = "pdc50"
+
+transform.type = "sigmoid"
+transform.low = 6.0
+transform.high = 9.0
+transform.k = 0.5
+
+# ---------------------------------------------------------------------------------
+# The activity classifier, as P(active). Already a probability, so it needs no
+# transform — a probability is a score.
+# ---------------------------------------------------------------------------------
+[[stage.scoring.component.TackDegradation.endpoint]]
+name = "P(active)"
+weight = 1.0
+
+params.task = "activity"
+# params.key omitted -> "proba" for a classification task
+
+# ---------------------------------------------------------------------------------
+# Dmax uncertainty, reported but not optimised (weight = 0). Worth logging: the
+# ensembles are calibrated, so a run that drifts into chemistry the training set never
+# covered shows up here as rising std before it shows up anywhere else.
+#
+# Do NOT give this a positive weight to "prefer confident molecules": the optimiser
+# would learn to propose molecules near the training set rather than good ones. To act
+# on uncertainty, filter the output afterwards.
+# ---------------------------------------------------------------------------------
+[[stage.scoring.component.TackDegradation.endpoint]]
+name = "Dmax std"
+weight = 0.0
+
+params.task = "dmax"
+params.key = "std"
+
+transform.type = "reverse_sigmoid"
+transform.low = 0.05
+transform.high = 0.25
+transform.k = 0.5
+
+
+# ---------------------------------------------------------------------------------
+# Keep the chemistry in a plausible PROTAC range. TACK was trained on bivalent
+# degraders, so these bounds also keep the optimiser inside the domain the ensembles
+# can actually speak to — without them a generative run drifts to small molecules the
+# model has no basis for scoring.
+# ---------------------------------------------------------------------------------
+[[stage.scoring.component]]
+[stage.scoring.component.MolecularWeight]
+
+[[stage.scoring.component.MolecularWeight.endpoint]]
+name = "Molecular weight"
+weight = 1.0
+
+transform.type = "double_sigmoid"
+transform.low = 600.0
+transform.high = 1200.0
+transform.coef_div = 500.0
+transform.coef_si = 20.0
+transform.coef_se = 20.0
+
+
+[[stage.scoring.component]]
+[stage.scoring.component.SlogP]
+
+[[stage.scoring.component.SlogP.endpoint]]
+name = "SlogP"
+weight = 1.0
+
+transform.type = "double_sigmoid"
+transform.low = 2.0
+transform.high = 7.0
+transform.coef_div = 3.0
+transform.coef_si = 10.0
+transform.coef_se = 10.0
+
+
+### A port file instead of a fixed port, for a shared node where 8777 may be taken.
+### Start the server with:
+###   tack serve --repo-id ... --port 0 --port-file /tmp/tack-$SLURM_JOB_ID.port
+### and replace params.url on the Dmax endpoint above with:
+###   params.port_file = "/tmp/tack-12345.port"
+###
+### Set url/port_file on ONE endpoint only. They configure the shared connection, not
+### the endpoint, and endpoints that disagree are refused — two different servers would
+### mean two requests, which is what this component exists to avoid.
