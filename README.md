@@ -207,8 +207,6 @@ To run the full test suite, install the dev dependencies and run:
 OMP_NUM_THREADS=1 pytest    # the full suite needs ".[dev,gp,training]"
 ```
 
-Python API documentation: [ribesstefano.github.io/TACK](https://ribesstefano.github.io/TACK/).
-
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
