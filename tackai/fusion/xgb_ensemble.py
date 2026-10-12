@@ -358,7 +358,9 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
                                           force_download=force_download, local_files_only=local_files_only,
                                           allow_patterns=f"{subfolder}/*" if subfolder else None))
         path = path / (subfolder or "")
-files = sorted(f for f in path.iterdir() if f.suffix in MODEL_SUFFIXES and f.name != CONFIG and not f.name.endswith(".params.json"))
+        files = sorted(f for f in path.iterdir()
+                       if f.suffix in MODEL_SUFFIXES and f.name != CONFIG
+                       and not f.name.endswith(".params.json"))
         if not files:
             raise FileNotFoundError(f"No model files ({', '.join(sorted(MODEL_SUFFIXES))}) in {path}")
         config = json.loads((path / CONFIG).read_text()) if (path / CONFIG).exists() else {}
