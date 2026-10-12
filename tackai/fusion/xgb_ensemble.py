@@ -126,6 +126,116 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
         self.weights_, self.sigmas_ = np.full(n, 1 / n), np.zeros(n)  # uniform, unknown noise
         self.lambda_ = self.q_hat_ = self.temperature_ = None
 
+    # --------------------------- introspection ------------------------------ #
+    def help(self, show_extras: bool = False) -> dict:
+        """Describe what `predict` returns: the task and its output dict's keys.
+
+        A quick way to see what `predict(X)` hands back without reading its body — the
+        keys depend on `self.task` and whether `calibrate` has been called yet (it adds
+        `"lower"`/`"upper"` for regression; a classification ensemble's keys don't change,
+        only `"proba"`'s values do, once temperature-scaled).
+
+        Args:
+            show_extras: Also return `"hyperparameters"` (the fitted/calibrated state:
+                `lambda_`, and `alpha`/`q_hat_` for regression or `temperature_` for
+                classification) and `"explanations"`, a per-key prose description of what
+                each output means and, where relevant, how a hyperparameter shapes it,
+                e.g., how the fitted `alpha` sets the conformal interval's target coverage.
+
+        Returns:
+            A dict with `"task"` (`"regression"` or `"classification"`) and
+            `"output_keys"` (the keys `predict` currently returns, in the order it builds
+            them); with `show_extras`, also `"hyperparameters"` and `"explanations"`.
+
+        Examples:
+            >>> ens.help()
+            {'task': 'regression', 'output_keys': ['mean', 'std', 'std_noise', 'std_disagreement']}
+
+            >>> ens.calibrate(X_cal, y_cal).help()
+            {'task': 'regression',
+             'output_keys': ['mean', 'std', 'std_noise', 'std_disagreement', 'lower', 'upper']}
+
+            >>> clf_ens.help()
+            {'task': 'classification',
+             'output_keys': ['proba', 'entropy_total', 'entropy_aleatoric', 'entropy_epistemic']}
+
+            >>> ens.calibrate(X_cal, y_cal).help(show_extras=True)
+            {'task': 'regression',
+             'output_keys': ['mean', 'std', 'std_noise', 'std_disagreement', 'lower', 'upper'],
+             'hyperparameters': {'lambda_': 0.1, 'alpha': 0.1, 'q_hat_': 1.8432},
+             'explanations': {
+                 'mean': 'Weighted mean of the base models\' predictions (weights_, uniform '
+                         'until fit()).',
+                 ...,
+                 'lower': "mean - q_hat_ * std, i.e. the lower end of a conformal interval "
+                          "targeting 1 - alpha = 90% coverage (alpha=0.1) on data exchangeable "
+                          "with the calibration set; q_hat_=1.8432 is that set's (1 - alpha)-"
+                          "quantile of |y - mean| / std.",
+                 'upper': "mean + q_hat_ * std, same interval's upper end."}}
+        """
+        if self.task == "regression":
+            keys = ["mean", "std", "std_noise", "std_disagreement"]
+            if self.q_hat_ is not None:
+                keys += ["lower", "upper"]
+        else:
+            keys = ["proba", "entropy_total", "entropy_aleatoric", "entropy_epistemic"]
+        out = {"task": self.task, "output_keys": keys}
+        if show_extras:
+            out["hyperparameters"] = self._help_hyperparameters()
+            out["explanations"] = self._help_explanations(keys)
+        return out
+
+    def _help_hyperparameters(self) -> dict:
+        """The fitted/calibrated state `help(show_extras=True)` explains the outputs against."""
+        out = {"lambda_": self.lambda_}
+        if self.task == "regression":
+            out["alpha"] = self.alpha
+            out["q_hat_"] = self.q_hat_
+        else:
+            out["temperature_"] = self.temperature_
+        return out
+
+    def _help_explanations(self, keys) -> dict:
+        """Prose description of each key in `keys`, referencing the fitted hyperparameters."""
+        if self.task == "regression":
+            coverage = 1 - self.alpha
+            explanations = {
+                "mean": "Weighted mean of the base models' predictions (weights_, uniform "
+                        "until fit()).",
+                "std": "Total predictive uncertainty: sqrt(std_noise**2 + std_disagreement**2).",
+                "std_noise": "Aleatoric term: sqrt(weights_ @ sigmas_**2), a single value shared "
+                             "by every prediction (not per-row) because sigmas_ are per-model "
+                             "constants fit by fit(); zero (hence std_noise=0) before fit().",
+                "std_disagreement": "Epistemic term: the weighted spread of the base models' "
+                                    "predictions around mean — shrinks as the ensemble agrees "
+                                    "with itself, independent of sigmas_.",
+            }
+            if "lower" in keys:
+                explanations["lower"] = (
+                    f"mean - q_hat_ * std, i.e. the lower end of a conformal interval "
+                    f"targeting 1 - alpha = {coverage:.0%} coverage (alpha={self.alpha!r}) on "
+                    f"data exchangeable with the calibration set; q_hat_={self.q_hat_!r} is "
+                    "that set's (1 - alpha)-quantile of |y - mean| / std."
+                )
+                explanations["upper"] = "mean + q_hat_ * std, same interval's upper end."
+            return explanations
+        temp = self.temperature_
+        calibrated = temp is not None
+        return {
+            "proba": ("Linear pool (weights_-weighted average) of the base models' "
+                     f"P(positive)" + (f", temperature-scaled by temperature_={temp!r} "
+                     "(fit by calibrate() to match the calibration set's log-loss)."
+                     if calibrated else
+                     ", not yet temperature-scaled (temperature_=None until calibrate()).")),
+            "entropy_total": "Binary entropy of proba (post-calibration if calibrated) — "
+                            "total predictive uncertainty, in nats.",
+            "entropy_aleatoric": "Weighted average of each base model's own entropy — "
+                                 "irreducible uncertainty the models agree on.",
+            "entropy_epistemic": "entropy_total of the uncalibrated pool minus "
+                                 "entropy_aleatoric, floored at 0 — uncertainty from the base "
+                                 "models disagreeing with each other.",
+        }
+
     # ------------------------------ fitting -------------------------------- #
     def fit(self, X, y):
         """Learn the weights (and per-model sigmas for regression) on the stacking set."""

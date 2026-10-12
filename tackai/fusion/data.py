@@ -23,8 +23,7 @@ from tackai.data.utils import get_cache_dir
 from tackai.fusion.context import (CONTEXT_BLOCKS, CONTEXT_FILES, DEFAULT_CONTEXT_REPO,
                                    SEQUENCE_BLOCKS, ContextEncoder, assay_time_or_default,
                                    stage_context_tables, upload_context_tables)
-from tackai.fusion.mol_encoder import (DESCRIPTOR_NAMES, FP_RADIUS, FP_SIZE, MOL_BLOCKS,
-                                       MolEncoder)
+from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES, MOL_BLOCKS, MolEncoder
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -42,6 +41,12 @@ CACHE_VERSION = "v2"   # v2: a missing assay_time is stored as ASSAY_TIME_DEFAUL
 
 #: Every block of the design matrix, in column order: molecular first, then the context.
 BLOCK_ORDER = [*MOL_BLOCKS, *CONTEXT_BLOCKS]
+
+#: Fields a :meth:`FusionData.transform`/:meth:`FusionData.encode_context` record may set.
+RECORD_FIELDS = ("smiles", "poi_seq", "e3_seq", "cell_id", "assay", "assay_time")
+#: Record field -> context block with a fixed, inspectable vocabulary. "smiles" is
+#: featurised on the fly and "assay_time" is a free-form duration, so neither has one.
+FIELD_BLOCKS = {"poi_seq": "poi", "e3_seq": "e3", "cell_id": "cell", "assay": "assay"}
 
 
 def block_index(dims: Dict[str, int]) -> Dict[str, np.ndarray]:
@@ -253,6 +258,77 @@ class FusionData:
         self._groups: Optional[np.ndarray] = None
         self._targets: Optional[Dict[str, np.ndarray]] = None
         self._splits: Dict[tuple, list] = {}
+
+    # ---------------------------------------------------------------- introspection
+
+    def help(self, block: Optional[str] = None, task: Optional[str] = None,
+             return_keys: bool = False) -> Dict[str, object]:
+        """Describe what a record may contain: its fields, cached context vocabularies and tasks.
+
+        A way to inspect what :meth:`transform`/:meth:`encode_context` accept and what the
+        cached tables actually know, without reading ``tackai/fusion/context.py`` directly —
+        useful both for building an inference record and for checking what a trained model
+        supports.
+
+        Args:
+            block: Inspect one record field's cached vocabulary instead of the overview —
+                one of ``"poi_seq"``, ``"e3_seq"``, ``"cell_id"`` or ``"assay"``.
+                ``"smiles"`` and ``"assay_time"`` accept any value and have no fixed
+                vocabulary to inspect.
+            task: Describe one task (``"dmax"``, ``"pdc50"`` or ``"activity"``) instead of
+                the overview. Ignored when `block` is given.
+            return_keys: For a `block` query, return the cached keys themselves rather than
+                just how many there are — the POI and E3 tables can hold thousands of
+                sequences, so this defaults to False.
+
+        Returns:
+            With `block`: a dict with ``"block"``, ``"n_keys"`` and, if `return_keys`,
+            ``"keys"`` (sorted). With `task`: a dict with ``"task"``, ``"type"``,
+            ``"label"`` and ``"support"``. With neither: a dict with ``"record_fields"``
+            (the fields a record may set) and ``"tasks"`` (every task name mapped to its
+            own type/label/support).
+
+        Raises:
+            ValueError: If `block` or `task` is not a recognised name.
+
+        Examples:
+            >>> dt = FusionData.from_pretrained(...) ; dt.help()
+            {'record_fields': ['smiles', 'poi_seq', 'e3_seq', 'cell_id', 'assay', 'assay_time'],
+             'tasks': {'dmax': {'type': 'regression', 'label': 'Dmax (fraction)', 'support': (0.0, 1.0)},
+                       'pdc50': {'type': 'regression', 'label': 'pDC50', 'support': None},
+                       'activity': {'type': 'binary', 'label': 'P(active)', 'support': (0.0, 1.0)}}}
+
+            >>> dt = FusionData.from_pretrained(...) ; dt.help(block="assay")
+            {'block': 'assay', 'n_keys': 20}
+
+            >>> dt = FusionData.from_pretrained(...) ; dt.help(block="assay", return_keys=True)
+            {'block': 'assay', 'n_keys': 20,
+             'keys': ['capillary immunoassay', 'dot blot', ..., 'western blot']}
+
+            >>> dt = FusionData.from_pretrained(...) ; dt.help(task="dmax")
+            {'task': 'dmax', 'type': 'regression', 'label': 'Dmax (fraction)', 'support': (0.0, 1.0)}
+        """
+        if block is not None:
+            if block not in FIELD_BLOCKS:
+                raise ValueError(
+                    f"block must be one of {sorted(FIELD_BLOCKS)}, got {block!r} "
+                    "('smiles' and 'assay_time' accept any value, with no fixed vocabulary)"
+                )
+            keys = sorted(self.encoder.table(FIELD_BLOCKS[block]))
+            out = {"block": block, "n_keys": len(keys)}
+            if return_keys:
+                out["keys"] = keys
+            return out
+
+        if task is not None:
+            if task not in TASKS:
+                raise ValueError(f"task must be one of {TASKS}, got {task!r}")
+            return {"task": task, "type": TASK_TYPES[task], "label": TASK_LABELS[task],
+                    "support": TASK_SUPPORT[task]}
+
+        return {"record_fields": list(RECORD_FIELDS),
+                "tasks": {t: {"type": TASK_TYPES[t], "label": TASK_LABELS[t],
+                              "support": TASK_SUPPORT[t]} for t in TASKS}}
 
     # ---------------------------------------------------------------- construction
 
