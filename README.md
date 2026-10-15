@@ -14,7 +14,7 @@
   <a href="https://ribesstefano.github.io/TACK/"><img src="https://img.shields.io/badge/Docs-mkdocs-informational" alt="Docs"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow" alt="License"></a>
   <!-- Add Colab banner -->
-  <a href="https://colab.research.google.com/github/ribesstefano/TACK/blob/fast-surrogates/notebooks/fast_TACK_models_tutorial.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
+  <a href="https://colab.research.google.com/github/ribesstefano/TACK/blob/main/notebooks/fast_TACK_models_tutorial.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
 </p>
 
 TACK predicts PROTAC-induced protein degradation — Dmax, DC50 and binary activity — from a
