@@ -38,7 +38,7 @@ import numpy as np
 # on this side of it.
 from .add_tag import add_tag
 from .component_results import ComponentResults
-from .tack_client import TackClient, TackServerError
+from .client_tack import TackClient, TackServerError
 
 logger = logging.getLogger(__name__)
 
