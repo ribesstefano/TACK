@@ -19,6 +19,8 @@ if sys.platform == "darwin":
     os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import argparse
+import hashlib
+import importlib.metadata
 import json
 import logging
 from pathlib import Path
@@ -39,7 +41,7 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold
 
 from rdkit import Chem, RDLogger
 
@@ -61,6 +63,7 @@ logger = logging.getLogger(__name__)
 TAIL = "low"  # which end of the regression target is the rare region
 TAIL_Q = 0.10  # quantile defining it
 TASKS = ("activity", "dmax", "pdc50")
+MAX_N_JOBS = 64
 
 
 def inverse_density_weights(y: np.ndarray, alpha: float = 1.0, max_ratio: float = 10.0) -> np.ndarray:
@@ -97,13 +100,14 @@ def suggest_params(trial: "optuna.Trial", task: str, tune_n_estimators: bool = F
     return p
 
 
-def make_model(params: dict, task: str, n_estimators: int, seed: int, scale_pos_weight=None):
+def make_model(params: dict, task: str, n_estimators: int, seed: int, scale_pos_weight=None,
+               n_jobs: int = 1):
     """An XGBoost model for a task. ``params["n_estimators"]`` wins over the argument, so a
     tuned count is used as tuned and the argument stays the fallback for the
     early-stopping path."""
     kw = {k: v for k, v in params.items() if k != "alpha_w"}
     kw.setdefault("n_estimators", n_estimators)
-    kw.update(n_jobs=-1, random_state=seed)
+    kw.update(n_jobs=n_jobs, random_state=seed)
     if task == "activity":
         return xgb.XGBClassifier(scale_pos_weight=scale_pos_weight, eval_metric="aucpr", **kw)
     return xgb.XGBRegressor(eval_metric="rmse", **kw)
@@ -111,6 +115,30 @@ def make_model(params: dict, task: str, n_estimators: int, seed: int, scale_pos_
 
 def tail_mask(y: np.ndarray, cut: float) -> np.ndarray:
     return y <= cut if TAIL == "low" else y >= cut
+
+
+def tail_cutoff(y: np.ndarray) -> float:
+    """Tail threshold estimated only from the supplied training partition."""
+    return float(np.quantile(y, TAIL_Q if TAIL == "low" else 1 - TAIL_Q))
+
+
+def grouped_inner_splits(y: np.ndarray, groups: np.ndarray, task: str, cut,
+                         n_inner: int, seed: int):
+    """Build grouped inner folds; optional labels only balance the fold assignment."""
+    y, groups = np.asarray(y), np.asarray(groups)
+    if len(groups) != len(y):
+        raise ValueError("groups must have the same length as y")
+    if len(np.unique(groups)) < n_inner:
+        raise ValueError(f"n_inner={n_inner} requires at least that many distinct groups")
+    strat = y if task == "activity" else (
+        tail_mask(y, cut if cut is not None else tail_cutoff(y)).astype(int)
+        if task == "dmax" else None
+    )
+    if strat is not None:
+        cv = StratifiedGroupKFold(n_splits=n_inner, shuffle=True, random_state=seed)
+        return list(cv.split(np.zeros(len(y)), strat, groups))
+    cv = GroupKFold(n_splits=n_inner, shuffle=True, random_state=seed)
+    return list(cv.split(np.zeros(len(y)), y, groups))
 
 
 def regression_scores(y_true: np.ndarray, y_pred: np.ndarray, cut) -> dict:
@@ -138,7 +166,7 @@ def binary_scores(y_true: np.ndarray, proba: np.ndarray, pred: np.ndarray) -> di
 
 
 def objective(trial: "optuna.Trial", X: np.ndarray, y: np.ndarray, task: str, cut, seed: int,
-              n_inner: int, tune_n_estimators: bool = False) -> float:
+              n_inner: int, tune_n_estimators: bool = False, groups=None, n_jobs: int = 1) -> float:
     """Inner-CV score of one hyper-parameter draw (lower is better).
 
     With ``tune_n_estimators`` the tree count is part of the search space and early stopping
@@ -148,35 +176,29 @@ def objective(trial: "optuna.Trial", X: np.ndarray, y: np.ndarray, task: str, cu
     iteration, so the caller refits identically either way.
     """
     params = suggest_params(trial, task, tune_n_estimators)
-    if task == "activity":
-        strat = y
-    elif cut is not None:
-        strat = tail_mask(y, cut).astype(int)
-    else:
-        strat = None
-    cv = StratifiedKFold(n_inner, shuffle=True, random_state=seed)
-    splitter = (
-        cv.split(X, strat) if strat is not None
-        else KFold(n_inner, shuffle=True, random_state=seed).split(X)
-    )
+    if groups is None:
+        raise ValueError("groups are required for grouped inner cross-validation")
+    groups = np.asarray(groups)
+    splitter = grouped_inner_splits(y, groups, task, cut, n_inner, seed)
     scores, iters = [], []
     for tr, va in splitter:
         fit_kw = {} if tune_n_estimators else {"eval_set": [(X[va], y[va])]}
         if task == "activity":
             spw = (y[tr] == 0).sum() / max((y[tr] == 1).sum(), 1)
-            model = make_model(params, task, 2000, seed, scale_pos_weight=spw)
+            model = make_model(params, task, 2000, seed, scale_pos_weight=spw, n_jobs=n_jobs)
             if not tune_n_estimators:
                 model.set_params(early_stopping_rounds=50)
             model.fit(X[tr], y[tr], verbose=False, **fit_kw)
             s = -average_precision_score(y[va], model.predict_proba(X[va])[:, 1])
         else:
             w = inverse_density_weights(y[tr], alpha=params["alpha_w"])
-            model = make_model(params, task, 2000, seed)
+            model = make_model(params, task, 2000, seed, n_jobs=n_jobs)
             if not tune_n_estimators:
                 model.set_params(early_stopping_rounds=50)
             model.fit(X[tr], y[tr], sample_weight=w, verbose=False, **fit_kw)
-            sc = regression_scores(y[va], model.predict(X[va]), cut)
-            s = np.nanmean([sc["rmse_rare"], sc["rmse_common"]]) if cut is not None else sc["rmse"]
+            fold_cut = tail_cutoff(y[tr]) if task == "dmax" else None
+            sc = regression_scores(y[va], model.predict(X[va]), fold_cut)
+            s = np.nanmean([sc["rmse_rare"], sc["rmse_common"]]) if fold_cut is not None else sc["rmse"]
         scores.append(s)
         if not tune_n_estimators:
             iters.append(model.best_iteration + 1)
@@ -274,6 +296,85 @@ def holdout_calibration(y: np.ndarray, groups: np.ndarray, n_folds: int, seed: i
     return train_idx, calib_idx
 
 
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def provenance_record(args, dev_dt: FusionData) -> dict:
+    """Capture inputs and code that determine the fitted members and feature matrix."""
+    source_paths = [Path(__file__).resolve(), REPO_ROOT / "tackai/fusion/data.py",
+                    REPO_ROOT / "tackai/fusion/context.py",
+                    REPO_ROOT / "tackai/fusion/mol_encoder.py",
+                    REPO_ROOT / "tackai/chem_utils.py"]
+    code = {str(p.relative_to(REPO_ROOT)): sha256_file(p) for p in source_paths}
+    feature_spec = {
+        "radius": dev_dt.featurizer.radius,
+        "fp_size": dev_dt.featurizer.fp_size,
+        "share_ipc": dev_dt.featurizer.share_ipc,
+        "descriptors": list(dev_dt.featurizer.descriptors),
+        "dims": {k: int(v) for k, v in dev_dt.dims.items()},
+        "protein_space": dev_dt.encoder.protein_space,
+        "context_fingerprint": dev_dt.encoder.fingerprint(),
+    }
+    dependency_names = ("numpy", "pandas", "scipy", "scikit-learn", "xgboost", "optuna", "rdkit")
+    dependencies = {}
+    for name in dependency_names:
+        try:
+            dependencies[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            dependencies[name] = None
+    training_args = {
+        "tasks": list(args.tasks), "n_repeats": args.n_repeats, "n_folds": args.n_folds,
+        "n_trials": args.n_trials, "n_inner": args.n_inner, "seed": args.seed,
+        "tune_n_estimators": args.tune_n_estimators,
+        "calibration_folds": args.calibration_folds,
+        "calibration_seed": args.calibration_seed,
+        "exclude_test_overlap": args.exclude_test_overlap,
+        "evaluate_test": args.evaluate_test,
+        "n_jobs": args.n_jobs,
+    }
+    return {
+        "schema_version": 1,
+        "input_files": {str(Path(p).resolve()): sha256_file(Path(p))
+                        for p in [*args.dev_files, args.test_file]},
+        "features": feature_spec,
+        "dependencies": dependencies,
+        "training_args": training_args,
+        "code_sha256": code,
+    }
+
+
+def check_resume_provenance(path: Path, current: dict, model_paths=()) -> None:
+    """Reject stale/legacy checkpoints rather than silently mixing experiments."""
+    path = Path(path)
+    if path.exists():
+        previous = json.loads(path.read_text())
+        if previous != current:
+            raise ValueError(f"resume provenance mismatch in {path}; use a new --output-dir")
+        return
+    existing = [str(p) for p in model_paths if Path(p).exists()]
+    if existing:
+        raise ValueError("existing model files have no provenance record; refusing unsafe resume: "
+                         + ", ".join(existing[:5]))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(current, indent=2, sort_keys=True) + "\n")
+
+
+def provenance_digest(provenance: dict) -> str:
+    return hashlib.sha256(json.dumps(provenance, sort_keys=True).encode()).hexdigest()
+
+
+def positive_int(value: str) -> int:
+    number = int(value)
+    if not 1 <= number <= MAX_N_JOBS:
+        raise argparse.ArgumentTypeError(f"must be between 1 and {MAX_N_JOBS}")
+    return number
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train fusion-surrogate XGBoost models with 5x5 CV and per-fold Optuna tuning.",
@@ -292,6 +393,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-folds", type=int, default=5, help="Outer CV folds per repeat.")
     parser.add_argument("--n-trials", type=int, default=50, help="Optuna trials per fold.")
     parser.add_argument("--n-inner", type=int, default=3, help="Inner CV folds used inside the Optuna objective.")
+    parser.add_argument("--n-jobs", type=positive_int, default=1,
+                        help=f"XGBoost CPU workers per fit (1..{MAX_N_JOBS}, default: 1).")
+    parser.add_argument("--evaluate-test", action="store_true",
+                        help="Include the held-out test set in fold_metrics.csv (default: off).")
     parser.add_argument("--seed", type=int, default=42, help="Base random seed.")
     parser.add_argument("--tune-n-estimators", dest="tune_n_estimators",
                         action=argparse.BooleanOptionalAction, default=True,
@@ -338,7 +443,20 @@ def main():
                if args.exclude_test_overlap else None)
     dev_dt = FusionData.from_csv(args.dev_files, encoder=ctx, exclude_smiles=exclude,
                                  verbose=True)
-    test_dt = FusionData.from_csv([args.test_file], encoder=ctx, verbose=True)
+    test_dt = (FusionData.from_csv([args.test_file], encoder=ctx, verbose=True)
+               if args.evaluate_test else None)
+
+    if not 1 <= args.n_jobs <= MAX_N_JOBS:
+        raise ValueError(f"--n-jobs must be between 1 and {MAX_N_JOBS}")
+
+    all_checkpoint_paths = [p for task in args.tasks for i in range(args.n_repeats)
+                            for j in range(args.n_folds)
+                            for p in (outdir / task / f"{task}_repeat{i}_fold{j}.json",
+                                      outdir / task / f"{task}_repeat{i}_fold{j}.params.json")]
+    provenance_path = outdir / "run_provenance.json"
+    provenance = provenance_record(args, dev_dt)
+    provenance_hash = provenance_digest(provenance)
+    check_resume_provenance(provenance_path, provenance, all_checkpoint_paths)
 
     if args.push_context_to_hub:
         logger.info("Pushing development context encoder to %s (private=%s)",
@@ -352,7 +470,8 @@ def main():
         task_dir.mkdir(parents=True, exist_ok=True)
 
         _, X_all, y_all, groups_all = dev_dt.task_rows(task=task)
-        _, X_test, y_test, _ = test_dt.task_rows(task=task)
+        if args.evaluate_test:
+            _, X_test, y_test, _ = test_dt.task_rows(task=task)
 
         # Carve the calibration set out of development before cross-validating, so the
         # ensemble's stacking weights and conformal quantile are later fitted on rows no
@@ -361,7 +480,10 @@ def main():
             cv_idx, calib_idx = holdout_calibration(y_all, groups_all, args.calibration_folds,
                                                     args.calibration_seed)
             np.savez(task_dir / "calibration.npz", X=X_all[calib_idx], y=y_all[calib_idx],
-                     groups=groups_all[calib_idx].astype(str), row_index=calib_idx)
+                     groups=groups_all[calib_idx].astype(str), row_index=calib_idx,
+                     task=np.asarray(task),
+                     context_fingerprint=np.asarray(dev_dt.encoder.fingerprint()),
+                     provenance_sha256=np.asarray(provenance_hash))
             logger.info("%s: %d development rows -> %d for CV, %d held out for calibration "
                         "(%d scaffold groups, disjoint from CV)", task, len(y_all), len(cv_idx),
                         len(calib_idx), len(set(groups_all[calib_idx])))
@@ -371,10 +493,6 @@ def main():
             logger.info("%s: %d development rows, no calibration holdout", task, len(y_all))
 
         X, y, groups = X_all[cv_idx], y_all[cv_idx], groups_all[cv_idx]
-        # The tail/cut-based rare-vs-common RMSE split only applies to dmax (a bounded
-        # fraction, where a tail quantile is meaningful); skip it for activity and pdc50.
-        cut = float(np.quantile(y, TAIL_Q if TAIL == "low" else 1 - TAIL_Q)) if task == "dmax" else None
-
         # Split the CV-training rows only: dev_dt.splits() would span the calibration rows too.
         cv_splits = make_splits(y, groups, n_repeats=args.n_repeats, n_folds=args.n_folds)
         for i, repeat in enumerate(cv_splits):
@@ -382,15 +500,22 @@ def main():
                 key = f"{task}_repeat{i}_fold{j}"
                 X_train, y_train = X[train_idx], y[train_idx]
                 X_val, y_val = X[val_idx], y[val_idx]
+                # Reporting tail membership is anchored to this outer training fold.
+                cut = tail_cutoff(y_train) if task == "dmax" else None
 
                 model_file = task_dir / f"{key}.json"
                 params_file = task_dir / f"{key}.params.json"
+                if model_file.exists() != params_file.exists():
+                    raise ValueError(f"incomplete checkpoint pair for {key}; remove or restore both "
+                                     "the model and its .params.json file")
                 if model_file.exists() and params_file.exists():
                     logger.info("Loading existing model for %s from %s", key, model_file)
                     model = xgb.XGBClassifier() if task == "activity" else xgb.XGBRegressor()
                     model.load_model(model_file)
                     with open(params_file, "r") as f:
                         params_data = json.load(f)
+                    if params_data.get("provenance_sha256") != provenance_hash:
+                        raise ValueError(f"checkpoint parameters for {key} do not match run provenance")
                     best = params_data.get("best_params", {})
                 else:
                     logger.info("Training new model for %s", key)
@@ -401,7 +526,8 @@ def main():
                     )
                     study.optimize(
                         lambda t: objective(t, X_train, y_train, task, cut, seed, args.n_inner,
-                                            args.tune_n_estimators),
+                                            args.tune_n_estimators, groups=groups[train_idx],
+                                            n_jobs=args.n_jobs),
                         n_trials=args.n_trials, show_progress_bar=True,
                     )
                     best = study.best_params
@@ -409,19 +535,24 @@ def main():
 
                     if task == "activity":
                         spw = (y_train == 0).sum() / max((y_train == 1).sum(), 1)
-                        model = make_model(best, task, n_est, args.seed, scale_pos_weight=spw).fit(X_train, y_train)
+                        model = make_model(best, task, n_est, args.seed, scale_pos_weight=spw,
+                                           n_jobs=args.n_jobs).fit(X_train, y_train)
                     else:
                         w = inverse_density_weights(y_train, alpha=best.get("alpha_w", 1.0))
-                        model = make_model(best, task, n_est, args.seed).fit(X_train, y_train, sample_weight=w)
+                        model = make_model(best, task, n_est, args.seed, n_jobs=args.n_jobs).fit(
+                            X_train, y_train, sample_weight=w)
 
                     model.save_model(model_file)
                     params_file.write_text(json.dumps(
                         dict(best_params=best, n_estimators=n_est,
-                             inner_score=study.best_value, cut=cut), indent=2))
+                             inner_score=study.best_value, cut=cut,
+                             provenance_sha256=provenance_hash), indent=2))
 
                 # "calib" is the held-out calibration set: no member was trained on it, so a
                 # per-member score there is the honest one to compare against "val".
-                splits = [("val", X_val, y_val), ("test", X_test, y_test)]
+                splits = [("val", X_val, y_val)]
+                if args.evaluate_test:
+                    splits.append(("test", X_test, y_test))
                 if len(calib_idx):
                     splits.append(("calib", X_all[calib_idx], y_all[calib_idx]))
                 for split, Xe, ye in splits:

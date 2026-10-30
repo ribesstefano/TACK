@@ -23,6 +23,7 @@ import xgboost as xgb
 from huggingface_hub import HfApi, ModelHubMixin, snapshot_download
 from scipy.optimize import minimize, minimize_scalar
 from scipy.special import expit, log_expit, log_softmax, logit, logsumexp, softmax, xlog1py, xlogy
+from sklearn.model_selection import GroupKFold
 
 EPS = 1e-6  # probability clipping
 CONFIG = "config.json"
@@ -240,17 +241,38 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
         }
 
     # ------------------------------ fitting -------------------------------- #
-    def fit(self, X, y):
-        """Learn the weights (and per-model sigmas for regression) on the stacking set."""
+    def fit(self, X, y, groups=None):
+        """Learn ensemble weights on the stacking set.
+
+        When ``groups`` is supplied, lambda selection uses group-disjoint folds. Omitting it
+        retains the historical row-wise split for compatibility with existing callers.
+        """
         preds, y = self._base_predictions(X), np.asarray(y, float)
+        if y.ndim != 1 or len(y) != len(preds):
+            raise ValueError("y must be a one-dimensional array aligned with X.")
         rng = np.random.default_rng(self.seed)
-        folds = np.array_split(rng.permutation(y.size), self.n_folds)
+        if groups is None:
+            folds = [(np.setdiff1d(np.arange(y.size), val), val)
+                     for val in np.array_split(rng.permutation(y.size), self.n_folds)]
+        else:
+            groups = np.asarray(groups)
+            if groups.ndim != 1 or len(groups) != y.size:
+                raise ValueError("groups must be a one-dimensional array aligned with X and y.")
+            missing = np.asarray([
+                value is None or (isinstance(value, (float, np.floating)) and np.isnan(value))
+                for value in groups
+            ])
+            if missing.any():
+                raise ValueError("groups must not contain missing values.")
+            n_groups = np.unique(groups).size
+            if n_groups < 2:
+                raise ValueError("grouped lambda selection requires at least two groups.")
+            folds = list(GroupKFold(n_splits=min(self.n_folds, n_groups)).split(preds, y, groups))
         loss = LOSSES[self.task]
 
         def cv_loss(lam):  # unpenalised held-out loss
             held_out = []
-            for val in folds:
-                train = np.setdiff1d(np.arange(y.size), val)
+            for train, val in folds:
                 params = self._optimise(preds[train], y[train], lam, rng)
                 held_out.append(loss(params, preds[val], y[val], 0.0)[0])
             return np.mean(held_out)

@@ -228,7 +228,7 @@ def build_table(files: Sequence[Union[str, Path]]) -> pd.DataFrame:
         e3_raw = (_first_valid(raw["Recruiter"], raw["Recruiter_Gene"])
                   if "Recruiter_Gene" in raw else raw["Recruiter"])
         hours = raw[["DC50_h", "Dmax_h"]].astype(float)
-        parts.append(pd.DataFrame({
+        part = pd.DataFrame({
             "source": f.stem, "smiles": raw["SMILES"], "e3_raw": e3_raw,
             "e3_seq": raw["Recruiter_Sequence"],
             "poi_uniprot": raw["Degradation_Target_Uniprot"],
@@ -236,7 +236,18 @@ def build_table(files: Sequence[Union[str, Path]]) -> pd.DataFrame:
             "cell_key": cell_key, "assay_raw": raw["Assay"],
             "assay_time": hours.mean(axis=1, skipna=True),   # DC50_h and Dmax_h agree in ~98% of rows
             "dmax_pct": raw["Dmax"].astype(float).clip(0, 100),
-            "dc50_nM": raw["DC50"].astype(float)}))
+            "dc50_nM": raw["DC50"].astype(float)})
+        # Preserve evidence for research label policies and reproducible splits. These
+        # columns are metadata only: they never enter the inference design matrix.
+        part["source_row"] = np.arange(len(raw))
+        part["source_path"] = str(f.resolve())
+        for column in ("DOI", "Reference", "Connectivity_Key", "Compound_Key", "Patent",
+                       "Patent_Number", "Degradation_Target", "DC50_operator",
+                       "Dmax_operator", "DC50_range_min", "DC50_range_max",
+                       "Dmax_range_min", "Dmax_range_max", "DC50_h", "Dmax_h"):
+            part[column] = raw[column] if column in raw else np.nan
+        part["dmax_raw_pct"] = raw["Dmax"].astype(float)
+        parts.append(part)
 
     tab = pd.concat(parts, ignore_index=True)
     tab = tab[tab["smiles"].notna() & (tab["smiles"].astype(str).str.strip() != "")]
@@ -691,6 +702,10 @@ class FusionData:
                                      self.featurizer.radius, self.featurizer.fp_size,
                                      self.featurizer.share_ipc, self.featurizer.descriptors,
                                      sorted(self.dims.items())]).encode())
+        if hasattr(self.featurizer, "spec"):
+            # Count/binary fingerprints can have identical dimensions. A versioned
+            # encoder must never reuse blocks from a different molecular contract.
+            h.update(self.featurizer.spec.to_json().encode())
         h.update(self.table[cols].astype(str).to_csv(index=False).encode())
         return Path(get_cache_dir()) / "fusion_blocks" / h.hexdigest()[:12]
 

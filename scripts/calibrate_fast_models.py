@@ -1,12 +1,12 @@
 """
 Fit and calibrate a directory of fusion-surrogate XGBoost models into an
-``XGBStackedEnsemble``, on a held-out test set, then save the result.
+``XGBStackedEnsemble`` using a saved grouped development holdout, then save the result.
 
 A directory produced by ``scripts/train_fast_models.py`` (``<task>/*.json`` model files)
 holds models with uniform ensemble weights and no calibration. This script loads them,
-splits the given test CSV into disjoint fit / calibration / evaluation subsets, learns the
-stacking weights (and regression sigmas) on the fit subset, conformal/temperature-calibrates
-on the calibration subset, reports metrics on the evaluation subset, and saves the resulting
+makes a group-disjoint fit/calibration split of the saved development holdout, learns the
+stacking weights (and regression sigmas) on the fit subset, calibrates on the calibration
+subset, reports metrics on the untouched test CSV, and saves the resulting
 calibrated ``XGBStackedEnsemble``:
 
     python scripts/calibrate_fast_models.py \\
@@ -29,6 +29,7 @@ if sys.platform == "darwin":
     os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import argparse
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -41,13 +42,15 @@ from dotenv import find_dotenv, load_dotenv
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     average_precision_score,
+    brier_score_loss,
     confusion_matrix,
+    log_loss,
     mean_absolute_error,
     mean_squared_error,
     r2_score,
     roc_auc_score,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
 
 from tackai.fusion.context import DEFAULT_CONTEXT_REPO
 from tackai.fusion.data import FusionData
@@ -92,7 +95,60 @@ def classification_metrics(y_true: np.ndarray, proba: np.ndarray, pred: np.ndarr
         "roc_auc": float(roc_auc_score(y_true, proba)),
         "pr_auc": float(average_precision_score(y_true, proba)),
         "accuracy": float((pred == y_true).mean()),
+        "brier": float(brier_score_loss(y_true, proba)),
+        "log_loss": float(log_loss(y_true, proba, labels=[0, 1])),
     }
+
+
+def split_fit_cal_by_group(X: np.ndarray, y: np.ndarray, groups: np.ndarray,
+                           seed: int, fit_fraction: float = 0.5,
+                           stratify: bool = False):
+    """Split a held-out pool into fit/calibration rows without crossing groups."""
+    groups = np.asarray(groups)
+    if groups.ndim != 1 or len(groups) != len(y) or len(X) != len(y):
+        raise ValueError("X, y, and groups must have the same row count; groups must be 1-D.")
+    if any(g is None or (isinstance(g, (float, np.floating)) and np.isnan(g)) for g in groups):
+        raise ValueError("Calibration groups contain missing values.")
+    unique = np.unique(groups)
+    if unique.size < 2:
+        raise ValueError("At least two distinct groups are required for grouped calibration.")
+    if not 0 < fit_fraction < 1:
+        raise ValueError("fit_fraction must be between 0 and 1.")
+
+    # Try deterministic grouped candidates and choose the closest row-count balance. If
+    # classification labels permit it, prefer candidates with both classes in each half.
+    splitter = GroupShuffleSplit(n_splits=min(100, max(20, unique.size * 2)),
+                                 test_size=1 - fit_fraction, random_state=seed)
+    candidates = []
+    for fit_idx, cal_idx in splitter.split(X, y, groups):
+        class_ok = (not stratify or (np.unique(y[fit_idx]).size == np.unique(y).size
+                                     and np.unique(y[cal_idx]).size == np.unique(y).size))
+        score = abs(len(fit_idx) - fit_fraction * len(y))
+        candidates.append((not class_ok, score, fit_idx, cal_idx))
+    _, _, fit_idx, cal_idx = min(candidates, key=lambda item: (item[0], item[1]))
+    if not len(fit_idx) or not len(cal_idx):
+        raise ValueError("Grouped calibration split produced an empty partition.")
+    if set(groups[fit_idx]) & set(groups[cal_idx]):
+        raise AssertionError("Grouped calibration split leaked a group across partitions.")
+    return (X[fit_idx], y[fit_idx], groups[fit_idx]), (X[cal_idx], y[cal_idx], groups[cal_idx])
+
+
+def validate_finite_output(out: dict, y_true: np.ndarray) -> None:
+    """Fail clearly rather than reporting uncertainty/probability metrics on invalid values."""
+    bad = [key for key, values in out.items() if not np.isfinite(values).all()]
+    if bad or not np.isfinite(y_true).all():
+        raise ValueError(f"Non-finite evaluation values in outputs {bad or 'or targets'}.")
+
+
+def regression_uncertainty_metrics(y_true: np.ndarray, out: dict, alpha: float) -> dict:
+    metrics = regression_metrics(y_true, out["mean"])
+    metrics["std_mean"] = float(np.mean(out["std"]))
+    metrics["std_median"] = float(np.median(out["std"]))
+    if "lower" in out and "upper" in out:
+        metrics["interval_coverage"] = float(np.mean((y_true >= out["lower"]) & (y_true <= out["upper"])))
+        metrics["interval_width_mean"] = float(np.mean(out["upper"] - out["lower"]))
+        metrics["interval_nominal_coverage"] = float(1 - alpha)
+    return metrics
 
 
 def verify_pushed_ensemble(repo_id: str, X_eval: np.ndarray, y_eval: np.ndarray,
@@ -109,7 +165,7 @@ def verify_pushed_ensemble(repo_id: str, X_eval: np.ndarray, y_eval: np.ndarray,
         pred = (out["proba"] >= 0.5).astype(int)
         reloaded_metrics = classification_metrics(y_eval, out["proba"], pred)
     else:
-        reloaded_metrics = regression_metrics(y_eval, out["mean"])
+        reloaded_metrics = regression_uncertainty_metrics(y_eval, out, reloaded.alpha)
     mismatched_metrics = {k: (metrics[k], reloaded_metrics[k]) for k in metrics
                           if not np.isclose(metrics[k], reloaded_metrics[k])}
     if mismatched_metrics:
@@ -167,8 +223,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", required=True, choices=list(TASKS),
                         help="Task whose target to pull from --test-file.")
     parser.add_argument("--test-file", required=True,
-                        help="Held-out test CSV (AutoTPD+/TACKv2 layout) to split into "
-                             "fit/calibration/evaluation subsets.")
+                        help="Held-out test CSV (AutoTPD+/TACKv2 layout), used only for evaluation.")
     parser.add_argument("--output-dir", default=None,
                         help="Save the calibrated ensemble locally (XGBStackedEnsemble."
                              "save_pretrained) to this directory.")
@@ -192,8 +247,10 @@ def parse_args() -> argparse.Namespace:
                         help="Only without a calibration npz: fraction of the test set used to "
                              "fit the stacking weights.")
     parser.add_argument("--cal-frac", type=float, default=0.1,
-                        help="Only without a calibration npz: fraction of the test set used "
-                             "for calibration.")
+                        help="Legacy opt-in only: fraction of the test set used for calibration.")
+    parser.add_argument("--allow-test-split", action="store_true",
+                        help="Explicitly allow legacy fit/calibration/evaluation splitting of "
+                             "the test CSV when no grouped calibration.npz is available.")
     parser.add_argument("--seed", type=int, default=0, help="Seed for the fit/cal/eval split.")
     return parser.parse_args()
 
@@ -235,21 +292,51 @@ def main():
         # and spends most of the only clean held-out set doing it.
         with np.load(calibration_npz, allow_pickle=False) as held:
             X_held, y_held = held["X"], held["y"]
+            if "groups" not in held.files:
+                raise ValueError(f"{calibration_npz} has no saved groups; grouped calibration is required.")
+            groups_held = held["groups"]
+            if "task" in held.files and str(held["task"].item()) != args.task:
+                raise ValueError(f"{calibration_npz} was saved for task {held['task'].item()!r}, "
+                                 f"not requested task {args.task!r}.")
+            if "context_fingerprint" in held.files:
+                expected_fingerprint = str(held["context_fingerprint"].item())
+                actual_fingerprint = context_dt.encoder.fingerprint()
+                if expected_fingerprint != actual_fingerprint:
+                    raise ValueError(f"{calibration_npz} context fingerprint does not match "
+                                     "the loaded context encoder.")
+            expected_provenance = (str(held["provenance_sha256"].item())
+                                   if "provenance_sha256" in held.files else None)
+        if expected_provenance:
+            manifest = Path(calibration_npz).resolve().parent.parent / "run_provenance.json"
+            if manifest.exists():
+                provenance = json.loads(manifest.read_text())
+                actual_provenance = hashlib.sha256(
+                    json.dumps(provenance, sort_keys=True).encode()).hexdigest()
+                if actual_provenance != expected_provenance:
+                    raise ValueError(f"{calibration_npz} provenance hash does not match {manifest}.")
+            else:
+                logger.warning("Calibration NPZ records provenance hash %s, but %s is absent; "
+                               "the provenance could not be independently verified.",
+                               expected_provenance, manifest)
         if X_held.shape[1] != X.shape[1]:
             raise ValueError(
                 f"{calibration_npz} holds {X_held.shape[1]}-column rows but the test table has "
                 f"{X.shape[1]}: the calibration set was built against a different context "
                 f"cache, so refusing to mix the two embedding spaces.")
-        # Halved, because the two steps must not share rows: the conformal quantile has to be
-        # measured on residuals of an ensemble whose weights are already fixed.
-        strat = y_held if is_classification else None
-        X_fit, X_cal, y_fit, y_cal = train_test_split(
-            X_held, y_held, test_size=0.5, random_state=args.seed, stratify=strat)
+        # These subsets must be disjoint by chemical series as well as by row.
+        (X_fit, y_fit, groups_fit), (X_cal, y_cal, groups_cal) = split_fit_cal_by_group(
+            X_held, y_held, groups_held, args.seed, stratify=is_classification)
         X_eval, y_eval = X, y
-        logger.info("Calibration set %s: %d held-out development rows -> %d fit, %d calibrate; "
+        logger.info("Calibration set %s: %d held-out development rows / %d groups -> "
+                    "%d fit (%d groups), %d calibrate (%d groups); "
                     "evaluating on all %d test rows",
-                    calibration_npz, len(y_held), len(y_fit), len(y_cal), len(y_eval))
+                    calibration_npz, len(y_held), len(np.unique(groups_held)), len(y_fit),
+                    len(np.unique(groups_fit)), len(y_cal), len(np.unique(groups_cal)), len(y_eval))
     else:
+        if not args.allow_test_split:
+            raise FileNotFoundError("A grouped calibration.npz is required. Pass --calibration-npz "
+                                    "or explicitly opt into the legacy test split with "
+                                    "--allow-test-split.")
         (X_fit, y_fit), (X_cal, y_cal), (X_eval, y_eval) = split_fit_cal_eval(
             X, y, args.fit_frac, args.cal_frac, args.seed, stratify=is_classification)
         logger.warning("No calibration npz: falling back to splitting the test set itself into "
@@ -257,16 +344,18 @@ def main():
                        "then neither independent of the reported metrics nor numerous enough to "
                        "fit %d stacking weights well.",
                        len(y_fit), len(y_cal), len(y_eval), len(ensemble.models))
+        groups_fit = None
 
-    ensemble.fit(X_fit, y_fit)
+    ensemble.fit(X_fit, y_fit, groups=groups_fit)
     ensemble.calibrate(X_cal, y_cal)
     out = ensemble.predict(X_eval)
+    validate_finite_output(out, y_eval)
 
     if is_classification:
         pred = (out["proba"] >= 0.5).astype(int)
         metrics = classification_metrics(y_eval, out["proba"], pred)
     else:
-        metrics = regression_metrics(y_eval, out["mean"])
+        metrics = regression_uncertainty_metrics(y_eval, out, ensemble.alpha)
     logger.info("Evaluation metrics: %s", json.dumps(metrics, indent=2))
 
     if args.plots_dir:
