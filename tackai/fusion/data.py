@@ -11,7 +11,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -212,7 +212,12 @@ def build_table(files: Sequence[Union[str, Path]]) -> pd.DataFrame:
     for f in files:
         f = Path(f)
         raw = pd.read_csv(f, low_memory=False)
-        units = set(raw["DC50_units"].dropna().unique())
+        # Checked only on the rows whose DC50 is actually read: one without a SMILES is
+        # dropped below, so rejecting the file over its units would refuse data on the
+        # strength of rows that never reach a model. A foreign unit on a usable row is still
+        # an error -- silently reading µg/mL as nM is exactly what this guard is for.
+        has_smiles = raw["SMILES"].notna() & (raw["SMILES"].astype(str).str.strip() != "")
+        units = set(raw.loc[has_smiles & raw["DC50"].notna(), "DC50_units"].dropna().unique())
         if not units <= {"nM"}:
             raise ValueError(f"{f.name}: unexpected DC50 units {units}")
         if "Cell_Line_STD_Accession" in raw:                       # AutoTPD+ layout
@@ -271,8 +276,10 @@ class FusionData:
         # the encoder discovers the context widths from the cached tables.
         self.dims = {**self.featurizer.dims, **self.encoder.dims}
         self.index = block_index(self.dims)
-        self.dropped: Dict[str, int] = {"poi": 0, "e3": 0, "cell": 0, "total": 0,
+        self.dropped: Dict[str, int] = {"poi": 0, "e3": 0, "cell": 0, "smiles": 0, "total": 0,
                                         "read": 0 if table is None else len(table)}
+        #: Rows removed by ``from_csv(exclude_smiles=...)``, before any encodability drop.
+        self.excluded: int = 0
         self._X: Optional[np.ndarray] = None
         self._groups: Optional[np.ndarray] = None
         self._targets: Optional[Dict[str, np.ndarray]] = None
@@ -357,6 +364,7 @@ class FusionData:
                  featurizer: Optional[MolEncoder] = None,
                  descriptors: Optional[Sequence[str]] = DESCRIPTOR_NAMES,
                  cache: bool = True, on_missing: str = "drop",
+                 exclude_smiles: Optional[Iterable[str]] = None,
                  verbose: bool = False) -> "FusionData":
         """Build the design matrix from curated CSVs.
 
@@ -377,6 +385,13 @@ class FusionData:
                 ``TACKAI_CACHE/fusion_blocks/<hash>/``.
             on_missing: ``"drop"`` to discard rows whose context is not in the cache (and
                 record them in :attr:`dropped`), or ``"raise"`` to fail on the first one.
+            exclude_smiles: SMILES whose rows to drop before anything else, counted in
+                :attr:`excluded`. Matched on the stripped string, so the caller decides what
+                counts as the same molecule — canonical SMILES, a connectivity key, an
+                InChIKey — and passes the raw strings that identity selected. The use case is
+                keeping a held-out test set's molecules out of a development table; doing it
+                here rather than by pre-filtering the CSVs keeps the published inputs as the
+                only source of truth.
             verbose: Print how many rows were read, dropped and kept.
 
         Returns:
@@ -384,9 +399,20 @@ class FusionData:
         """
         if on_missing not in {"drop", "raise"}:
             raise ValueError(f"on_missing must be 'drop' or 'raise', got {on_missing!r}")
-        data = cls(build_table(files), encoder=encoder, featurizer=featurizer,
+        table = build_table(files)
+        excluded = 0
+        if exclude_smiles is not None:
+            drop = {str(s).strip() for s in exclude_smiles}
+            keep = ~table["smiles"].astype(str).str.strip().isin(drop)
+            excluded = int((~keep).sum())
+            table = table[keep].reset_index(drop=True)
+            if verbose:
+                print(f"table: {excluded} rows excluded as {len(drop)} given molecule(s)")
+        data = cls(table, encoder=encoder, featurizer=featurizer,
                    descriptors=descriptors)
+        data.excluded = excluded
         if on_missing == "drop":
+            data._drop_unparseable_smiles(verbose=verbose)
             data._drop_unencodable(verbose=verbose)
         data._build_matrix(cache=cache)
         return data
@@ -612,6 +638,25 @@ class FusionData:
                                  protein_space=self.encoder.protein_space)
             return upload_context_tables(staged, repo_id, private, commit_message)
 
+    def _drop_unparseable_smiles(self, verbose: bool = False) -> None:
+        """Remove rows whose SMILES RDKit cannot parse, counted in :attr:`dropped`.
+
+        ``build_table`` already drops a row with no SMILES at all; a string RDKit rejects is
+        the same kind of defect found one step later, and :meth:`_compute_blocks` refuses the
+        whole table over it. Dropping it on the ``on_missing="drop"`` path keeps one bad row
+        in a 12,000-row curation from making the table unbuildable, while
+        :meth:`_compute_blocks` still raises for :meth:`transform`, where a molecule the
+        caller asked about must never be silently discarded.
+        """
+        ok = np.array([Chem.MolFromSmiles(str(s)) is not None for s in self.table["smiles"]],
+                      dtype=bool)
+        n = int((~ok).sum())
+        self.dropped["smiles"] = n
+        if n:
+            if verbose:
+                print(f"table: {n} row(s) dropped for a SMILES RDKit cannot parse")
+            self.table = self.table[ok].reset_index(drop=True)
+
     def _drop_unencodable(self, verbose: bool = False) -> None:
         """Remove rows whose context the cached tables cannot encode, counting them by block."""
         keep = np.ones(len(self.table), dtype=bool)
@@ -620,7 +665,10 @@ class FusionData:
             ok = self.encoder.encodable(block, self.table[column])
             counts[block] = int((~ok).sum())
             keep &= ok
-        self.dropped = {**counts, "total": int((~keep).sum()), "read": len(self.table)}
+        # Merged, not replaced: _drop_unparseable_smiles has already recorded its own count
+        # here, and "read" is the number of rows that reached this stage.
+        self.dropped = {**self.dropped, **counts,
+                        "total": int((~keep).sum()), "read": len(self.table)}
         if verbose:
             print(f"table: {self.dropped['read']} rows read, {self.dropped['total']} dropped "
                   f"(context not in the cache: " +
@@ -629,9 +677,17 @@ class FusionData:
         self.table = self.table[keep].reset_index(drop=True)
 
     def _cache_dir(self) -> Path:
-        """Directory holding this table's cached blocks, keyed by content (never a label)."""
+        """Directory holding this table's cached blocks, keyed by content (never a label).
+
+        The encoder's :meth:`~tackai.fusion.context.ContextEncoder.fingerprint` is part of the
+        key because the block widths and the table rows do not pin the context vectors down: a
+        PCA refitted over a larger vocabulary keeps every name and width and still changes
+        every vector, so without it a table whose rows happen to be unchanged would be served
+        context blocks from the previous embedding space.
+        """
         cols = ["smiles", "e3_seq", "poi_seq", "cell_key", "assay_raw", "assay_time"]
         h = hashlib.sha1(json.dumps([CACHE_VERSION, self.encoder.protein_space,
+                                     self.encoder.fingerprint(),
                                      self.featurizer.radius, self.featurizer.fp_size,
                                      self.featurizer.share_ipc, self.featurizer.descriptors,
                                      sorted(self.dims.items())]).encode())

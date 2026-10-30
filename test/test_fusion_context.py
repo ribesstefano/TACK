@@ -19,16 +19,71 @@ def test_normalize_assay_ported_rules():
     assert normalize_assay("some novel readout") == "some novel readout"
 
 
+def test_normalize_assay_maps_wb_abbreviation():
+    """`wb` is western blot: AutoTPD-TPDdb uses the abbreviation, and without this rule those
+    rows fall back to the "unknown" assay vector instead of the one they share with
+    "western blot"."""
+    assert normalize_assay("WB") == "western blot"
+    assert normalize_assay("wb") == "western blot"
+    assert normalize_assay(" WB ") == "western blot"
+    assert normalize_assay("WB/ELISA") == "elisa + western blot"
+    # Matched as a word, so a longer token that merely contains "wb" is still passed through.
+    assert normalize_assay("wbc count") == "wbc count"
+
+
+def test_sequences_with_non_standard_residues_resolve_to_their_sanitised_key(fake_cache):
+    """The protein tables are keyed by ``sanitize_sequence`` output, so a sequence carrying a
+    non-standard residue has to be looked up through the same normalisation or it is
+    unreachable — which silently dropped 15 AutoTPD-TPDdb rows over one selenocysteine."""
+    enc = ContextEncoder()
+    stored = SEQS["poi"][3]
+    assert "C" in stored
+    raw = stored.replace("C", "U", 1)        # selenocysteine; sanitize_sequence maps U -> C
+    assert raw not in enc.table("poi")
+    assert enc.encodable("poi", [raw]).tolist() == [True]
+    np.testing.assert_array_equal(enc.encode("poi", [raw]), enc.encode("poi", [stored]))
+
+
+def test_sanitisation_agrees_with_the_canonical_implementation():
+    """``context.py`` keeps its own copy to stay free of the torch/h5py imports that
+    ``protein_embeddings`` pulls in; this pins the two together."""
+    from tackai.data.embeddings.protein_embeddings import sanitize_sequence
+    from tackai.fusion.context import _sanitize_sequence_key
+
+    for seq in ["MUOBZJCK", "  MACDEK  ", "MACDEK", "", "UUU"]:
+        assert _sanitize_sequence_key(seq) == sanitize_sequence(seq)
+
+
+def test_fingerprint_tracks_the_content_of_the_tables(fake_cache):
+    """The fingerprint is what lets a derived cache notice that a table was refitted.
+
+    Refitting a PCA over a larger vocabulary leaves the table's name and width alone while
+    changing every vector, so anything caching encoder output has to key on content.
+    """
+    from tackai.fusion.context import CONTEXT_FILES
+
+    enc = ContextEncoder()
+    before = enc.fingerprint()
+    assert before == ContextEncoder().fingerprint()        # same cache, same answer
+
+    path = fake_cache / CONTEXT_FILES["poi"]["table"]
+    with np.load(path) as data:
+        tables = {k: data[k] for k in data.files}
+    tables[next(iter(tables))] += 1.0                      # same keys, same width, new vectors
+    np.savez(path, **tables)
+    assert ContextEncoder().fingerprint() != before
+
+
 def test_dims_match_the_cached_tables(fake_cache):
     enc = ContextEncoder()
-    assert (enc.dim("poi"), enc.dim("e3"), enc.dim("cell"), enc.dim("assay")) == (51, 7, 47, 8)
+    assert (enc.dim("poi"), enc.dim("e3"), enc.dim("cell"), enc.dim("assay")) == (78, 24, 56, 8)
 
 
 def test_sequences_are_looked_up_by_stripped_string(fake_cache):
     enc = ContextEncoder()
     a = enc.encode("poi", [SEQS["poi"][0]])
     b = enc.encode("poi", ["  " + SEQS["poi"][0] + "\n"])
-    assert a.shape == (1, 51) and np.array_equal(a, b)
+    assert a.shape == (1, 78) and np.array_equal(a, b)
 
 
 def test_unseen_sequence_raises_keyerror_naming_the_block(fake_cache):  # Review Focus 1
@@ -81,8 +136,8 @@ def test_register_sequence_projects_a_full_embedding(fake_cache):
 
 def test_combined_space_is_selectable(fake_cache):
     enc = ContextEncoder(protein_space="combined")
-    assert enc.dim("poi") == 52 and enc.dim("e3") == 52
-    assert enc.encode("e3", [SEQS["e3"][0]]).shape == (1, 52)
+    assert enc.dim("poi") == 86 and enc.dim("e3") == 86
+    assert enc.encode("e3", [SEQS["e3"][0]]).shape == (1, 86)
 
 
 def test_encode_context_returns_every_context_block(fake_cache):
@@ -90,7 +145,7 @@ def test_encode_context_returns_every_context_block(fake_cache):
     row = enc.encode_context({"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
                               "cell_id": CELLS[0], "assay": "western blot", "assay_time": 24.0})
     assert set(row) == {"poi", "e3", "cell", "assay", "assay_time"}
-    assert row["poi"].shape == (1, 51) and row["assay_time"].shape == (1, 1)
+    assert row["poi"].shape == (1, 78) and row["assay_time"].shape == (1, 1)
 
 
 def test_missing_assay_time_is_the_24h_default_not_an_error(fake_cache):
@@ -123,6 +178,6 @@ def test_dims_are_discovered_from_the_cached_tables(fake_cache):
     from tackai.fusion.context import CONTEXT_BLOCKS
     per_block = ContextEncoder().dims
     assert list(per_block) == list(CONTEXT_BLOCKS)
-    assert per_block == {"e3": 7, "cell": 47, "poi": 51, "assay": 8, "assay_time": 1}
+    assert per_block == {"e3": 24, "cell": 56, "poi": 78, "assay": 8, "assay_time": 1}
     combined = ContextEncoder(protein_space="combined").dims
-    assert combined["e3"] == combined["poi"] == 52 and combined["cell"] == 47
+    assert combined["e3"] == combined["poi"] == 86 and combined["cell"] == 56

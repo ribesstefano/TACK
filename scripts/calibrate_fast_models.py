@@ -182,17 +182,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-repo-id", default=DEFAULT_CONTEXT_REPO,
                         help="Hub repo id (or local staged directory) of the context "
                              "embedding tables used to encode --test-file.")
+    parser.add_argument("--calibration-npz", default=None,
+                        help="Held-out calibration set written by train_fast_models.py "
+                             "(<model-dir>/calibration.npz). When given, the stacking weights "
+                             "and the conformal quantile are fitted on it and the whole "
+                             "--test-file is used for evaluation. Defaults to that file when "
+                             "it exists next to the models.")
     parser.add_argument("--fit-frac", type=float, default=0.1,
-                        help="Fraction of the test set used to fit the stacking weights.")
+                        help="Only without a calibration npz: fraction of the test set used to "
+                             "fit the stacking weights.")
     parser.add_argument("--cal-frac", type=float, default=0.1,
-                        help="Fraction of the test set used for calibration.")
+                        help="Only without a calibration npz: fraction of the test set used "
+                             "for calibration.")
     parser.add_argument("--seed", type=int, default=0, help="Seed for the fit/cal/eval split.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    if args.fit_frac <= 0 or args.cal_frac <= 0 or args.fit_frac + args.cal_frac >= 1:
+    if not args.calibration_npz and (args.fit_frac <= 0 or args.cal_frac <= 0
+                                     or args.fit_frac + args.cal_frac >= 1):
         raise ValueError("--fit-frac and --cal-frac must each be positive and sum to < 1.")
     if not os.environ.get("HF_TOKEN"):
         logger.warning("HF_TOKEN is not set (looked in %s and the cwd); pushing to a private "
@@ -214,9 +223,40 @@ def main():
         raise ValueError(f"--task {args.task} expects {expected} models, but {args.model_dir} "
                          f"holds {ensemble.task} models.")
 
-    (X_fit, y_fit), (X_cal, y_cal), (X_eval, y_eval) = split_fit_cal_eval(
-        X, y, args.fit_frac, args.cal_frac, args.seed, stratify=is_classification)
-    logger.info("Split: %d fit, %d calibration, %d evaluation", len(y_fit), len(y_cal), len(y_eval))
+    calibration_npz = args.calibration_npz
+    if calibration_npz is None:
+        default = Path(args.model_dir) / "calibration.npz"
+        calibration_npz = str(default) if default.exists() else None
+
+    if calibration_npz:
+        # Fit and calibrate on development rows held out before the CV, and evaluate on the
+        # whole test file. The alternative — carving fit/calibration subsets out of the test
+        # file — fits the stacking weights on a handful of molecules (15 of 158 for activity)
+        # and spends most of the only clean held-out set doing it.
+        with np.load(calibration_npz, allow_pickle=False) as held:
+            X_held, y_held = held["X"], held["y"]
+        if X_held.shape[1] != X.shape[1]:
+            raise ValueError(
+                f"{calibration_npz} holds {X_held.shape[1]}-column rows but the test table has "
+                f"{X.shape[1]}: the calibration set was built against a different context "
+                f"cache, so refusing to mix the two embedding spaces.")
+        # Halved, because the two steps must not share rows: the conformal quantile has to be
+        # measured on residuals of an ensemble whose weights are already fixed.
+        strat = y_held if is_classification else None
+        X_fit, X_cal, y_fit, y_cal = train_test_split(
+            X_held, y_held, test_size=0.5, random_state=args.seed, stratify=strat)
+        X_eval, y_eval = X, y
+        logger.info("Calibration set %s: %d held-out development rows -> %d fit, %d calibrate; "
+                    "evaluating on all %d test rows",
+                    calibration_npz, len(y_held), len(y_fit), len(y_cal), len(y_eval))
+    else:
+        (X_fit, y_fit), (X_cal, y_cal), (X_eval, y_eval) = split_fit_cal_eval(
+            X, y, args.fit_frac, args.cal_frac, args.seed, stratify=is_classification)
+        logger.warning("No calibration npz: falling back to splitting the test set itself into "
+                       "%d fit, %d calibration, %d evaluation. The fit and calibration rows are "
+                       "then neither independent of the reported metrics nor numerous enough to "
+                       "fit %d stacking weights well.",
+                       len(y_fit), len(y_cal), len(y_eval), len(ensemble.models))
 
     ensemble.fit(X_fit, y_fit)
     ensemble.calibrate(X_cal, y_cal)
@@ -242,8 +282,16 @@ def main():
 
     if args.output_dir:
         logger.info("Saving calibrated ensemble to %s", args.output_dir)
-        ensemble.save_pretrained(args.output_dir)
-        (Path(args.output_dir) / "eval_metrics.json").write_text(json.dumps(metrics, indent=2))
+        out_dir = Path(args.output_dir)
+        ensemble.save_pretrained(out_dir)
+        # Written *beside* the ensemble, never inside it: XGBStackedEnsemble._from_pretrained
+        # treats every .json in the directory except config.json as a member file, so a
+        # metrics file in there makes the saved ensemble unloadable ("Invalid cast, from Null
+        # to Object" out of xgboost). The Hub copy never showed this, because push_to_hub
+        # stages through a temporary save_pretrained directory that this file is not in.
+        metrics_path = out_dir.with_name(out_dir.name + "_eval_metrics.json")
+        metrics_path.write_text(json.dumps(metrics, indent=2) + "\n")
+        logger.info("Wrote %s", metrics_path)
 
     if args.repo_id:
         logger.info("Pushing calibrated ensemble to %s (private=%s)", args.repo_id, args.private)

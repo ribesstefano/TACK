@@ -30,16 +30,16 @@ def fake_cache(tmp_path, monkeypatch):
     """A TACKAI_CACHE holding the five npz tables under their real names. Returns the Path."""
     cache = tmp_path / "cache"
     cache.mkdir()
-    _write(cache / CELL_FILE, CELLS + [NOT_FOUND], 47, 1)
-    _write(cache / POI_FILE, SEQS["poi"], 51, 2)
-    _write(cache / COMBINED_FILE, SEQS["poi"] + SEQS["e3"], 52, 3)
-    _write(cache / E3_FILE, SEQS["e3"], 7, 4)
+    _write(cache / CELL_FILE, CELLS + [NOT_FOUND], 56, 1)
+    _write(cache / POI_FILE, SEQS["poi"], 78, 2)
+    _write(cache / COMBINED_FILE, SEQS["poi"] + SEQS["e3"], 86, 3)
+    _write(cache / E3_FILE, SEQS["e3"], 24, 4)
     _write(cache / ASSAY_FILE, ASSAYS, 8, 5)
-    _write_pca_model(cache / CELL_FILE.replace(".npz", "_model.npz"), 768, 47, 6)
-    _write_pca_model(cache / POI_FILE.replace(".npz", "_model.npz"), 640, 51, 7)
-    _write_pca_model(cache / E3_FILE.replace(".npz", "_model.npz"), 640, 7, 8)
+    _write_pca_model(cache / CELL_FILE.replace(".npz", "_model.npz"), 768, 56, 6)
+    _write_pca_model(cache / POI_FILE.replace(".npz", "_model.npz"), 640, 78, 7)
+    _write_pca_model(cache / E3_FILE.replace(".npz", "_model.npz"), 640, 24, 8)
     _write_pca_model(cache / ASSAY_PCA_FILE, 768, 8, 9)
-    _write_pca_model(cache / COMBINED_FILE.replace(".npz", "_model.npz"), 640, 52, 10)
+    _write_pca_model(cache / COMBINED_FILE.replace(".npz", "_model.npz"), 640, 86, 10)
     monkeypatch.setenv("TACKAI_CACHE", str(cache))
     return cache
 

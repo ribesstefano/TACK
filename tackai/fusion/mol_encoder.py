@@ -4,7 +4,7 @@ Inference featurises molecules as they arrive rather than reading a cache, so a 
 loop can score molecules that have never been seen. The values must nevertheless match the
 cached features the models were trained on exactly, which is what
 ``test_bit_exact_with_tackai_mol_embedding`` pins down: same Morgan generator settings, the
-same 217 descriptors in the same order, and the same ``-1`` sentinel for values RDKit cannot
+same 216 descriptors in the same order, and the same ``-1`` sentinel for values RDKit cannot
 produce or that overflow.
 """
 from typing import Callable, Dict, List, Optional, Sequence, Tuple

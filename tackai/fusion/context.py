@@ -67,20 +67,20 @@ _ASSAY_STEM = "vocab=open20_model=all-mpnet-base-v1_pooling=mean"
 #: Block name -> the cached table and its PCA side file.
 CONTEXT_FILES: Dict[str, Dict[str, str]] = {
     "cell": {
-        "table": "cell_embeddings_model=sentence-transformer_pooling=mean_pca47.npz",
-        "pca_model": "cell_embeddings_model=sentence-transformer_pooling=mean_pca47_model.npz",
+        "table": "cell_embeddings_model=sentence-transformer_pooling=mean_pca56.npz",
+        "pca_model": "cell_embeddings_model=sentence-transformer_pooling=mean_pca56_model.npz",
     },
     "poi": {
-        "table": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=poi_pca51.npz",
-        "pca_model": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=poi_pca51_model.npz",
+        "table": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=poi_pca78.npz",
+        "pca_model": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=poi_pca78_model.npz",
     },
     "e3": {
-        "table": f"{_PROTEIN_STEM}_layer=30_pooling=mean_rm_pc2_window=1022_block=e3_pca7.npz",
-        "pca_model": f"{_PROTEIN_STEM}_layer=30_pooling=mean_rm_pc2_window=1022_block=e3_pca7_model.npz",
+        "table": f"{_PROTEIN_STEM}_layer=30_pooling=mean_rm_pc2_window=1022_block=e3_pca24.npz",
+        "pca_model": f"{_PROTEIN_STEM}_layer=30_pooling=mean_rm_pc2_window=1022_block=e3_pca24_model.npz",
     },
     "combined": {
-        "table": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=combined_pca52.npz",
-        "pca_model": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=combined_pca52_model.npz",
+        "table": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=combined_pca86.npz",
+        "pca_model": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=combined_pca86_model.npz",
     },
     "assay": {
         "table": f"assay_embeddings_{_ASSAY_STEM}_pca8.npz",
@@ -314,11 +314,35 @@ def _is_missing(value) -> bool:
         return False
 
 
+#: U -> C (selenocysteine), O -> K (pyrrolysine), B -> D (Asx), Z -> E (Glx), J -> L (Xle).
+_SEQUENCE_REPLACEMENTS = (("U", "C"), ("O", "K"), ("B", "D"), ("Z", "E"), ("J", "L"))
+
+
+def _sanitize_sequence_key(seq) -> str:
+    """Normalise non-standard amino-acid codes, as the embedding generator does.
+
+    A duplicate of :func:`tackai.data.embeddings.protein_embeddings.sanitize_sequence`, kept
+    here on purpose: that module imports ``torch`` and ``h5py`` at module level, and
+    ``tackai.fusion`` is deliberately importable without either.
+    ``test_sanitisation_agrees_with_the_canonical_implementation`` pins the two together.
+    """
+    if not isinstance(seq, str):
+        return ""
+    seq = seq.strip()
+    for old, new in _SEQUENCE_REPLACEMENTS:
+        seq = seq.replace(old, new)
+    return seq
+
+
 def normalize_assay(value) -> str:
     """Normalise a raw assay string to the open-vocabulary key.
 
     Ported from ``notebooks/assay_embeddings.ipynb``: text no rule recognises is passed
     through, so the vocabulary grows with the data instead of collapsing to "other".
+
+    Abbreviations are folded into the canonical type they stand for — ``"wb"`` is western
+    blot — because an unrecognised key falls back to the "unknown" vector and so throws away
+    a signal the vocabulary already holds.
 
     Args:
         value: Raw assay description, possibly missing.
@@ -351,7 +375,9 @@ def normalize_assay(value) -> str:
         return "in-cell immunoassay + western blot" if "/western blot" in text else "in-cell immunoassay"
     if "dot blot" in text:
         return "dot blot"
-    western = "western" in text or "immunoblot" in text
+    # "wb" is matched as a whole word, not a substring: it is the abbreviation AutoTPD-TPDdb
+    # uses, but it also occurs inside unrelated tokens ("wbc"), which must still pass through.
+    western = "western" in text or "immunoblot" in text or re.search(r"\bwb\b", text) is not None
     if western and "elisa" in text:
         return "elisa + western blot"
     if western:
@@ -400,6 +426,38 @@ class ContextEncoder:
         if block not in CONTEXT_FILES:
             raise KeyError(f"unknown context block {block!r}")
         return CONTEXT_FILES[block]
+
+    def _lookup_key(self, block: str, key, table: Dict[str, np.ndarray]) -> str:
+        """The table key a raw key resolves to: the stripped string, or, for a protein block
+        that does not hold it, its sanitised form.
+
+        The protein tables are keyed by sanitised sequences, so a sequence carrying a
+        non-standard residue is stored under a key the stripped string never matches. The
+        stripped form is still tried first, so a table holding the raw string keeps working.
+        """
+        name = str(key).strip()
+        if name in table or block not in SEQUENCE_BLOCKS:
+            return name
+        sanitized = _sanitize_sequence_key(name)
+        return sanitized if sanitized in table else name
+
+    def fingerprint(self) -> str:
+        """Short content hash of the cached tables this encoder reads.
+
+        Names and widths do not identify a table: refitting a PCA over a larger vocabulary
+        keeps both and changes every vector. Anything that caches the output of this encoder
+        has to include this in its key, or it serves vectors from a space that no longer
+        exists — see :meth:`~tackai.fusion.data.FusionData._cache_dir`.
+
+        Returns:
+            The first 12 hex characters of a sha256 over the protein space and the content of
+            every block table, in a fixed order.
+        """
+        h = hashlib.sha256(self.protein_space.encode())
+        for name in sorted({self.files(b)["table"] for b in CONTEXT_BLOCKS if b != "assay_time"}):
+            h.update(name.encode())
+            h.update(sha256_of(self.cache_dir / name).encode())
+        return h.hexdigest()[:12]
 
     def table(self, block: str) -> Dict[str, np.ndarray]:
         """The block's lookup table, loaded once and kept."""
@@ -479,7 +537,7 @@ class ContextEncoder:
                     raise KeyError(f"{block}: a sequence is required, got a missing value")
                 rows.append(table[self.NOT_FOUND])
                 continue
-            name = str(key).strip()
+            name = self._lookup_key(block, key, table)
             if name not in table:
                 raise KeyError(
                     f"{block}: {'sequence' if block in SEQUENCE_BLOCKS else 'key'} not in the "
@@ -512,7 +570,7 @@ class ContextEncoder:
             if _is_missing(key):
                 out.append(block == "cell")        # a missing cell line has a vector; a sequence does not
             else:
-                out.append(str(key).strip() in table)
+                out.append(self._lookup_key(block, key, table) in table)
         return np.array(out, dtype=bool)
 
     def _encode_assay(self, raws: Sequence) -> np.ndarray:

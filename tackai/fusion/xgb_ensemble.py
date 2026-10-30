@@ -27,7 +27,8 @@ from scipy.special import expit, log_expit, log_softmax, logit, logsumexp, softm
 EPS = 1e-6  # probability clipping
 CONFIG = "config.json"
 MODEL_SUFFIXES = {".json", ".ubj"}
-HPARAMS = ("lambdas", "n_restarts", "n_folds", "sigma_floor_ratio", "alpha", "seed")
+HPARAMS = ("lambdas", "n_restarts", "n_folds", "sigma_floor_ratio", "sigma_ceiling_ratio",
+           "alpha", "seed")
 STATE = ("weights_", "sigmas_", "lambda_", "q_hat_", "temperature_")
 
 
@@ -113,7 +114,8 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
     """
 
     def __init__(self, models, *, sigma="constant", lambdas=(0.0, 0.01, 0.1, 1.0, 10.0),
-                 n_restarts=5, n_folds=5, sigma_floor_ratio=1e-3, alpha=0.1, seed=0):
+                 n_restarts=5, n_folds=5, sigma_floor_ratio=1e-3, sigma_ceiling_ratio=10.0,
+                 alpha=0.1, seed=0):
         if sigma != "constant":
             # TODO: input-dependent sigma_i(x): quantile pair (B), residual model (C),
             # distributional boosting (D). They would enter as s_i * sigma_i(x).
@@ -121,7 +123,8 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
         self.models = list(models)
         self.task = _infer_task(self.models)
         self.lambdas, self.n_restarts, self.n_folds = list(lambdas), n_restarts, n_folds
-        self.sigma_floor_ratio, self.alpha, self.seed = sigma_floor_ratio, alpha, seed
+        self.sigma_floor_ratio, self.sigma_ceiling_ratio = sigma_floor_ratio, sigma_ceiling_ratio
+        self.alpha, self.seed = alpha, seed
         n = len(self.models)
         self.weights_, self.sigmas_ = np.full(n, 1 / n), np.zeros(n)  # uniform, unknown noise
         self.lambda_ = self.q_hat_ = self.temperature_ = None
@@ -259,13 +262,32 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
         self.q_hat_ = self.temperature_ = None
         return self
 
+    def _sigma_bounds(self, y, n):
+        """L-BFGS-B bounds for `[logits, log sigma]`: the logits free, log sigma boxed.
+
+        The ceiling is the half that is easy to forget and expensive to omit. A member whose
+        weight collapses toward zero contributes nothing to the likelihood, so its sigma is
+        unidentifiable and the surface is flat along it; with no upper bound the optimiser
+        drifts that coordinate arbitrarily high. The noise term is `weights_ @ sigmas_**2`,
+        so a 1e-6 weight beside a 1e11 sigma still dominates every prediction -- which is how
+        a published pdc50 ensemble ended up reporting a std of 5.8e7 on a target spanning
+        4 to 11.5, and a conformal interval covering 66% at a nominal 90%.
+
+        Both bounds are relative to the spread of `y`: a noise term far above the target's own
+        standard deviation describes a member that predicts nothing, which the weights already
+        express, and the Gaussian is effectively flat out there anyway.
+        """
+        floor = max(self.sigma_floor_ratio * y.std(), 1e-12)
+        ceiling = max(self.sigma_ceiling_ratio * y.std(), floor * 1e3)
+        return [(None, None)] * n + [(np.log(floor), np.log(ceiling))] * n
+
     def _optimise(self, preds, y, lam, rng):
         n = preds.shape[1]
-        if self.task == "regression":  # non-convex in sigma: restarts and a variance floor
-            floor = max(self.sigma_floor_ratio * y.std(), 1e-12)
+        if self.task == "regression":  # non-convex in sigma: restarts and a bounded variance
+            bounds = self._sigma_bounds(y, n)
+            floor, ceiling = np.exp(bounds[n][0]), np.exp(bounds[n][1])
             rmse = np.sqrt(np.mean((y[:, None] - preds) ** 2, axis=0))
-            tail, n_starts = np.log(np.maximum(rmse, floor)), self.n_restarts
-            bounds = [(None, None)] * n + [(np.log(floor), None)] * n
+            tail, n_starts = np.log(np.clip(rmse, floor, ceiling)), self.n_restarts
         else:  # convex: one run from uniform weights
             tail, n_starts, bounds = np.empty(0), 1, None
         thetas = [np.zeros(n)] + [rng.normal(0, 0.5, n) for _ in range(n_starts - 1)]

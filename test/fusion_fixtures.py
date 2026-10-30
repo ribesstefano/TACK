@@ -9,17 +9,17 @@ from tackai.fusion.data import BLOCK_ORDER, block_index  # noqa: F401  (re-expor
 
 #: Widths of a FusionData built on the synthetic cache below and the default featuriser.
 #: ``test_fusion_data.py`` checks that they agree with what the library discovers.
-BLOCK_DIMS = {"fingerprint": 1024, "descriptors": 217, "e3": 7, "cell": 47, "poi": 51,
+BLOCK_DIMS = {"fingerprint": 1024, "descriptors": 216, "e3": 24, "cell": 56, "poi": 78,
               "assay": 8, "assay_time": 1}
 DEFAULT_BLOCKS = block_index(BLOCK_DIMS)
 
-CELL_FILE = "cell_embeddings_model=sentence-transformer_pooling=mean_pca47.npz"
+CELL_FILE = "cell_embeddings_model=sentence-transformer_pooling=mean_pca56.npz"
 POI_FILE = ("protein_embeddings_esm_model=facebook-esm2_t30_150M_UR50D_layer=18"
-            "_pooling=lse_window=1022_block=poi_pca51.npz")
+            "_pooling=lse_window=1022_block=poi_pca78.npz")
 COMBINED_FILE = ("protein_embeddings_esm_model=facebook-esm2_t30_150M_UR50D_layer=18"
-                 "_pooling=lse_window=1022_block=combined_pca52.npz")
+                 "_pooling=lse_window=1022_block=combined_pca86.npz")
 E3_FILE = ("protein_embeddings_esm_model=facebook-esm2_t30_150M_UR50D_layer=30"
-           "_pooling=mean_rm_pc2_window=1022_block=e3_pca7.npz")
+           "_pooling=mean_rm_pc2_window=1022_block=e3_pca24.npz")
 ASSAY_FILE = "assay_embeddings_vocab=open20_model=all-mpnet-base-v1_pooling=mean_pca8.npz"
 ASSAY_PCA_FILE = "assay_pca_vocab=open20_model=all-mpnet-base-v1_pooling=mean_pca8.npz"
 

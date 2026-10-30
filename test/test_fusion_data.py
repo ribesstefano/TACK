@@ -115,7 +115,8 @@ def test_assemble_broadcasts_one_context_over_many_smiles(fake_cache, tiny_csv):
     data = FusionData.from_csv([tiny_csv], cache=False)
     ctx = data.transform_context({"poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
                                "cell_id": CELLS[0], "assay": "western blot", "assay_time": 24.0})
-    X = data.assemble(ctx, SMILES[:4])
+    # assemble(smiles, context) -- note the order differs from assemble_features(context, ...).
+    X = data.assemble(SMILES[:4], ctx)
     assert X.shape == (4, N_COLS)
     assert np.array_equal(X[:, data.context_columns], np.repeat(ctx, 4, axis=0))
     direct = data.transform([{"smiles": s, "poi_seq": SEQS["poi"][0], "e3_seq": SEQS["e3"][0],
@@ -174,6 +175,97 @@ def test_from_csv_drops_rows_whose_context_is_not_in_the_cache(fake_cache, tmp_p
     assert len(data.table) == 2 and data.X.shape[0] == 2
     assert data.dropped["total"] == 4
     assert data.dropped["poi"] == 2 and data.dropped["cell"] == 1 and data.dropped["e3"] == 1
+
+
+def _csv_with_foreign_dc50_units(tmp_path, with_smiles):
+    """A CSV carrying one DC50 in µg/mL, with or without a SMILES on that row."""
+    import pandas as pd
+    rows = [{"SMILES": SMILES[0], "Recruiter": "CRBN", "Recruiter_Sequence": SEQS["e3"][0],
+             "Degradation_Target_Uniprot": "P00001", "Degradation_Target_Sequence": SEQS["poi"][0],
+             "Cell_Line_ID": CELLS[0], "Cell_Line": "HeLa", "Assay": "western blot",
+             "DC50": 100.0, "DC50_units": "nM", "DC50_h": 24.0, "Dmax_h": 24.0, "Dmax": 90.0},
+            {"SMILES": SMILES[1] if with_smiles else None, "Recruiter": "VHL",
+             "Recruiter_Sequence": SEQS["e3"][1], "Degradation_Target_Uniprot": "P00002",
+             "Degradation_Target_Sequence": SEQS["poi"][1], "Cell_Line_ID": CELLS[1],
+             "Cell_Line": "HeLa", "Assay": "western blot",
+             "DC50": 2.5, "DC50_units": "µg/mL", "DC50_h": 24.0, "Dmax_h": 24.0, "Dmax": 80.0}]
+    path = tmp_path / f"units_{'with' if with_smiles else 'without'}_smiles.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+    return path
+
+
+def test_foreign_dc50_units_are_ignored_on_rows_without_a_smiles(fake_cache, tmp_path):
+    """A unit the builder cannot read must not reject rows it was going to discard anyway.
+
+    AutoTPDplus-PROTAC.csv carries 15 DC50 values in µg/mL, none of them on a row with a
+    SMILES; refusing the whole file over them made it unloadable.
+    """
+    data = FusionData.from_csv([_csv_with_foreign_dc50_units(tmp_path, with_smiles=False)],
+                               cache=False)
+    assert len(data.table) == 1
+    assert data.table["dc50_nM"].tolist() == [100.0]
+
+
+def test_foreign_dc50_units_still_raise_when_the_row_is_used(fake_cache, tmp_path):
+    """The guard keeps its point: a DC50 that would be read in the wrong unit is an error."""
+    with pytest.raises(ValueError, match=r"DC50 units"):
+        FusionData.from_csv([_csv_with_foreign_dc50_units(tmp_path, with_smiles=True)],
+                            cache=False)
+
+
+def test_from_csv_drops_a_smiles_rdkit_cannot_parse(fake_cache, tmp_path):
+    """One unparseable SMILES must not make a 12,000-row curation unbuildable.
+
+    `_compute_blocks` still raises, so `transform` never silently discards a molecule the
+    caller asked about -- this is only the development-table path.
+    """
+    import pandas as pd
+    rows = []
+    for i, smi in enumerate([SMILES[0], "not a molecule", SMILES[1]]):
+        rows.append({"SMILES": smi, "Recruiter": "CRBN", "Recruiter_Sequence": SEQS["e3"][0],
+                     "Degradation_Target_Uniprot": "P00001",
+                     "Degradation_Target_Sequence": SEQS["poi"][0],
+                     "Cell_Line_ID": CELLS[0], "Cell_Line": "HeLa", "Assay": "western blot",
+                     "DC50": 100.0, "DC50_units": "nM", "DC50_h": 24.0, "Dmax_h": 24.0,
+                     "Dmax": 90.0})
+    path = tmp_path / "unparseable.csv"
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+    data = FusionData.from_csv([path], cache=False)
+    assert data.dropped["smiles"] == 1
+    assert len(data.table) == 2 and data.X.shape[0] == 2
+    assert "not a molecule" not in set(data.smiles)
+
+
+def test_from_csv_excludes_given_molecules(fake_cache, tiny_csv):
+    """`exclude_smiles` keeps test-set molecules out of a development table.
+
+    The caller decides molecule identity (canonical SMILES, connectivity key, ...) and hands
+    over the raw strings to drop, so every row of an excluded molecule goes, not just the rows
+    whose SMILES string happens to match character for character.
+    """
+    full = FusionData.from_csv([tiny_csv], cache=False)
+    dropped_smiles = {SMILES[0], SMILES[3]}
+    data = FusionData.from_csv([tiny_csv], cache=False, exclude_smiles=dropped_smiles)
+
+    assert set(data.smiles).isdisjoint(dropped_smiles)
+    assert len(data.table) == len(full.table) - sum(s in dropped_smiles for s in full.smiles)
+    # Compared against the unfiltered table rather than N_COLS, so this does not also assert
+    # the descriptor count.
+    assert data.X.shape == (len(data.table), full.X.shape[1])
+    assert data.excluded == len(full.table) - len(data.table) > 0
+
+
+def test_exclude_smiles_matches_on_the_stripped_string(fake_cache, tiny_csv):
+    """Whitespace around a SMILES must not let an excluded molecule back in."""
+    data = FusionData.from_csv([tiny_csv], cache=False,
+                               exclude_smiles=["  " + SMILES[0] + "\n"])
+    assert SMILES[0] not in set(data.smiles)
+
+
+def test_exclude_smiles_none_changes_nothing(fake_cache, tiny_csv):
+    data = FusionData.from_csv([tiny_csv], cache=False, exclude_smiles=None)
+    assert len(data.table) == 24 and data.excluded == 0
 
 
 def test_from_csv_can_raise_instead_of_dropping(fake_cache, tmp_path):
@@ -242,7 +334,7 @@ def test_the_layout_is_discovered_not_assumed(fake_cache, tiny_csv):
                       encoder=ContextEncoder(protein_space="combined"))
     assert wide.dims == {**MolEncoder(fp_size=256).dims, **ContextEncoder(
         protein_space="combined").dims}
-    assert wide.dims["fingerprint"] == 256 and wide.dims["poi"] == wide.dims["e3"] == 52
+    assert wide.dims["fingerprint"] == 256 and wide.dims["poi"] == wide.dims["e3"] == 86
     assert wide.n_columns == sum(wide.dims.values())
     assert np.array_equal(np.concatenate(list(wide.blocks_indexes.values())),
                           np.arange(wide.n_columns))
