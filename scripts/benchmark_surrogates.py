@@ -15,7 +15,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 import numpy as np
 import optuna
 import pandas as pd
-from scipy.stats import spearmanr
+from scipy.stats import gaussian_kde, spearmanr
 from sklearn.dummy import DummyClassifier, DummyRegressor
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
 from sklearn.impute import SimpleImputer
@@ -69,8 +69,27 @@ def estimator(family, classification, params, jobs, seed):
     options = dict(n_estimators=400, max_depth=4, learning_rate=.05,
                    subsample=.85, colsample_bytree=.8, min_child_weight=5.,
                    reg_lambda=10., tree_method="hist", n_jobs=jobs, random_state=seed)
-    options.update(params)
+    options.update({k: v for k, v in params.items() if k != "alpha_w"})
     return cls(**options)
+
+
+def fit_learner(model, family, X, y, params, classification):
+    """Reproduce current recipe weighting only for the corrected B1 comparator."""
+    if family != "current_xgb":
+        return model.fit(X, y)
+    if classification:
+        model.set_params(scale_pos_weight=float((y == 0).sum() / max((y == 1).sum(), 1)))
+        return model.fit(X, y)
+    weights = np.ones(len(y))
+    if np.std(y) > 1e-12 and len(np.unique(y)) >= 3:
+        try:
+            density = gaussian_kde(y)(y)
+            weights = np.clip(density, 1e-12, None) ** -params.get("alpha_w", 1.)
+            weights = np.minimum(weights, 10 * np.median(weights))
+            weights /= weights.mean()
+        except np.linalg.LinAlgError:
+            pass
+    return model.fit(X, y, sample_weight=weights)
 
 
 def predict(model, X, classification):
@@ -83,6 +102,17 @@ def predict(model, X, classification):
 
 
 def suggest(trial, family, classification):
+    if family == "current_xgb":
+        params = dict(max_depth=trial.suggest_int("max_depth", 3, 10),
+                      n_estimators=trial.suggest_int("n_estimators", 50, 2000, log=True),
+                      learning_rate=trial.suggest_float("learning_rate", .001, .3, log=True),
+                      subsample=trial.suggest_float("subsample", .6, 1.),
+                      colsample_bytree=trial.suggest_float("colsample_bytree", .6, 1.),
+                      min_child_weight=trial.suggest_float("min_child_weight", 1., 20., log=True),
+                      reg_lambda=trial.suggest_float("reg_lambda", .001, 10., log=True))
+        if not classification:
+            params["alpha_w"] = trial.suggest_float("alpha_w", 0., 1.)
+        return params
     if family == "xgb":
         params = dict(max_depth=trial.suggest_int("max_depth", 2, 8),
                       n_estimators=trial.suggest_int("n_estimators", 100, 1200, log=True),
@@ -109,7 +139,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--task", choices=["dmax", "pdc50", "activity"], required=True)
     parser.add_argument("--feature", default="baseline")
-    parser.add_argument("--model", choices=["dummy", "linear", "xgb", "extratrees", "catboost"], default="xgb")
+    parser.add_argument("--model", choices=["dummy", "linear", "xgb", "current_xgb", "extratrees", "catboost"], default="xgb")
     parser.add_argument("--policy", choices=["compat", "exact"], default="compat")
     parser.add_argument("--eval-policy", choices=["compat", "exact"], default="exact")
     parser.add_argument("--trials", type=int, default=20)
@@ -163,7 +193,7 @@ def main():
         seed = 20261030 + number
         start = time.monotonic()
         best = {}
-        if args.trials and args.model in {"xgb", "linear"}:
+        if args.trials and args.model in {"xgb", "current_xgb", "linear"}:
             inner = make_splits(y[train], groups[train], 1, 3, seeds=[seed])[0]
             def objective(trial):
                 params = suggest(trial, args.model, classification)
@@ -174,17 +204,23 @@ def main():
                     if not len(vi) or (classification and len(np.unique(y[ti])) < 2):
                         raise ValueError("Insufficient labels in grouped inner fold")
                     model = estimator(args.model, classification, params, args.jobs, seed)
-                    model.fit(X[ti], y[ti])
+                    fit_learner(model, args.model, X[ti], y[ti], params, classification)
                     pred = predict(model, X[vi], classification)
-                    losses.append(-average_precision_score(yeval[vi], pred) if classification
-                                  else np.sqrt(mean_squared_error(yeval[vi], pred)))
+                    if args.model == "current_xgb" and args.task == "dmax":
+                        rare = yeval[vi] <= np.quantile(y[ti], .1)
+                        losses.append(float(np.mean([
+                            np.sqrt(mean_squared_error(yeval[vi][mask], pred[mask]))
+                            for mask in (rare, ~rare) if mask.sum() > 1])))
+                    else:
+                        losses.append(-average_precision_score(yeval[vi], pred) if classification
+                                      else np.sqrt(mean_squared_error(yeval[vi], pred)))
                 return float(np.mean(losses))
             study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=seed))
             study.optimize(objective, n_trials=args.trials)
             best = study.best_params
             study.trials_dataframe().to_csv(args.output / f"{name}_trials.csv", index=False)
         model = estimator(args.model, classification, best, args.jobs, seed)
-        model.fit(X[train], y[train])
+        fit_learner(model, args.model, X[train], y[train], best, classification)
         pred = predict(model, X[val], classification)
         if not np.isfinite(pred).all():
             raise ValueError("Nonfinite model predictions")

@@ -78,6 +78,24 @@ source prevalence baseline is 0.2561. Dmax source RMSE for the initial XGBoost
 baseline is 0.3368 versus 0.2917 for the development-mean dummy. These are pilot
 results, not a tuned comparison or a confidence interval.
 
+### Follow-up experiments
+
+The same source-holdout activity rows show a large improvement under exact-label
+training: ExtraTrees AP rises from 0.2675 to 0.5526; XGBoost with the original
+molecular features rises from 0.2330 to 0.5220. This is evidence for investigating
+label handling, not proof that all generalization issues have been resolved.
+
+- **4642949:** three tuned corrected-B1 baseline jobs are running (20 trials per
+  outer/source fold). The comparator retains the current recipe's search space,
+  density weighting and classification weighting, with grouped inner folds and
+  training-only rare-region thresholds. Evaluation uses the same exact-label
+  rows as the new candidates. Five benchmark tests passed before training.
+- **4643011:** paired group-bootstrap summary of all completed pilot candidates
+  is queued; output is `models/research_pilot_summary.json` (500 draws for this
+  screening report). It explicitly lists incomplete original jobs.
+- The initial implementation is committed as `a78e635`; model/cache artifacts
+  remain ignored and production artifacts remain untouched.
+
 ## Outstanding work before completion
 
 1. Finish and summarize all pilots with pooled out-of-fold scores and paired

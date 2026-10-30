@@ -88,6 +88,7 @@ def main():
             results.append(row)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({"results": results, "incomplete": incomplete,
+                                      "bootstrap_draws": args.draws, "bootstrap_seed": 20261030,
                                       "note": "Development-only fixed-parameter pilot; not final model selection."},
                                      indent=2, allow_nan=False) + "\n")
     print(f"Summarized {len(candidates)} completed candidates; {len(incomplete)} incomplete")
