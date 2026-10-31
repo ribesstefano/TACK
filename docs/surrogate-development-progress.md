@@ -116,3 +116,73 @@ label handling, not proof that all generalization issues have been resolved.
 
 No objective-completion claim is supported yet. Keep expensive ignored artifacts,
 job logs and frozen data in project storage; do not add them to Git.
+
+## 2026-10-31: tuned comparisons and deployment preparation
+
+This section supersedes the running/queued statuses in the October 30 notes.
+The corrected baseline, original/exact pilots, CatBoost/ablation pilots, and
+single/shared MLP pilots have completed. Their outputs are still development
+experiments; no confirmation or new historical-test evaluation has been run.
+
+- **4685712:** six tuned shortlist configurations submitted; first three tasks
+  running and remaining three pending at the latest inspection. Do not duplicate
+  these jobs. They compare ExtraTrees/CatBoost for Dmax/activity and radius-2/3
+  XGBoost for pDC50, with exact training labels.
+- **4685802:** 14 benchmark/paired-summary tests passed. The summarizer now accepts
+  an explicit reference root, checks matching rows, labels, groups and folds,
+  rejects incomplete repeats and group-crossing folds, and identifies comparator
+  paths in each result.
+- **4685807:** completed comparison of 79 candidates against the tuned B1 baseline
+  with 1,000 paired bootstrap draws. The two failed original dummy runs remain
+  explicitly incomplete; their successful retry artifacts are included.
+  Evidence: `models/research_tuned_comparison.json`.
+- **4685823:** consolidated research/fusion regression checks passed: **96 tests**
+  in 18.80 seconds, including masked neural supervision and artifact round trips.
+- **4685835:** development slice reports generated; two slice tests passed.
+  They read metadata and existing development predictions only, reject rows from
+  reserved partitions, retain group counts and flag small slices. Subsequent
+  reports add paired E3 intervals and a CatBoost activity comparison.
+
+### Paired results against the tuned baseline
+
+All CV values here are pooled out-of-fold metrics, not means of fold metrics.
+Positive differences indicate improvement; intervals are percentile bootstrap
+intervals conditional on these development experiments, not corrections for
+search over many candidate models.
+
+| Candidate | View | Candidate / baseline | Improvement, 95% bootstrap interval |
+|---|---|---|---|
+| Exact ExtraTrees Dmax | CV RMSE | 0.2095 / 0.2111 | 0.0016 [−0.0063, 0.0082] |
+| Exact ExtraTrees Dmax | Source RMSE | 0.2869 / 0.3022 | 0.0154 [0.0034, 0.0252] |
+| Exact radius-3/4096 XGBoost pDC50 | CV RMSE | 0.7348 / 0.8086 | 0.0738 [0.0506, 0.0971] |
+| Exact radius-3/4096 XGBoost pDC50 | Source RMSE | 1.0410 / 1.0813 | 0.0403 [−0.0145, 0.1063] |
+| Exact ExtraTrees activity | CV AP | 0.7361 / 0.7244 | 0.0117 [−0.0110, 0.0342] |
+| Exact ExtraTrees activity | Source AP | 0.5526 / 0.2610 | 0.2916 [0.0156, 0.4382] |
+
+The activity source gain hides an important E3 difference. CRBN AP improves from
+0.2599 to 0.5915 (636 rows, 31 publication groups), but VHL falls from 0.4456 to
+0.3088 (75 rows, 21 publication groups). This matters because the historical test
+is VHL-heavy. Do not promote the aggregate winner without addressing this slice.
+Dmax's AR and BTK source slices also regress despite aggregate improvement.
+
+### Remaining implementation work now underway
+
+A separate Chemprop graph probe replaces only the molecular fingerprint branch.
+It is explicitly a partial pilot (one chemical fold plus source evaluation), not
+full cross-validation. Initial smoke tests exposed API/forward/loss issues; fix
+and rerun them before accepting any graph result. Graph dependency additions are
+restricted to the research extra. The lock retains existing dependency versions;
+the local tackai metadata is corrected from stale 1.0.0 to 2.0.0.
+
+A portable, torch-free candidate artifact for alternative tree learners is under
+review. In particular, any residual scale used by normalized conformal scores
+must be fitted on stacking/training data and frozen **before** conformal calibration.
+Fitting that scale on the same conformal labels would invalidate the intended
+split-conformal interpretation. Prediction pooling must preserve each estimator's
+actual semantics, and activity entropy outputs must remain coherent after scaling.
+These artifacts have not yet been integrated into serving or fitted as final models.
+
+The [updated review plan](model-development-plan-2026-10-31.md) records current
+evidence and priorities. The original objective still includes repeated finalist
+evaluation, independent calibration/confirmation, portable inference, HTTP/TACKOS
+verification, latency measurement and a model card. None is waived by pilot gains.

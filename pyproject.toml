@@ -35,6 +35,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Development-only comparisons; serving existing tree artifacts does not need these.
+research = [
+    "catboost>=1.2.8",
+    "chemprop>=2.3.1,<2.4",
+    "optuna>=4.0.0",
+]
 # torch, for the GP surrogate (`tackai.fusion.gp.GPInteraction` /
 # `AdditiveProductGP`) and the generic `tackai.fusion.ensemble.FusionEnsemble`
 # that imports it. `tackai.fusion.data.FusionData` and

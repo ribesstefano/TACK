@@ -58,13 +58,17 @@ def estimator(family, classification, params, jobs, seed):
         return make_pipeline(SimpleImputer(), StandardScaler(), model)
     if family == "extratrees":
         cls = ExtraTreesClassifier if classification else ExtraTreesRegressor
-        return cls(n_estimators=300, min_samples_leaf=3, max_features=.7,
-                   n_jobs=jobs, random_state=seed, **params)
+        options = dict(n_estimators=300, min_samples_leaf=3, max_features=.7,
+                       n_jobs=jobs, random_state=seed)
+        options.update(params)
+        return cls(**options)
     if family == "catboost":
         from catboost import CatBoostClassifier, CatBoostRegressor
         cls = CatBoostClassifier if classification else CatBoostRegressor
-        return cls(iterations=500, depth=6, learning_rate=.05, thread_count=jobs,
-                   random_seed=seed, verbose=False, allow_writing_files=False, **params)
+        options = dict(iterations=500, depth=6, learning_rate=.05, thread_count=jobs,
+                       random_seed=seed, verbose=False, allow_writing_files=False)
+        options.update(params)
+        return cls(**options)
     cls = xgb.XGBClassifier if classification else xgb.XGBRegressor
     options = dict(n_estimators=400, max_depth=4, learning_rate=.05,
                    subsample=.85, colsample_bytree=.8, min_child_weight=5.,
@@ -102,6 +106,15 @@ def predict(model, X, classification):
 
 
 def suggest(trial, family, classification):
+    if family == "extratrees":
+        return dict(min_samples_leaf=trial.suggest_int("min_samples_leaf", 1, 16, log=True),
+                    max_features=trial.suggest_float("max_features", .25, 1.),
+                    max_depth=trial.suggest_categorical("max_depth", [None, 8, 16, 24]))
+    if family == "catboost":
+        return dict(iterations=trial.suggest_int("iterations", 200, 1000, log=True),
+                    depth=trial.suggest_int("depth", 4, 8),
+                    learning_rate=trial.suggest_float("learning_rate", .015, .15, log=True),
+                    l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1., 30., log=True))
     if family == "current_xgb":
         params = dict(max_depth=trial.suggest_int("max_depth", 3, 10),
                       n_estimators=trial.suggest_int("n_estimators", 50, 2000, log=True),
@@ -176,6 +189,8 @@ def main():
     config.update(snapshot_hash=sha256(args.snapshot / "manifest.json"),
                   runner_hash=sha256(__file__),
                   versions={k: importlib.metadata.version(k) for k in ("scikit-learn", "xgboost", "optuna")})
+    if args.model == "catboost":
+        config["versions"]["catboost"] = importlib.metadata.version("catboost")
     write_once_json(args.output / "config.json", config)
     # Shared outer folds are independent of endpoint label availability and values.
     shared = make_splits(np.zeros(len(search)), groups[search], args.repeats, args.folds)
@@ -193,7 +208,7 @@ def main():
         seed = 20261030 + number
         start = time.monotonic()
         best = {}
-        if args.trials and args.model in {"xgb", "current_xgb", "linear"}:
+        if args.trials and args.model in {"xgb", "current_xgb", "linear", "extratrees", "catboost"}:
             inner = make_splits(y[train], groups[train], 1, 3, seeds=[seed])[0]
             def objective(trial):
                 params = suggest(trial, args.model, classification)
