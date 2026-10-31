@@ -211,3 +211,45 @@ The [updated review plan](model-development-plan-2026-10-31.md) records current
 evidence and priorities. The original objective still includes repeated finalist
 evaluation, independent calibration/confirmation, portable inference, HTTP/TACKOS
 verification, latency measurement and a model card. None is waived by pilot gains.
+
+## Tuned shortlist and repeated evaluation
+
+All six tasks of array **4685712** completed, as did the three bound-established
+activity label pilots in **4685919**. Paired summary **4693035** covers all nine
+completed runs against the tuned current-recipe baseline; evidence is in
+`models/research_tuned_shortlist_comparison.json`. Intervals are paired chemical
+component bootstrap for CV and publication bootstrap for the source split.
+
+| Candidate | Pooled CV / baseline | Source / baseline | Source improvement, 95% interval |
+|---|---|---|---|
+| pDC50 tuned XGB radius 2, 2048 | RMSE 0.7185 / 0.8086 | 1.0667 / 1.0813 | 0.0147 [−0.0579, 0.1016] |
+| pDC50 tuned XGB radius 3, 4096 | RMSE 0.7241 / 0.8086 | 1.0424 / 1.0813 | 0.0389 [−0.0215, 0.1131] |
+| Dmax tuned ExtraTrees | RMSE 0.2088 / 0.2111 | 0.2827 / 0.3022 | 0.0196 [0.0045, 0.0286] |
+| Activity tuned ExtraTrees | AP 0.7459 / 0.7244 | 0.5566 / 0.2610 | 0.2956 [−0.0157, 0.4269] |
+
+The activity source interval spans zero despite its large point estimate. The
+bound-established activity label pilots produced source AP 0.4005 (ExtraTrees),
+0.3067 (CatBoost) and 0.3065 (XGBoost), versus 0.5566 for tuned exact ExtraTrees;
+these are not matched-tuning comparisons and do not justify dropping censoring
+research generally.
+
+The graph partial pilot **4685914** completed. One shared-model chemical fold has
+Dmax RMSE 0.2148, pDC50 RMSE 0.8053 and activity AP 0.7410. The source scores are
+0.3357, 1.1558 and 0.3539 respectively. It does not provide evidence to promote a
+graph model; its one fold and short training are a resource-bounded screen only.
+
+Array **4693047** evaluates four finalists and their three corrected baseline
+comparators under the same five-repeat/five-fold schedule, with 20 grouped inner
+trials. It uses only search/source validation groups; confirmation remains reserved.
+The longer runs must complete before robust repeated-split selection. They may
+exceed the twelve-hour per-task allocation: inspect each Slurm status and preserved
+fold ledger before deciding whether to resume or alter resource limits.
+
+A research candidate wrapper and explicit recipe-driven fit tool are being tested.
+The regression residual scale is fitted on stacking groups and frozen before the
+conformal quantile is fitted on calibration groups. A separate serving path can
+load trusted local calibrated candidates with different per-task molecular specs,
+after validating the frozen context and feature dimensions. It does not change the
+default published-model loader. These are not yet a promoted surrogate; the
+candidate-serving and fit tests must pass, followed by model-level validation,
+calibration, locked confirmation, live HTTP and downstream performance checks.

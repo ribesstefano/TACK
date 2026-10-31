@@ -153,7 +153,7 @@ def main():
     parser.add_argument("--task", choices=["dmax", "pdc50", "activity"], required=True)
     parser.add_argument("--feature", default="baseline")
     parser.add_argument("--model", choices=["dummy", "linear", "xgb", "current_xgb", "extratrees", "catboost"], default="xgb")
-    parser.add_argument("--policy", choices=["compat", "exact"], default="compat")
+    parser.add_argument("--policy", choices=["compat", "exact", "censored"], default="compat")
     parser.add_argument("--eval-policy", choices=["compat", "exact"], default="exact")
     parser.add_argument("--trials", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=1)
@@ -161,6 +161,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--ablation", choices=["all", "molecule", "context"], default="all")
     args = parser.parse_args()
+    if args.policy == "censored" and args.task != "activity":
+        parser.error("Tree censored policy supports bound-established activity only; regression needs an interval loss")
     if args.output.exists():
         raise FileExistsError(f"Use a fresh candidate output directory: {args.output}")
     manifest = json.loads((args.snapshot / "manifest.json").read_text())
