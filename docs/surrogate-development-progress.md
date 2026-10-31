@@ -165,6 +165,23 @@ The activity source gain hides an important E3 difference. CRBN AP improves from
 is VHL-heavy. Do not promote the aggregate winner without addressing this slice.
 Dmax's AR and BTK source slices also regress despite aggregate improvement.
 
+Follow-up source E3 bootstraps (jobs **4685837** and **4685838**) give an activity
+ExtraTrees VHL AP difference interval [−0.2574, 0.1282], so the apparent decrease
+is uncertain, not established harm. CatBoost's VHL point AP is 0.3836 versus the
+baseline 0.4456, also inconclusive [−0.2191, 0.1275]. Neither aggregate score is
+sufficient to dismiss the VHL concern.
+
+Search-only label attrition audit **4685913** completed and wrote
+`models/research_label_attrition.json`. VHL compatibility activity has 843 labels
+(392 positive), while exact activity has 532 (200 positive). Of the 192 lost
+compatibility positives, 171 have a missing endpoint time, 2 have differing known
+times, and 48 lack an exact endpoint (reasons overlap). CRBN loses 306 positives,
+of which 122 lack time and 218 lack an exact endpoint. There are no conflicting
+observed exact/compatibility activity labels in these E3 slices: filtering and
+coverage change, rather than observed-label flips, drive this policy comparison.
+This makes endpoint-time missingness and cohort selection important next checks;
+it does not justify inventing missing times or treating uncertain positives as true.
+
 ### Remaining implementation work now underway
 
 A separate Chemprop graph probe replaces only the molecular fingerprint branch.
@@ -181,6 +198,14 @@ Fitting that scale on the same conformal labels would invalidate the intended
 split-conformal interpretation. Prediction pooling must preserve each estimator's
 actual semantics, and activity entropy outputs must remain coherent after scaling.
 These artifacts have not yet been integrated into serving or fitted as final models.
+
+After correcting the graph forward path, Chemprop API calls and loss scaling,
+five focused graph tests passed. They check stereochemistry, masked supervision,
+normalization/early stopping, singleton/empty inference and safe artifact reload.
+Job **4685914** is the active bounded pilot in
+`models/research_graph_pilot_run2/dmpnn_probe`; earlier failed or incomplete attempts
+remain preserved. The graph is not yet a validated candidate. Commit **3a039c4**
+records the tested benchmark, neural pilot, slice reporting and updated review work.
 
 The [updated review plan](model-development-plan-2026-10-31.md) records current
 evidence and priorities. The original objective still includes repeated finalist
