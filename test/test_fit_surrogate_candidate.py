@@ -54,6 +54,7 @@ def _make_snapshot(path, change_role=None, change_amount=0.0):
 def _recipe():
     return {
         "schema_version": 1,
+        "snapshot_hash": "a" * 64,
         "task": "dmax",
         "feature": "synthetic",
         "label_policy": "exact",
@@ -72,6 +73,7 @@ def _recipe():
 def _fit(path, output, change_role=None, change_amount=0.0):
     roles = _make_snapshot(path, change_role, change_amount)
     recipe = _recipe()
+    recipe["snapshot_hash"] = fit_cli.sha256(path / "manifest.json")
     recipe_path = path.parent / f"{path.name}.recipe.json"
     recipe_path.write_text(json.dumps(recipe))
     fit_cli._fit_one(path, recipe, output)
@@ -135,6 +137,13 @@ def test_recipe_cannot_override_seed_or_thread_limits():
     recipe["members"][0]["params"]["n_jobs"] = -1
     with pytest.raises(ValueError, match="controlled resources"):
         fit_cli.validate_recipe(recipe)
+
+
+def test_recipe_rejects_wrong_snapshot_before_training(tmp_path):
+    path = tmp_path / "snapshot"
+    _make_snapshot(path)
+    with pytest.raises(ValueError, match="different snapshot"):
+        fit_cli._fit_one(path, _recipe(), tmp_path / "artifact")
 
 
 def test_catboost_accepts_tuned_parameters_not_present_in_default_get_params():

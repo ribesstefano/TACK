@@ -42,12 +42,16 @@ def _require_int(value, name, minimum=0):
 
 def validate_recipe(recipe):
     """Validate an explicit, fully pinned candidate recipe without tuning it."""
-    expected = {"schema_version", "task", "feature", "label_policy", "cv",
+    expected = {"schema_version", "snapshot_hash", "task", "feature", "label_policy", "cv",
                 "members", "stacking", "calibration"}
     if not isinstance(recipe, dict) or set(recipe) != expected:
         raise ValueError(f"recipe fields must be exactly {sorted(expected)}")
     if recipe["schema_version"] != RECIPE_SCHEMA_VERSION:
         raise ValueError("unsupported recipe schema version")
+    snapshot_hash = recipe["snapshot_hash"]
+    if (not isinstance(snapshot_hash, str) or len(snapshot_hash) != 64
+            or any(char not in "0123456789abcdef" for char in snapshot_hash)):
+        raise ValueError("snapshot_hash must be a lowercase SHA256 digest")
     if recipe["task"] not in {"dmax", "pdc50", "activity"}:
         raise ValueError("task must be dmax, pdc50, or activity")
     if recipe["label_policy"] not in {"exact", "compat"}:
@@ -277,6 +281,8 @@ def _load_frozen_inputs(snapshot, recipe):
 
 def _fit_one(snapshot, recipe, output):
     recipe = validate_recipe(recipe)
+    if sha256(Path(snapshot) / "manifest.json") != recipe["snapshot_hash"]:
+        raise ValueError("Recipe was frozen for a different snapshot")
     output = Path(output)
     if output.exists():
         raise FileExistsError(f"candidate output already exists: {output}")

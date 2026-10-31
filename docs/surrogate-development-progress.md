@@ -272,3 +272,11 @@ reward config. Its five focused predictor/reward tests passed (**4693395**), and
 its original checkout's unrelated changes remain untouched. Cross-repository
 loopback test **4693318** is still running; full TACKOS RL/container validation
 has not been performed.
+
+`scripts/freeze_surrogate_recipe.py` can extract explicitly selected, complete
+grouped-fold settings with source-run hashes. The candidate fit recipe now pins
+the snapshot manifest SHA-256 and rejects another snapshot before training. This
+tool does not automatically choose a winner; do not freeze a final recipe until
+the repeated validation and slice review have finished. Candidate use and trust
+assumptions are documented in `docs/surrogate-candidate-artifacts.md`.
+Recipe freezing and snapshot-lock tests passed in job **4693636** (8 tests).

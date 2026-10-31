@@ -16,6 +16,9 @@ read by the fit tool.
 
 Defaults not listed in `params` are defined by the fit tool; its source hash and
 the dependency versions are recorded with the artifact.
+After a run has been explicitly selected, `scripts/freeze_surrogate_recipe.py
+--run RUN_DIRECTORY --output RECIPE.json` extracts its nested-tuned member
+parameters and records the source hashes. It does not select or rank candidates.
 
 A compact schema illustration follows. Its deliberately tiny fold/estimator
 counts are for understanding the format, not a recommended training recipe:
@@ -23,6 +26,7 @@ counts are for understanding the format, not a recommended training recipe:
 ```json
 {
   "schema_version": 1,
+  "snapshot_hash": "<64-character frozen snapshot manifest SHA256>",
   "task": "dmax",
   "feature": "baseline",
   "label_policy": "exact",
