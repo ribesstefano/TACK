@@ -36,8 +36,10 @@ import contextlib
 import json
 import logging
 import os
+import signal
 import socket
 import sys
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator, List, Optional
 
@@ -343,6 +345,9 @@ def serve(argv: Optional[List[str]] = None) -> None:
     model_source.add_argument("--repo-id",
                         help="Hugging Face Hub repo id to load the ensemble from, "
                              "e.g. ailab-bio/TACK-FastEnsemble.")
+    model_source.add_argument("--candidate-dir",
+                        help="Trusted local directory of calibrated research candidates, "
+                             "one task subdirectory per model.")
     parser.add_argument("--task", action="append", dest="tasks",
                         choices=["dmax", "pdc50", "activity"],
                         help="Task to serve; repeat for several. Each is loaded from the "
@@ -425,8 +430,13 @@ def serve(argv: Optional[List[str]] = None) -> None:
 
     tasks = args.tasks or list(TASKS)
     try:
-        service = load_service(
-            model=args.checkpoints_dir or args.repo_id,
+        if args.candidate_dir:
+            from tackai.serve.candidate import load_candidate_service
+            loader = load_candidate_service
+        else:
+            loader = load_service
+        service = loader(
+            model=args.candidate_dir or args.checkpoints_dir or args.repo_id,
             tasks=tasks,
             context=ContextSpec(**context) if context is not None else None,
             context_repo=context_repo,
@@ -464,11 +474,24 @@ def serve(argv: Optional[List[str]] = None) -> None:
         port_path.parent.mkdir(parents=True, exist_ok=True)
         port_path.write_text(str(port))
     logger.info(f"Serving {', '.join(tasks)} on http://{args.host}:{port} (docs at /docs)")
+    # Uvicorn replays SIGTERM after its graceful shutdown. The default signal
+    # disposition terminates Python before this function's finally block can
+    # remove the port file; raising SystemExit keeps normal cleanup semantics.
+    main_thread = threading.current_thread() is threading.main_thread()
+    previous_sigterm = signal.getsignal(signal.SIGTERM) if main_thread else None
+
+    def _exit_after_sigterm(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    if main_thread:
+        signal.signal(signal.SIGTERM, _exit_after_sigterm)
     try:
         uvicorn.Server(config).run(sockets=[sock])
     finally:
         if args.port_file:
             Path(args.port_file).unlink(missing_ok=True)
+        if main_thread:
+            signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 # ----------------------------------------------------------------------------

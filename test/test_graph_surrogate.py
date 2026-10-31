@@ -4,7 +4,7 @@ import pytest
 torch = pytest.importorskip("torch")
 pytest.importorskip("chemprop")
 
-from tackai.fusion.graph import GraphPredictor, _mol_graphs, masked_graph_loss
+from tackai.fusion.graph import GraphPredictor, _mol_graphs, masked_graph_loss  # noqa: E402
 
 
 def test_chemprop_graphs_preserve_isomeric_stereochemistry():

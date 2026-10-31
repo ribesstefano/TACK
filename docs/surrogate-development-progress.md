@@ -245,6 +245,14 @@ The longer runs must complete before robust repeated-split selection. They may
 exceed the twelve-hour per-task allocation: inspect each Slurm status and preserved
 fold ledger before deciding whether to resume or alter resource limits.
 
+Tuned E3 slice reports (**4693339**) show activity CatBoost has VHL source AP
+0.4699 versus the baseline 0.4456, while tuned ExtraTrees has 0.3397; both paired
+VHL intervals include zero. CRBN AP is 0.4013 for CatBoost and 0.5949 for
+ExtraTrees. Dmax CatBoost also has a slightly better pooled CV point estimate
+than ExtraTrees. These opposing slice signals justify retaining both as options;
+array **4693464** adds CatBoost activity and Dmax to the same repeated protocol.
+The reports are exploratory and are not corrected for trying multiple models.
+
 A research candidate wrapper and explicit recipe-driven fit tool are being tested.
 The regression residual scale is fitted on stacking groups and frozen before the
 conformal quantile is fitted on calibration groups. A separate serving path can
@@ -253,3 +261,14 @@ after validating the frozen context and feature dimensions. It does not change t
 default published-model loader. These are not yet a promoted surrogate; the
 candidate-serving and fit tests must pass, followed by model-level validation,
 calibration, locked confirmation, live HTTP and downstream performance checks.
+
+Focused artifact, fit, graph and benchmark tests passed (**4693034**, 19 tests).
+Candidate and existing HTTP TestClient checks passed (**4693174**, 30 tests).
+A real loopback candidate-server/REINVENT-client test passed (**4693284**); it
+also detected and verified a fix for stale port files after SIGTERM. The separate
+TACKOS worktree `TACKOS-surrogate-research`, branch `research/tack-surrogate-http`,
+contains commit `131e666`, a standard-library HTTP predictor and opt-in Dmax
+reward config. Its five focused predictor/reward tests passed (**4693395**), and
+its original checkout's unrelated changes remain untouched. Cross-repository
+loopback test **4693318** is still running; full TACKOS RL/container validation
+has not been performed.

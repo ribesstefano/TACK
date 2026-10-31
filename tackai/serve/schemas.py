@@ -186,8 +186,10 @@ class InfoResponse(BaseModel):
     has_default_context: bool = Field(
         ..., description="Whether the server was started with --context, so requests may "
                          "omit one.", examples=[True])
-    n_columns: int = Field(..., description="Width of the shared design matrix. Must equal "
-                                           "what the members were fitted on; the server "
-                                           "refuses to start otherwise.", examples=[1400])
+    n_columns: Optional[int] = Field(..., description="Width of the shared design matrix; "
+        "null if tasks use different molecular features. The server checks each width at startup.",
+        examples=[1400])
+    n_columns_by_task: Optional[Dict[str, int]] = Field(
+        None, description="Per-task matrix widths when molecular feature layouts differ.")
     tackai_version: str = Field(..., description="Version of tackai serving this.",
                                 examples=["2.0.0"])
