@@ -24,7 +24,8 @@ def blend_runs(runs, output):
         if not (run / "COMPLETE").is_file():
             raise ValueError(f"Incomplete run: {run}")
         config = json.loads((run / "config.json").read_text())
-        pred = pd.read_csv(run / "predictions.csv").sort_values(["split", "row"]).reset_index(drop=True)
+        pred = (pd.read_csv(run / "predictions.csv", float_precision="round_trip")
+                .sort_values(["split", "row"]).reset_index(drop=True))
         if (pred[["row", "group", "split"]].isna().any().any()
                 or pred.duplicated(["split", "row"]).any()
                 or not np.isfinite(pred[["y", "prediction"]].to_numpy()).all()):
