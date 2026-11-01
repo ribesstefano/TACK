@@ -14,11 +14,20 @@ the reserved stacking groups. The independent calibration groups fit the
 conformal quantile or classification temperature. Confirmation labels are not
 read by the fit tool.
 
+Regression recipes may set `"unit": "group_max"` in `calibration` to fit a
+quantile of per-group maximum residual scores instead of the default row scores.
+That targets simultaneous coverage of the observed rows in a new exchangeable
+chemical group and may produce wider intervals; neither method guarantees
+coverage under source or chemical distribution shift. Fix the method before
+reading calibration outcomes.
+
 Defaults not listed in `params` are defined by the fit tool; its source hash and
 the dependency versions are recorded with the artifact.
 After a run has been explicitly selected, `scripts/freeze_surrogate_recipe.py
 --run RUN_DIRECTORY --output RECIPE.json` extracts its nested-tuned member
 parameters and records the source hashes. It does not select or rank candidates.
+After choosing the interval method on development data, pass `--unit group_max`
+for group-maximum calibration; `--unit row` is the default.
 
 A compact schema illustration follows. Its deliberately tiny fold/estimator
 counts are for understanding the format, not a recommended training recipe:

@@ -94,6 +94,8 @@ class CandidateArtifact:
         self.q_hat_ = None
         self.alpha_ = None
         self.temperature_ = None
+        self.calibration_unit_ = None
+        self.n_calibration_units_ = None
 
     @staticmethod
     def _json_object(value, name):
@@ -152,14 +154,17 @@ class CandidateArtifact:
         residual = y - predictions @ self.weights_
         self.residual_scale_ = max(float(np.sqrt(np.mean(residual ** 2))), 1e-12)
         self.q_hat_ = self.alpha_ = None
+        self.calibration_unit_ = self.n_calibration_units_ = None
         return self
 
-    def calibrate(self, X, y, alpha: float = 0.1):
+    def calibrate(self, X, y, alpha: float = 0.1, *, unit: str = "row", groups=None):
         """Calibrate intervals or probabilities after all model choices are fixed.
 
         Regression requires a residual scale already fitted on independent
         stacking rows. Its scale is frozen while the calibration set supplies
-        only the conformal quantile. Classification fits one temperature to the
+        only the conformal quantile. With ``unit='group_max'``, it computes one
+        maximum normalized score per group, targeting simultaneous coverage of
+        all observed rows in a new exchangeable group. Classification fits one temperature to the
         weighted pool of equally temperature-scaled member probabilities.
         """
         if not 0 < alpha < 1:
@@ -171,18 +176,39 @@ class CandidateArtifact:
             raise ValueError("y must be finite, one-dimensional, and aligned with X")
         if n_rows == 0:
             raise ValueError("calibration set must not be empty")
+        if unit not in {"row", "group_max"}:
+            raise ValueError("calibration unit must be 'row' or 'group_max'")
+        if self.task == "classification" and (unit != "row" or groups is not None):
+            raise ValueError("group-max conformal calibration applies only to regression")
         if self.task == "regression":
             if self.residual_scale_ is None:
                 raise ValueError(
                     "fit_residual_scale on stacking rows before regression calibration")
             mean = predictions @ self.weights_
             scale = self._predictive_scale(predictions)
-            scores = np.sort(np.abs(y - mean) / scale)
-            rank = int(np.ceil((n_rows + 1) * (1 - alpha)))
-            if rank > n_rows:
+            residual_scores = np.abs(y - mean) / scale
+            if not np.isfinite(residual_scores).all():
+                raise ValueError("Nonfinite conformal calibration scores")
+            if unit == "group_max":
+                groups = np.asarray(groups)
+                missing = (groups.shape != (n_rows,) or any(
+                    group is None or (isinstance(group, (float, np.floating)) and not np.isfinite(group))
+                    or (isinstance(group, str) and not group.strip()) for group in groups))
+                if missing:
+                    raise ValueError("group-max calibration requires aligned nonmissing groups")
+                unique = np.unique(groups)
+                residual_scores = np.array([np.max(residual_scores[groups == group]) for group in unique])
+            elif groups is not None:
+                raise ValueError("groups are only used with group-max calibration")
+            scores = np.sort(residual_scores)
+            n_units = len(scores)
+            rank = int(np.ceil((n_units + 1) * (1 - alpha)))
+            if rank > n_units:
                 raise ValueError("calibration set is too small for requested alpha")
             self.q_hat_ = float(scores[rank - 1])
             self.alpha_ = float(alpha)
+            self.calibration_unit_ = unit
+            self.n_calibration_units_ = n_units
         else:
             if not np.isin(y, [0, 1]).all():
                 raise ValueError("classification calibration labels must be 0 or 1")
@@ -258,9 +284,13 @@ class CandidateArtifact:
                         "disagreement."),
             }
             if self.q_hat_ is not None:
+                description = (f"{1 - self.alpha_:.0%} coverage for all observed rows of a new "
+                               "exchangeable group."
+                               if getattr(self, "calibration_unit_", None) == "group_max" else
+                               f"{1 - self.alpha_:.0%} calibration coverage under exchangeability.")
                 explanations.update({
                     "lower": (f"mean - q_hat_ * std; finite-sample conformal interval targeting "
-                              f"{1 - self.alpha_:.0%} calibration coverage under exchangeability."),
+                              f"{description}"),
                     "upper": "mean + q_hat_ * std.",
                 })
         else:
@@ -278,6 +308,8 @@ class CandidateArtifact:
                                           "residual_scale_": self.residual_scale_,
                                           "q_hat_": self.q_hat_,
                                           "alpha_": self.alpha_,
+                                          "calibration_unit_": getattr(self, "calibration_unit_", None),
+                                          "n_calibration_units_": getattr(self, "n_calibration_units_", None),
                                           "temperature_": self.temperature_}
             result["explanations"] = explanations
         return result
@@ -298,6 +330,8 @@ class CandidateArtifact:
             "residual_scale": self.residual_scale_,
             "q_hat": self.q_hat_,
             "alpha": self.alpha_,
+            "calibration_unit": getattr(self, "calibration_unit_", None),
+            "n_calibration_units": getattr(self, "n_calibration_units_", None),
             "temperature": self.temperature_,
             "molecular_feature_spec": self.molecular_spec.to_dict(),
             "recipe": self.recipe,
@@ -356,6 +390,8 @@ class CandidateArtifact:
                     and _same_optional_float(artifact.residual_scale_, manifest["residual_scale"])
                     and _same_optional_float(artifact.q_hat_, manifest["q_hat"])
                     and _same_optional_float(artifact.alpha_, manifest["alpha"])
+                    and getattr(artifact, "calibration_unit_", None) == manifest.get("calibration_unit")
+                    and getattr(artifact, "n_calibration_units_", None) == manifest.get("n_calibration_units")
                     and _same_optional_float(artifact.temperature_, manifest["temperature"])
                     and artifact.help(show_extras=True)["explanations"]
                     == manifest["uncertainty_contract"])

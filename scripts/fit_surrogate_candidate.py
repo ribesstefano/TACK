@@ -109,11 +109,14 @@ def validate_recipe(recipe):
     if isinstance(l2, bool) or not isinstance(l2, (int, float)) or not np.isfinite(l2) or l2 < 0:
         raise ValueError("stacking.l2 must be a finite nonnegative number")
     calibration = recipe["calibration"]
-    if not isinstance(calibration, dict) or set(calibration) != {"alpha"}:
-        raise ValueError("calibration must contain exactly alpha")
+    if not isinstance(calibration, dict) or set(calibration) not in ({"alpha"}, {"alpha", "unit"}):
+        raise ValueError("calibration must contain alpha and optional unit")
     alpha = calibration["alpha"]
     if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not 0 < alpha < 1:
         raise ValueError("calibration.alpha must lie strictly between 0 and 1")
+    unit = calibration.get("unit", "row")
+    if unit not in {"row", "group_max"} or (recipe["task"] == "activity" and unit != "row"):
+        raise ValueError("group_max calibration is available for regression tasks only")
     return recipe
 
 
@@ -384,8 +387,9 @@ def _fit_one(snapshot, recipe, output, *, pre_calibration=False):
     y_calibration = y_calibration[calibration_mask]
     if classification and set(np.unique(y_calibration)) != {0.0, 1.0}:
         raise ValueError("activity calibration requires both labels")
-    candidate.calibrate(X[calibration_rows], y_calibration,
-                        alpha=recipe["calibration"]["alpha"])
+    unit = recipe["calibration"].get("unit", "row")
+    candidate.calibrate(X[calibration_rows], y_calibration, alpha=recipe["calibration"]["alpha"],
+                        unit=unit, groups=groups[calibration_rows] if unit == "group_max" else None)
 
     role_label_counts = {"search": int(np.isfinite(y_search).sum()),
                          "stacking": int(len(stack_rows)) if not classification

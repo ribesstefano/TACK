@@ -318,6 +318,13 @@ joint-threshold score without assuming endpoint independence. Its output is an
 uncalibrated ranking score, not an activity probability. Failed initial test/job
 chain **4711298–4711302** was corrected before resubmission.
 
+The endpoint ranking jobs completed: pooled CV AP was 0.6735 with CatBoost Dmax
+or 0.6904 with ExtraTrees Dmax, versus 0.7392 for direct activity XGBoost.
+The paired chemical-group intervals for improvement were [−0.0967, −0.0309]
+and [−0.0753, −0.0181]. Source AP was 0.2797 and 0.2825 versus 0.2292, with
+publication intervals crossing zero. This fixed bottleneck score is an
+uncalibrated ranking heuristic and does not warrant promotion.
+
 Benchmark label access now reads only search-row offsets from the frozen NPZ;
 it rejects source-stress rows outside search. The search-only dummy smoke run
 **4711267** produced all 4,524 prediction records bit-identical to the earlier
@@ -327,6 +334,12 @@ The cross-repository live check **4711192** passed after earlier filesystem-stal
 job **4693318** timed out. It exercised the actual TACK candidate server,
 REINVENT client and isolated TACKOS HTTP predictor on synthetic models; it is
 not a full TACKOS RL run.
+
+The isolated TACKOS branch's lean REINVENT configuration and HTTP predictor
+tests passed together (**4711635**, 18 tests). Its changed files pass Ruff. A
+full `ruff check tackos/ reinvent_entrypoint/` reports three pre-existing issues
+in untouched files (`reinvent_entrypoint/cli.py` and
+`tackos/data/preprocessing/preprocess_pipeline.py`); no unrelated fixes were made.
 
 The provisional pDC50 search-only bundle is being fitted in **4711370**. Its
 first attempt **4711347** stopped before training because the snapshot's RDKit
@@ -386,3 +399,37 @@ locked internal-confirmation evaluator has passed four synthetic tests
 (**4711564**), but has **not** been run against the real confirmation labels.
 It creates a persistent marker immediately before reading those labels and
 reports row and group-all coverage with cluster-bootstrap uncertainty.
+
+The provisional pDC50 bundle **4711370** completed, followed by stacking study
+**4711418** and conformal study **4711558**. Uniform pooling had held-out
+stacking RMSE 0.7027; none of the convex strategies met the predeclared
+improvement rule, so uniform is the provisional choice. At nominal 90%, the
+development study estimated row/group-all coverage of 0.888/0.822 for row
+quantiles versus 0.939/0.889 for group-maximum quantiles. Mean interval widths
+were 2.22 and 2.85 pDC50 units respectively. The extra group-level protection
+therefore has a substantial width cost; these are grouped development estimates,
+not guarantees under distribution shift.
+
+The candidate artifact and locked-recipe format now support `group_max` as an
+explicit regression calibration unit. Its scores are maxima within each
+calibration group; the associated target is simultaneous coverage of all
+observed rows in a new exchangeable group. The original row mode remains the
+default. Focused group-calibration and compatibility checks **4711609** passed
+25 tests. The final pDC50 interval method is not yet fixed and no real
+calibration or confirmation labels have been evaluated for it.
+
+The search-only 25-member pDC50 bundle occupies about 54 MiB. A CPU microbenchmark
+(**4711634**) scored 128 distinct search molecules under one fixed context: cold
+featurization plus prediction took 2.43 s, and warm-cache median/p95 took
+47.8/50.0 ms. Model deserialization took 0.27 s and peak process RSS was about
+775 MiB. This excludes Python startup, HTTP and RL; it is not a comparison on
+matched hardware against the previous model. A real loopback latency probe
+(**4711664**) uses a clearly marked temporary calibration derived only from
+stacking groups to measure the service path; it is not a final artifact.
+That loopback probe completed: startup was 2.42 s, the cold 128-molecule
+request 2.27 s, and warm request median/p95 47.9/117.2 ms over ten repeats.
+The p95 is based on only ten observations and excludes any RL workload.
+A second temporary probe (**4711680**) exercised the new group-maximum interval
+path through the live service: startup 2.52 s, cold 2.35 s, warm median/p95
+48.9/130.0 ms. It used a disjoint split of stacking groups only and was deleted
+after timing; these are not final calibration results.

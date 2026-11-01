@@ -137,3 +137,40 @@ def test_context_contract_tampering_is_detected(tmp_path, sample_data):
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="manifest"):
         CandidateArtifact.from_pretrained(tmp_path / "artifact")
+
+
+def test_group_max_conformal_uses_one_maximum_per_group(tmp_path):
+    class ZeroRegressor:
+        n_features_in_ = 1
+
+        def predict(self, X):
+            return np.zeros(len(X))
+
+    X = np.zeros((10, 1))
+    y = np.array([0., 1., 0., 2., 0., 3., 0., 4., 0., 5.])
+    groups = np.repeat(np.arange(5), 2)
+    row = CandidateArtifact([ZeroRegressor()], "regression", MolecularFeatureSpec.preset("default"))
+    group = CandidateArtifact([ZeroRegressor()], "regression", MolecularFeatureSpec.preset("default"))
+    for artifact in (row, group):
+        artifact.residual_scale_ = 1.
+    row.calibrate(X, y, alpha=.2)
+    group.calibrate(X, y, alpha=.2, unit="group_max", groups=groups)
+    assert row.q_hat_ == pytest.approx(4.)
+    assert group.q_hat_ == pytest.approx(5.)
+    assert group.n_calibration_units_ == 5
+    assert "exchangeable group" in group.help(True)["explanations"]["lower"]
+    with pytest.raises(ValueError, match="nonmissing"):
+        group.calibrate(X, y, alpha=.2, unit="group_max", groups=np.full(10, np.nan))
+
+
+def test_group_max_calibration_roundtrips(tmp_path, sample_data):
+    X, y, _ = sample_data
+    model = ExtraTreesRegressor(n_estimators=3, random_state=2, n_jobs=1).fit(X[:60], y[:60])
+    artifact = CandidateArtifact([model], "regression", MolecularFeatureSpec.preset("default"))
+    artifact.fit_residual_scale(X[60:100], y[60:100])
+    artifact.calibrate(X[100:], y[100:], alpha=.1, unit="group_max", groups=np.arange(40))
+    artifact.save_pretrained(tmp_path / "candidate")
+    loaded = CandidateArtifact.from_pretrained(tmp_path / "candidate")
+    assert loaded.calibration_unit_ == "group_max"
+    assert loaded.n_calibration_units_ == 40
+    np.testing.assert_allclose(loaded.predict(X[:3])["lower"], artifact.predict(X[:3])["lower"])

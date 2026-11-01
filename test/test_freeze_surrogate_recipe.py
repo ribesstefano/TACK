@@ -28,6 +28,7 @@ def test_freeze_never_uses_source_holdout_tuning(tmp_path):
     assert recipe["snapshot_hash"] == "a" * 64
     assert [x["params"]["max_depth"] for x in recipe["members"]] == [5, 3]
     assert [x["seed"] for x in recipe["members"]] == [20261030, 20261031]
+    assert recipe_from_run(run, unit="group_max")["calibration"]["unit"] == "group_max"
 
 
 def test_missing_or_duplicate_fold_is_never_frozen(tmp_path):

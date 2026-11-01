@@ -146,6 +146,18 @@ def test_recipe_rejects_wrong_snapshot_before_training(tmp_path):
         fit_cli._fit_one(path, _recipe(), tmp_path / "artifact")
 
 
+def test_fit_uses_frozen_calibration_groups_for_group_max(tmp_path):
+    snapshot = tmp_path / "snapshot"
+    roles = _make_snapshot(snapshot)
+    recipe = _recipe()
+    recipe["snapshot_hash"] = fit_cli.sha256(snapshot / "manifest.json")
+    recipe["calibration"]["unit"] = "group_max"
+    fit_cli._fit_one(snapshot, recipe, tmp_path / "artifact")
+    artifact = fit_cli.CandidateArtifact.from_pretrained(tmp_path / "artifact")
+    assert artifact.calibration_unit_ == "group_max"
+    assert artifact.n_calibration_units_ == len(roles["calibration"])
+
+
 def test_catboost_accepts_tuned_parameters_not_present_in_default_get_params():
     pytest.importorskip("catboost")
     member = {"family": "catboost", "seed": 3, "params": {"l2_leaf_reg": 4.5}}

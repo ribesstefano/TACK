@@ -17,7 +17,7 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def recipe_from_run(directory, *, weights="uniform", l2=.1, alpha=.1):
+def recipe_from_run(directory, *, weights="uniform", l2=.1, alpha=.1, unit="row"):
     """Extract one set of nested-tuned parameters per shared search fold."""
     directory = Path(directory)
     if not (directory / "COMPLETE").is_file():
@@ -49,13 +49,15 @@ def recipe_from_run(directory, *, weights="uniform", l2=.1, alpha=.1):
     if seen != set(expected) or source_count != 1:
         raise ValueError("The completed benchmark is missing one or more search folds")
     members.sort(key=lambda item: (item["repeat"], item["fold"]))
+    if unit not in {"row", "group_max"} or (config["task"] == "activity" and unit != "row"):
+        raise ValueError("group_max calibration applies only to regression")
     return {"schema_version": 1, "snapshot_hash": config["snapshot_hash"],
             "task": config["task"], "feature": config["feature"],
             "label_policy": config["policy"],
             "cv": {"repeats": repeats, "folds": folds,
                    "seeds": [1000 + r for r in range(repeats)]},
             "members": members, "stacking": {"weights": weights, "l2": l2},
-            "calibration": {"alpha": alpha}}
+            "calibration": {"alpha": alpha, "unit": unit}}
 
 
 def main():
@@ -65,10 +67,11 @@ def main():
     parser.add_argument("--weights", choices=["uniform", "fit"], default="uniform")
     parser.add_argument("--l2", type=float, default=.1)
     parser.add_argument("--alpha", type=float, default=.1)
+    parser.add_argument("--unit", choices=["row", "group_max"], default="row")
     args = parser.parse_args()
     if not 0 < args.alpha < 1 or not 0 <= args.l2 < float("inf"):
         parser.error("alpha must lie between zero and one and l2 must be finite and nonnegative")
-    recipe = recipe_from_run(args.run, weights=args.weights, l2=args.l2, alpha=args.alpha)
+    recipe = recipe_from_run(args.run, weights=args.weights, l2=args.l2, alpha=args.alpha, unit=args.unit)
     snapshot = Path(json.loads((args.run / "config.json").read_text())["snapshot"])
     config = json.loads((args.run / "config.json").read_text())
     if file_hash(snapshot / "manifest.json") != config["snapshot_hash"]:

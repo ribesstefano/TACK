@@ -148,7 +148,7 @@ def _verify_artifact(snapshot, artifact_dir, task, selected_recipe_sha256):
 
 
 def evaluate(snapshot, artifact_dir, output, *, task, selected_recipe_sha256,
-             n_bootstrap=2000, seed=20261102):
+             n_bootstrap=2000, seed=20261101):
     """Evaluate one explicitly selected candidate once on confirmation groups.
 
     The function reads the exact endpoint label vector only at rows whose frozen
@@ -220,6 +220,7 @@ def evaluate(snapshot, artifact_dir, output, *, task, selected_recipe_sha256,
                 np.all(covered[groups == group]) for group in np.unique(groups)])),
             "nominal_coverage": .9,
             "alpha": float(artifact.alpha_),
+            "calibration_unit": getattr(artifact, "calibration_unit_", None) or "row",
         }
         intervals = covered
 
@@ -257,8 +258,9 @@ def evaluate(snapshot, artifact_dir, output, *, task, selected_recipe_sha256,
         },
         "interpretation_note": (
             "This is one internal confirmation evaluation. Group separation does not prove "
-            "exchangeability or external coverage; row-level conformal coverage remains "
-            "row-marginal, and group-all coverage is reported descriptively."),
+            "exchangeability or external coverage. Row calibration targets marginal row "
+            "coverage; group-max calibration targets all observed rows in an exchangeable "
+            "new group. Both coverage estimates here are descriptive."),
     }
     report_path = output / "report.json"
     temporary_report = output / "report.json.tmp"
@@ -277,7 +279,7 @@ def main(argv=None):
     parser.add_argument("--recipe-sha256", required=True,
                         help="Exact recipe_sha256 recorded in the selected candidate artifact")
     parser.add_argument("--bootstrap", type=int, default=2000)
-    parser.add_argument("--seed", type=int, default=20261102)
+    parser.add_argument("--seed", type=int, default=20261101)
     args = parser.parse_args(argv)
     result = evaluate(args.snapshot, args.artifact, args.output, task=args.task,
                       selected_recipe_sha256=args.recipe_sha256,
