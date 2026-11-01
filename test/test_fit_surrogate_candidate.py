@@ -1,10 +1,10 @@
 """Synthetic checks for recipe-driven fitting and data-partition boundaries."""
 import hashlib
+import importlib.metadata
 import json
 
 import numpy as np
 import pytest
-from rdkit import rdBase
 
 from scripts import fit_surrogate_candidate as fit_cli
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES
@@ -44,7 +44,7 @@ def _make_snapshot(path, change_role=None, change_amount=0.0):
                      "poi": 1, "e3": 1, "assay_time": 1},
         }},
         "context_fingerprint": "synthetic-context-42",
-        "versions": {"rdkit": rdBase.rdkitVersion},
+        "versions": {"rdkit": importlib.metadata.version("rdkit")},
         "code_revision": "synthetic",
     }
     (path / "manifest.json").write_text(json.dumps(manifest))
@@ -150,6 +150,17 @@ def test_catboost_accepts_tuned_parameters_not_present_in_default_get_params():
     pytest.importorskip("catboost")
     member = {"family": "catboost", "seed": 3, "params": {"l2_leaf_reg": 4.5}}
     assert fit_cli._estimator(member, "dmax").get_params()["l2_leaf_reg"] == 4.5
+
+
+def test_current_baseline_weight_parameter_is_not_forwarded_to_xgboost():
+    member = {"family": "current_xgb", "seed": 3,
+              "params": {"n_estimators": 2, "alpha_w": .5}}
+    model = fit_cli._estimator(member, "dmax")
+    assert "alpha_w" not in model.get_params()
+    X = np.arange(60).reshape(30, 2)
+    y = np.linspace(0, 1, 30)
+    fit_cli.fit_learner(model, member["family"], X, y, member["params"], False)
+    assert np.isfinite(model.predict(X)).all()
 
 
 def test_role_limited_npz_reader_loads_only_requested_offsets(tmp_path):

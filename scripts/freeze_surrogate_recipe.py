@@ -24,7 +24,7 @@ def recipe_from_run(directory, *, weights="uniform", l2=.1, alpha=.1):
         raise ValueError("Cannot freeze an incomplete benchmark run")
     config = json.loads((directory / "config.json").read_text())
     metrics = json.loads((directory / "metrics.json").read_text())
-    if config.get("model") not in {"xgb", "extratrees", "catboost"}:
+    if config.get("model") not in {"xgb", "current_xgb", "extratrees", "catboost"}:
         raise ValueError("Candidate fit tool cannot reproduce this model family")
     if config.get("ablation") != "all" or config.get("policy") not in {"exact", "compat"}:
         raise ValueError("Only complete-feature exact or compatibility training is supported")

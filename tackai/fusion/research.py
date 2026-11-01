@@ -6,6 +6,7 @@ cannot silently cross a partition through differing scaffold calculations.
 """
 import hashlib
 import json
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,46 @@ def sha256(path):
         for chunk in iter(lambda: stream.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def read_npz_rows(path, key, indices):
+    """Read selected offsets from a numeric array in an uncompressed NPZ file.
+
+    Research snapshots are written with ``np.savez``. Refusing compressed or
+    object arrays avoids materializing reserved label partitions while reading
+    a permitted subset. Returned values follow the requested index order.
+    """
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.ndim != 1:
+        raise ValueError("Label row indices must be one-dimensional")
+    with zipfile.ZipFile(path) as archive:
+        try:
+            info = archive.getinfo(f"{key}.npy")
+        except KeyError as exc:
+            raise ValueError(f"label array {key!r} is absent from {path}") from exc
+        if info.compress_type != zipfile.ZIP_STORED:
+            raise ValueError("label arrays must be uncompressed for role-limited reads")
+        with archive.open(info) as stream:
+            version = np.lib.format.read_magic(stream)
+            if version == (1, 0):
+                shape, fortran, dtype = np.lib.format.read_array_header_1_0(stream)
+            elif version == (2, 0):
+                shape, fortran, dtype = np.lib.format.read_array_header_2_0(stream)
+            else:
+                raise ValueError(f"unsupported label NPY header version: {version}")
+            if len(shape) != 1 or fortran or dtype.hasobject or dtype.kind not in "biuf":
+                raise ValueError("label arrays must be one-dimensional numeric values")
+            if np.any(indices < 0) or np.any(indices >= shape[0]):
+                raise ValueError("requested label row lies outside the snapshot")
+            offset = stream.tell()
+            values = np.empty(indices.size, dtype=dtype)
+            for i, row in enumerate(indices):
+                stream.seek(offset + int(row) * dtype.itemsize)
+                raw = stream.read(dtype.itemsize)
+                if len(raw) != dtype.itemsize:
+                    raise ValueError("truncated label array in snapshot")
+                values[i] = np.frombuffer(raw, dtype=dtype, count=1)[0]
+    return values
 
 
 def identity_groups(scaffolds, canonical, connectivity):

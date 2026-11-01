@@ -27,7 +27,7 @@ from sklearn.preprocessing import StandardScaler
 import xgboost as xgb
 
 from tackai.fusion.data import make_splits
-from tackai.fusion.research import sha256, write_once_json
+from tackai.fusion.research import read_npz_rows, sha256, write_once_json
 
 
 def scores(y, pred, classification):
@@ -177,14 +177,19 @@ def main():
         X = X[:, :mol_width]
     elif args.ablation == "context":
         X = X[:, mol_width:]
-    labels = np.load(args.snapshot / "labels.npz")
-    y = labels[f"{args.policy}_{args.task}"]
-    yeval = labels[f"{args.eval_policy}_{args.task}"]
     groups = np.load(args.snapshot / "groups.npy")
     roles = np.load(args.snapshot / "partition.npy")
     source_roles = np.load(args.snapshot / "source_partition.npy")
     # Masks are applied only after the shared group assignment.
     search = np.flatnonzero(roles == "search")
+    if np.any((source_roles == "train") & (roles != "search")) or np.any(
+            (source_roles == "eval") & (roles != "search")):
+        raise ValueError("Source stress rows must be part of the search partition")
+    y = np.full(len(roles), np.nan)
+    yeval = np.full(len(roles), np.nan)
+    label_file = args.snapshot / "labels.npz"
+    y[search] = read_npz_rows(label_file, f"{args.policy}_{args.task}", search)
+    yeval[search] = read_npz_rows(label_file, f"{args.eval_policy}_{args.task}", search)
     classification = args.task == "activity"
     args.output.mkdir(parents=True)
     config = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}

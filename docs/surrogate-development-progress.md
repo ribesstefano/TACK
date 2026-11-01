@@ -280,3 +280,79 @@ tool does not automatically choose a winner; do not freeze a final recipe until
 the repeated validation and slice review have finished. Candidate use and trust
 assumptions are documented in `docs/surrogate-candidate-artifacts.md`.
 Recipe freezing and snapshot-lock tests passed in job **4693636** (8 tests).
+
+## 2026-11-01: repeated validation and controlled follow-up
+
+Arrays **4693047** and **4693464** completed all nine five-repeat/five-fold
+experiments. Job **4711191** produced matched pooled out-of-fold comparisons
+against the repeated corrected baseline, and **4711205** produced E3/source
+slices. Both use 1,000 paired bootstrap draws. The candidate training policy is
+exact-label; the current-XGB reference uses compatibility labels, so differences
+include label policy and cannot be attributed solely to model or fingerprints.
+
+| Candidate | Pooled CV / baseline | CV improvement (95% interval) | Source / baseline |
+|---|---|---|---|
+| pDC50 XGB r2/2048 | RMSE 0.7108 / 0.7799 | 0.0691 [0.0528, 0.0874] | 1.0179 / 1.0506 |
+| pDC50 XGB r3/4096 | RMSE 0.7091 / 0.7799 | 0.0708 [0.0545, 0.0885] | 1.0274 / 1.0506 |
+| Dmax CatBoost | RMSE 0.2013 / 0.2074 | 0.0060 [0.0009, 0.0107] | 0.2969 / 0.3408 |
+| Dmax ExtraTrees | RMSE 0.2051 / 0.2074 | 0.0022 [−0.0044, 0.0074] | 0.2871 / 0.3408 |
+| Activity CatBoost | AP 0.7684 / 0.7392 | 0.0292 [0.0093, 0.0549] | 0.4606 / 0.2292 |
+| Activity ExtraTrees | AP 0.7545 / 0.7392 | 0.0153 [−0.0046, 0.0386] | 0.5426 / 0.2292 |
+
+Only pDC50 passes the prespecified numeric CV gate. The source pDC50 paired
+intervals include zero. Direct radius-2 versus radius-3 comparisons (job
+**4711242**) are inconclusive on CV and source holdout, so radius 2 is the
+provisional lower-width candidate, not a proven better representation. Dmax
+CatBoost's 2.9% CV reduction misses the 5% gate, and activity CatBoost's +0.0292
+misses the +0.03 gate. Activity source VHL AP is 0.2693 for CatBoost and 0.3295
+for ExtraTrees versus 0.3936 for the baseline (75 rows, 21 publications); both
+intervals include zero but do not exclude material degradation.
+
+Exact-label current-XGB comparators (**4711281**) are running with identical
+folds to separate label-policy effects from architecture/representation changes.
+The radius-2 pDC50 fold parameters were saved as a *pre-calibration* recipe in
+`models/research_recipes/pdc50_r2_precal.json`; no final candidate has been
+selected. A search-only endpoint-head activity ranking experiment (**4711307**,
+with dependent combine/summary jobs **4711308** and **4711320**) tests a fixed
+joint-threshold score without assuming endpoint independence. Its output is an
+uncalibrated ranking score, not an activity probability. Failed initial test/job
+chain **4711298–4711302** was corrected before resubmission.
+
+Benchmark label access now reads only search-row offsets from the frozen NPZ;
+it rejects source-stress rows outside search. The search-only dummy smoke run
+**4711267** produced all 4,524 prediction records bit-identical to the earlier
+baseline. Earlier benchmark runners materialized whole label arrays but used
+only search/source rows for scoring; no confirmation metrics were computed.
+The cross-repository live check **4711192** passed after earlier filesystem-stalled
+job **4693318** timed out. It exercised the actual TACK candidate server,
+REINVENT client and isolated TACKOS HTTP predictor on synthetic models; it is
+not a full TACKOS RL run.
+
+The provisional pDC50 search-only bundle is being fitted in **4711370**. Its
+first attempt **4711347** stopped before training because the snapshot's RDKit
+distribution version (`2026.3.1`) and runtime's equivalent formatted version
+(`2026.03.1`) were compared literally. The check now compares distribution
+versions and records the runtime string in the molecular contract; focused job
+**4711368** passed 12 tests. The independent group-held-out stacking study
+**4711418** depends on bundle completion and compares uniform against fixed
+regularized convex strategies without reading calibration or confirmation labels.
+Current conformal intervals target row-marginal coverage under exchangeability;
+group-disjoint splits alone do not prove new-series coverage.
+
+A Dmax interval-loss XGBoost pilot **4711416** uses exact measurements as
+zero-width intervals and censored measurements as bounds; its comparison with
+fixed-parameter exact-label XGBoost is scheduled as **4711417**. This is a
+development pilot, not a claim that censored labels or interval uncertainty
+have improved. The new tools never treat a bound as an exact point label.
+
+Both jobs completed. Interval-loss pooled CV RMSE was 0.2078 versus 0.2091 for
+fixed-parameter exact-label XGBoost, improvement 0.0013 with chemical-group
+bootstrap interval [−0.0022, 0.0052]. Source RMSE was 0.3245 versus 0.3095,
+improvement −0.0150 [−0.0394, 0.0009] by publication bootstrap. This one-repeat
+pilot does not support advancing the interval-loss recipe.
+
+Activity source-weighting experiment **4711453** reuses the completed exact
+CatBoost fold parameters and computes bounded VHL source-balancing weights from
+each training fold only. Source and E3 identifiers do not enter its feature
+matrix. Paired overall and E3 slice reports **4711454** and **4711455** depend
+on completion and compare against the otherwise identical unweighted model.

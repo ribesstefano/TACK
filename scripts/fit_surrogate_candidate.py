@@ -15,7 +15,6 @@ import inspect
 import json
 import os
 from pathlib import Path
-import zipfile
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
@@ -27,10 +26,15 @@ from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
 from tackai.fusion.candidate_artifact import CandidateArtifact
 from tackai.fusion.data import make_splits
 from tackai.fusion.molecular_spec import MolecularFeatureSpec
-from tackai.fusion.research import sha256
+from tackai.fusion.research import read_npz_rows as _read_npz_rows, sha256
+
+try:
+    from .benchmark_surrogates import fit_learner
+except ImportError:
+    from benchmark_surrogates import fit_learner
 
 RECIPE_SCHEMA_VERSION = 1
-FAMILIES = {"xgb", "extratrees", "catboost"}
+FAMILIES = {"xgb", "current_xgb", "extratrees", "catboost"}
 ROLES = ("search", "stacking", "calibration", "confirmation")
 
 
@@ -126,41 +130,8 @@ def _validate_nonnegative_params(params, name):
 
 
 def read_npz_rows(path, key, indices):
-    """Read only selected one-dimensional numeric labels from an uncompressed NPZ.
-
-    The research snapshot is written by ``np.savez`` (ZIP_STORED). Seeking to
-    selected offsets prevents the fit process from indexing confirmation labels.
-    Compressed/object label members are rejected rather than fully decoded.
-    """
-    indices = np.asarray(indices, dtype=np.int64)
-    with zipfile.ZipFile(path) as archive:
-        try:
-            info = archive.getinfo(f"{key}.npy")
-        except KeyError as exc:
-            raise ValueError(f"label array {key!r} is absent from {path}") from exc
-        if info.compress_type != zipfile.ZIP_STORED:
-            raise ValueError("label arrays must be uncompressed for role-limited reads")
-        with archive.open(info) as stream:
-            version = np.lib.format.read_magic(stream)
-            if version == (1, 0):
-                shape, fortran, dtype = np.lib.format.read_array_header_1_0(stream)
-            elif version == (2, 0):
-                shape, fortran, dtype = np.lib.format.read_array_header_2_0(stream)
-            else:
-                raise ValueError(f"unsupported label NPY header version: {version}")
-            if len(shape) != 1 or fortran or dtype.hasobject or dtype.kind not in "biuf":
-                raise ValueError("label arrays must be one-dimensional numeric values")
-            if np.any(indices < 0) or np.any(indices >= shape[0]):
-                raise ValueError("requested label row lies outside the snapshot")
-            data_offset = stream.tell()
-            out = np.empty(indices.size, dtype=dtype)
-            for out_i, row_i in enumerate(indices):
-                stream.seek(data_offset + int(row_i) * dtype.itemsize)
-                raw = stream.read(dtype.itemsize)
-                if len(raw) != dtype.itemsize:
-                    raise ValueError("truncated label array in snapshot")
-                out[out_i] = np.frombuffer(raw, dtype=dtype, count=1)[0]
-    return out
+    """Compatibility wrapper for the shared role-limited NPZ reader."""
+    return _read_npz_rows(path, key, indices)
 
 
 def _estimator(member, task, jobs=1):
@@ -192,10 +163,12 @@ def _estimator(member, task, jobs=1):
     # CatBoost get_params() only returns parameters already set, not every
     # accepted constructor option such as l2_leaf_reg from the tuned search.
     accepted = set(model.get_params(deep=True)) | set(inspect.signature(type(model).__init__).parameters)
-    unknown = set(member["params"]) - accepted
+    parameters = {key: value for key, value in member["params"].items()
+                  if key != "alpha_w" or family != "current_xgb"}
+    unknown = set(parameters) - accepted
     if unknown:
         raise ValueError(f"unknown {family} parameter(s): {sorted(unknown)}")
-    model.set_params(**member["params"])
+    model.set_params(**parameters)
     return model
 
 
@@ -270,16 +243,16 @@ def _load_frozen_inputs(snapshot, recipe):
         raise ValueError("feature matrix width differs from snapshot dimension manifest")
     feature_meta = manifest["features"][feature_name]
     from rdkit import rdBase
-    if manifest["versions"]["rdkit"] != rdBase.rdkitVersion:
-        raise ValueError("RDKit runtime differs from the frozen feature-generation version")
+    if manifest["versions"]["rdkit"] != importlib.metadata.version("rdkit"):
+        raise ValueError("RDKit distribution differs from the frozen feature-generation version")
     molecular_spec = MolecularFeatureSpec(
         radius=feature_meta["radius"], size=feature_meta["fp_size"],
         count=feature_meta["counts"], descriptor_names=tuple(feature_meta["descriptors"]),
-        rdkit_version=manifest["versions"]["rdkit"])
+        rdkit_version=rdBase.rdkitVersion)
     return snapshot, manifest, X, groups, roles, labels_path, molecular_spec
 
 
-def _fit_one(snapshot, recipe, output):
+def _fit_one(snapshot, recipe, output, *, pre_calibration=False):
     recipe = validate_recipe(recipe)
     if sha256(Path(snapshot) / "manifest.json") != recipe["snapshot_hash"]:
         raise ValueError("Recipe was frozen for a different snapshot")
@@ -330,7 +303,8 @@ def _fit_one(snapshot, recipe, output):
             if classification and set(np.unique(y_train)) != {0.0, 1.0}:
                 raise ValueError(f"activity fold {repeat}/{fold} lacks both training classes")
             estimator = _estimator(member, recipe["task"])
-            estimator.fit(X[train_rows], y_train)
+            fit_learner(estimator, member["family"], X[train_rows], y_train,
+                        member["params"], classification)
             models.append(estimator)
             fitted_members.append({
                 **member,
@@ -340,11 +314,45 @@ def _fit_one(snapshot, recipe, output):
             })
 
     candidate_recipe = {**recipe, "members": fitted_members}
+    candidate_recipe["fit_stage"] = "pre_calibration" if pre_calibration else "calibrated"
     candidate_recipe["snapshot_manifest_sha256"] = sha256(snapshot / "manifest.json")
     candidate_recipe["recipe_sha256"] = hashlib.sha256(
         json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     candidate = CandidateArtifact(models, "classification" if classification else "regression",
                                   molecular_spec, recipe=candidate_recipe)
+
+    package_versions = {"scikit-learn": sklearn_version, "numpy": np.__version__}
+    families = sorted({member["family"] for member in recipe["members"]})
+    package_for_family = {"xgb": "xgboost", "current_xgb": "xgboost", "catboost": "catboost"}
+    for family in families:
+        if family in package_for_family:
+            package_versions[package_for_family[family]] = importlib.metadata.version(
+                package_for_family[family])
+    code_files = [Path(__file__), Path("scripts/benchmark_surrogates.py"),
+                  Path("tackai/fusion/candidate_artifact.py"),
+                  Path("tackai/fusion/molecular_spec.py"), Path("tackai/fusion/research.py")]
+    context_contract = {
+        "context_fingerprint": snapshot_manifest["context_fingerprint"],
+        "snapshot_manifest_sha256": sha256(snapshot / "manifest.json"),
+        "snapshot_artifact_hashes": {
+            path.name: snapshot_manifest["artifact_hashes"][path.name]
+            for path in (snapshot / f"{recipe['feature']}.npy", snapshot / "labels.npz",
+                         snapshot / "groups.npy", snapshot / "partition.npy")},
+        "feature_name": recipe["feature"],
+        "feature_dims": snapshot_manifest["features"][recipe["feature"]]["dims"],
+        "feature_width": int(X.shape[1]),
+        "molecular_feature_spec": molecular_spec.to_dict(),
+        "snapshot_versions": snapshot_manifest["versions"],
+        "runtime_model_package_versions": package_versions,
+        "code_sha256": {str(path): sha256(path) for path in code_files},
+        "role_counts": role_counts,
+        "task_label_counts": {"search": int(np.isfinite(y_search).sum()),
+                               "stacking": None, "calibration": None},
+    }
+    if pre_calibration:
+        candidate.context_contract = context_contract
+        candidate.save_pretrained(output)
+        return output
 
     stack_rows = role_indices["stacking"]
     if not classification or recipe["stacking"]["weights"] == "fit":
@@ -379,36 +387,11 @@ def _fit_one(snapshot, recipe, output):
     candidate.calibrate(X[calibration_rows], y_calibration,
                         alpha=recipe["calibration"]["alpha"])
 
-    package_versions = {"scikit-learn": sklearn_version, "numpy": np.__version__}
-    families = sorted({member["family"] for member in recipe["members"]})
-    package_for_family = {"xgb": "xgboost", "catboost": "catboost"}
-    for family in families:
-        if family in package_for_family:
-            package_versions[package_for_family[family]] = importlib.metadata.version(
-                package_for_family[family])
     role_label_counts = {"search": int(np.isfinite(y_search).sum()),
                          "stacking": int(len(stack_rows)) if not classification
                          or recipe["stacking"]["weights"] == "fit" else None,
                          "calibration": int(len(calibration_rows))}
-    code_files = [Path(__file__), Path("tackai/fusion/candidate_artifact.py"),
-                  Path("tackai/fusion/molecular_spec.py"), Path("tackai/fusion/research.py")]
-    context_contract = {
-        "context_fingerprint": snapshot_manifest["context_fingerprint"],
-        "snapshot_manifest_sha256": sha256(snapshot / "manifest.json"),
-        "snapshot_artifact_hashes": {
-            path.name: snapshot_manifest["artifact_hashes"][path.name]
-            for path in (snapshot / f"{recipe['feature']}.npy", snapshot / "labels.npz",
-                         snapshot / "groups.npy", snapshot / "partition.npy")},
-        "feature_name": recipe["feature"],
-        "feature_dims": snapshot_manifest["features"][recipe["feature"]]["dims"],
-        "feature_width": int(X.shape[1]),
-        "molecular_feature_spec": molecular_spec.to_dict(),
-        "snapshot_versions": snapshot_manifest["versions"],
-        "runtime_model_package_versions": package_versions,
-        "code_sha256": {str(path): sha256(path) for path in code_files},
-        "role_counts": role_counts,
-        "task_label_counts": role_label_counts,
-    }
+    context_contract["task_label_counts"] = role_label_counts
     candidate.context_contract = context_contract
     candidate.save_pretrained(output)
     return output
@@ -419,10 +402,15 @@ def main(argv=None):
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--recipe", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--pre-calibration", action="store_true",
+                        help="Save a search-only model bundle without reading stacking/calibration labels")
     args = parser.parse_args(argv)
     recipe = json.loads(args.recipe.read_text())
-    output = _fit_one(args.snapshot, recipe, args.output)
-    print(json.dumps({"artifact": str(output), "confirmation_evaluated": False}, indent=2))
+    output = _fit_one(args.snapshot, recipe, args.output,
+                      pre_calibration=args.pre_calibration)
+    print(json.dumps({"artifact": str(output), "fit_stage":
+                      "pre_calibration" if args.pre_calibration else "calibrated",
+                      "confirmation_evaluated": False}, indent=2))
 
 
 if __name__ == "__main__":
