@@ -612,3 +612,32 @@ snapshot before fitting.
 The grouped calibration-study implementation passed 11 focused tests in
 **4720187**. XGBoost study **4720332** and ExtraTrees study **4720333** are
 queued after their respective bundle-array tasks; they use only stacking labels.
+
+### Dmax physical bounds diagnostic (before scoring)
+
+Dmax is a fraction degraded, so predictions outside [0, 1] are physically
+invalid. Assess a fixed projection to [0, 1] on existing exact-label development
+prediction ledgers, paired against each unprojected model on the same CV and
+source rows. First require all evaluated labels to be within the same range;
+report how often and by how much clipping changes predictions, and compare RMSE
+and MAE. No model is selected by this diagnostic. Any eventual serving change
+must be versioned and applied consistently before calibration and evaluation,
+with an artifact parity test; the existing deployed models are not changed.
+
+Dmax bounds study **4720540** completed with two focused tests. Among 12,420
+held-out CV fold predictions, 16 current-XGBoost and two CatBoost outputs were
+above 1; none of the pooled repeated-CV predictions or source predictions were
+outside [0, 1]. ExtraTrees had no violations. The CV pool averages one held-out
+fold prediction per repeat, while the source view uses one source model; neither
+reproduces the full deployed ensemble. Fixed clipping after pooling changed no
+measured predictions or metrics in this sample. This does
+not guarantee bounds on new molecules; no serving or calibration change was made.
+
+In the isolated `TACKOS-surrogate-research` worktree, commit **0fd794d** makes
+the TRL reward adapter reject a reward vector whose length differs from the
+valid-molecule batch, avoiding silent misalignment. Seven focused tests passed
+in **4720522**; the original TACKOS checkout remains untouched.
+
+Matched pDC50 latency probe **4720520** stopped before timing because one
+recomputed molecular descriptor failed parity against the frozen snapshot. The
+mismatch is under investigation; do not use that job as performance evidence.
