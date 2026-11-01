@@ -640,4 +640,7 @@ in **4720522**; the original TACKOS checkout remains untouched.
 
 Matched pDC50 latency probe **4720520** stopped before timing because one
 recomputed molecular descriptor failed parity against the frozen snapshot. The
-mismatch is under investigation; do not use that job as performance evidence.
+mismatch was AvgIpc for one of 128 molecules (0.8994 recomputed versus 0.9170
+frozen); original and canonical SMILES currently give the same value. Threading
+and prediction-impact probes **4720671** and **4720732** are queued. Do not use
+the failed job as performance evidence or assume the cause is known.
