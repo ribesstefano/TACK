@@ -421,6 +421,14 @@ default. Focused group-calibration and compatibility checks **4711609** passed
 25 tests. The final pDC50 interval method is not yet fixed and no real
 calibration or confirmation labels have been evaluated for it.
 
+Before inspecting the pending input-dependent scale comparison, advance that
+experimental method only if its mean interval width is at least 10% lower than
+the global-scale group-maximum method, its group-all coverage is no more than
+two percentage points lower, and paired group-bootstrap intervals support a
+width reduction while excluding a coverage loss larger than five points. This
+is an exploratory development rule, not a coverage guarantee; both scales use
+the same held-out group folds. Otherwise retain the simpler global scale.
+
 The search-only 25-member pDC50 bundle occupies about 54 MiB. A CPU microbenchmark
 (**4711634**) scored 128 distinct search molecules under one fixed context: cold
 featurization plus prediction took 2.43 s, and warm-cache median/p95 took
