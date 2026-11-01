@@ -337,8 +337,12 @@ training settings both differ from the comparator. Dmax CatBoost improved CV RMS
 from 0.2064 to 0.2013 (2.5%), while activity CatBoost changed CV AP from
 0.7675 to 0.7684. Neither supports promotion against this matched baseline.
 These are development comparisons, not confirmation or test results.
-Matched-baseline biological and source slice reports are queued as **4716990**
-to check whether the aggregate comparisons conceal subgroup degradation.
+Matched-baseline biological and source slice reports (**4716990**) also flag
+activity CatBoost on source-held-out VHL: AP 0.2693 versus 0.4272 for matched
+XGBoost, difference −0.1580, publication-bootstrap interval [−0.2439, −0.0009]
+over 75 rows and 21 publications. This exploratory, unadjusted subgroup result
+reinforces the concern about activity generalization; it is not a confirmation
+test. ExtraTrees VHL AP was 0.3295, with its paired interval crossing zero.
 The radius-2 pDC50 fold parameters were saved as a *pre-calibration* recipe in
 `models/research_recipes/pdc50_r2_precal.json`; no final candidate has been
 selected. A search-only endpoint-head activity ranking experiment (**4711307**,
