@@ -142,6 +142,8 @@ def main():
                    "n": len(summary), "groups": summary.group.nunique(),
                    "resampling_unit": "publication" if view == "source_holdout" else "chemical_component",
                    **scores(summary.y.to_numpy(), summary.prediction.to_numpy(), task == "activity")}
+            if config.get("score_note"):
+                row["score_note"] = config["score_note"]
             row["reference_path"] = reference[0][0]
             row["reference_metrics"] = scores(base.y.to_numpy(), base.prediction.to_numpy(), task == "activity")
             key = "ap" if task == "activity" else "rmse"

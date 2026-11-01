@@ -339,6 +339,16 @@ regularized convex strategies without reading calibration or confirmation labels
 Current conformal intervals target row-marginal coverage under exchangeability;
 group-disjoint splits alone do not prove new-series coverage.
 
+Before the stacking study runs, use uniform pDC50 weights unless a convex option
+reduces pooled held-out stacking RMSE by at least 1%, does not worsen macro-group
+RMSE, and has a paired chemical-group bootstrap interval entirely below zero
+(the report defines delta as candidate minus uniform). If multiple options meet
+these criteria, prefer the strongest shrinkage. This is a conservative selection
+rule, not an independent confirmation: trying multiple penalties on the same
+groups makes the reported intervals exploratory, and bootstrapping fixed
+out-of-fold predictions does not capture refitting variability. Interval
+methodology and alpha must also be fixed before reading calibration outcomes.
+
 A Dmax interval-loss XGBoost pilot **4711416** uses exact measurements as
 zero-width intervals and censored measurements as bounds; its comparison with
 fixed-parameter exact-label XGBoost is scheduled as **4711417**. This is a
@@ -356,3 +366,23 @@ CatBoost fold parameters and computes bounded VHL source-balancing weights from
 each training fold only. Source and E3 identifiers do not enter its feature
 matrix. Paired overall and E3 slice reports **4711454** and **4711455** depend
 on completion and compare against the otherwise identical unweighted model.
+
+The fold-specific similarity diagnostic **4711526** computes each held-out
+molecule's maximum chirality-aware radius-2 Morgan Tanimoto similarity to that
+fold's labeled training molecules; these fingerprints are diagnostic only.
+For provisional pDC50 r2, CV RMSE is 0.929 versus 0.907 for the baseline in the
+0.3–0.5 similarity band (193 rows), with a wide paired interval crossing zero;
+for repeated CV, the per-row diagnostic averages its fold-specific similarities.
+At >0.7 similarity the point gains are clearer. The smallest source band has
+only 14 rows. These are exploratory slices, not evidence of a hard applicability
+threshold. Activity's report also completed; AP depends on prevalence and should
+be compared between models within a band, not across bands. The other ongoing
+jobs must be reviewed before any deployment claim.
+
+A separate group-held-out conformal-method study (**4711558**, dependent on the
+search-only pDC50 bundle) compares row-level and group-maximum quantiles on
+stacking groups only. Its five synthetic tests passed (**4711530**). The new
+locked internal-confirmation evaluator has passed four synthetic tests
+(**4711564**), but has **not** been run against the real confirmation labels.
+It creates a persistent marker immediately before reading those labels and
+reports row and group-all coverage with cluster-bootstrap uncertainty.

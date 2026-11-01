@@ -113,6 +113,10 @@ def test_precalibration_bundle_and_group_study_never_read_calibration_or_confirm
     assert result_a["selection_performed"] is False
     assert result_a["calibration_labels_read"] is False
     assert result_a["confirmation_labels_read"] is False
+    conventions = result_a["metric_conventions"]
+    assert conventions["paired_delta"].startswith("candidate minus uniform")
+    assert conventions["direction"]["rmse"] == "lower_is_better"
+    assert conventions["direction"]["ap"] == "higher_is_better"
     assert result_a["metrics"] == result_b["metrics"]
     assert (tmp_path / "study_a" / "oof_predictions.csv").read_text() == (
         tmp_path / "study_b" / "oof_predictions.csv").read_text()

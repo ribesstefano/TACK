@@ -57,6 +57,15 @@ snapshot and recipe hashes in the experiment record. Predictions from a single
 member have no between-model disagreement; the empirical residual scale is not
 a learned decomposition of biological noise.
 
+For a preliminary search-only bundle, add `--pre-calibration` to the fit
+command. This mode does not read stacking, calibration or confirmation labels
+and cannot be loaded by the candidate server. Use
+`scripts/study_surrogate_stacking.py --snapshot SNAPSHOT --bundle BUNDLE --output
+STUDY_DIR` to compare uniform and prespecified regularized convex weights with
+group-held-out stacking predictions. The study reports alternatives and does
+not select a strategy or read calibration labels. Select the final recipe from
+development evidence before fitting the final weights and calibration.
+
 To test a set of calibrated **trusted local** candidate artifacts, the server can
 use their separate molecular features while enforcing the saved context fingerprint:
 
