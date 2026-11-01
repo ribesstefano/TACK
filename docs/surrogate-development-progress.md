@@ -644,3 +644,18 @@ mismatch was AvgIpc for one of 128 molecules (0.8994 recomputed versus 0.9170
 frozen); original and canonical SMILES currently give the same value. Threading
 and prediction-impact probes **4720671** and **4720732** are queued. Do not use
 the failed job as performance evidence or assume the cause is known.
+
+The search-only matched-label XGBoost activity bundle **4719992_0** and its
+stacking-only calibration study **4720332** completed. On 310 labeled rows from
+126 groups, raw/temperature/Platt Brier scores were 0.1476/0.1486/0.1453;
+log losses were 0.4635/0.4634/0.4576 and APs 0.7949/0.7893/0.7879. Paired
+chemical-group bootstrap intervals for both calibrated-minus-raw Brier changes
+included zero. The exploratory VHL slice has 50 rows from 26 groups; Platt's
+Brier was 0.1569 versus 0.1494 raw, with a wide interval. This does not yet
+support selecting a more complex probability calibration. The ExtraTrees study
+remains dependent on its search-only bundle.
+
+For the AvgIpc parity discrepancy, the single-thread probe **4720732** found no
+change in either model's mean for that molecule when substituting its frozen
+versus recomputed value. This single case does not establish feature parity or
+exclude effects on other molecules; the inherited-threading probe is pending.
