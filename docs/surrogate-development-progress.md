@@ -532,3 +532,22 @@ comparisons are exploratory after candidate selection. The blend misses the
 activity blend also missed that gate (CV AP 0.7708). Results and slice ledgers
 are in `models/research_fixed_blends_summary.json` and
 `models/research_fixed_blend_slices/`; confirmation/test labels were not read.
+
+### Tuned molecular follow-up (development screen)
+
+The previous tuned Dmax CatBoost and activity CatBoost candidates used the
+original molecular representation. Before examining results, screen exact-label
+CatBoost with radius-2/2048-bit fingerprints for both tasks and Dmax XGBoost
+with radius-3/2048-bit fingerprints. The earlier fixed-parameter pilots showed
+small CV improvements and small source regressions; they do not establish a
+benefit. Train fresh same-seed, exact-label current-XGBoost controls for Dmax
+and activity with identical one-repeat folds, tuning budget and source split.
+Context representations remain frozen. Compare pooled CV, source and E3 slices
+with paired group/publication intervals. This is a screen, not independent
+confirmation: only candidates with promising CV and source performance may
+advance to repeated evaluation, and the pre-existing promotion gates remain in
+force. Calibration, internal-confirmation and historical-test labels are not
+used for the screen.
+Array **4719437** runs the screen; dependent summary and E3 slice job **4719442**
+will run only after all five members finish successfully. Each candidate writes
+a fresh provenance-recorded directory, so incomplete jobs remain visible.
