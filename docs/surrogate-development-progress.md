@@ -587,3 +587,23 @@ coverage 0.871 on the same splits. These are stacking-development estimates;
 no final calibration or confirmation was performed. Keep the simpler global
 method provisional; detailed results are in
 `models/research_feature_conditional_study/pdc50_r2/report.json`.
+
+### Activity calibration development (before study)
+
+Probability quality is a separate question from activity AP: the original
+stacking/calibration report worsened Brier score, and the fixed XGBoost–ExtraTrees
+blend improved source Brier but missed the CV AP gate. Prepare provisional
+search-only exact-label activity XGBoost and ExtraTrees bundles from the existing
+25-fold recipes. On stacking groups only, use grouped held-out predictions to
+compare no calibration, the existing member-wise temperature before pooling,
+and a fixed, regularized pooled logistic/Platt alternative. The stacking set has
+only 310 exact activity labels, so do not fit a flexible isotonic method here.
+Fit calibrators on groups disjoint from evaluation, retain uniform base weights,
+and report paired group-bootstrap Brier, log loss, AP and E3 slices. Prefer the
+simplest method unless probability losses improve without material AP or slice
+regression; any selected method requires a separate locked recipe, independent
+calibration and confirmation. This study does not select a final activity model
+and does not access real calibration, confirmation or historical-test labels.
+Search-only bundle array **4719992** has been submitted; neither bundle is a
+calibrated or promoted model. Its output recipes pin the exact source runs and
+snapshot before fitting.
