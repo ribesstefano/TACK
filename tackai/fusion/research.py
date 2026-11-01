@@ -27,7 +27,8 @@ def read_npz_rows(path, key, indices):
 
     Research snapshots are written with ``np.savez``. Refusing compressed or
     object arrays avoids materializing reserved label partitions while reading
-    a permitted subset. Returned values follow the requested index order.
+    a permitted subset. One- and two-dimensional C-order arrays are supported;
+    returned values follow the requested index order, including duplicates.
     """
     indices = np.asarray(indices, dtype=np.int64)
     if indices.ndim != 1:
@@ -47,18 +48,20 @@ def read_npz_rows(path, key, indices):
                 shape, fortran, dtype = np.lib.format.read_array_header_2_0(stream)
             else:
                 raise ValueError(f"unsupported label NPY header version: {version}")
-            if len(shape) != 1 or fortran or dtype.hasobject or dtype.kind not in "biuf":
-                raise ValueError("label arrays must be one-dimensional numeric values")
+            if len(shape) not in (1, 2) or fortran or dtype.hasobject or dtype.kind not in "biuf":
+                raise ValueError("label arrays must be one- or two-dimensional C-order numeric values")
             if np.any(indices < 0) or np.any(indices >= shape[0]):
                 raise ValueError("requested label row lies outside the snapshot")
             offset = stream.tell()
-            values = np.empty(indices.size, dtype=dtype)
+            width = int(np.prod(shape[1:], dtype=np.int64))
+            row_bytes = width * dtype.itemsize
+            values = np.empty((indices.size, *shape[1:]), dtype=dtype)
             for i, row in enumerate(indices):
-                stream.seek(offset + int(row) * dtype.itemsize)
-                raw = stream.read(dtype.itemsize)
-                if len(raw) != dtype.itemsize:
+                stream.seek(offset + int(row) * row_bytes)
+                raw = stream.read(row_bytes)
+                if len(raw) != row_bytes:
                     raise ValueError("truncated label array in snapshot")
-                values[i] = np.frombuffer(raw, dtype=dtype, count=1)[0]
+                values[i] = np.frombuffer(raw, dtype=dtype, count=width).reshape(shape[1:])
     return values
 
 

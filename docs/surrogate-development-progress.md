@@ -551,3 +551,39 @@ used for the screen.
 Array **4719437** runs the screen; dependent summary and E3 slice job **4719442**
 will run only after all five members finish successfully. Each candidate writes
 a fresh provenance-recorded directory, so incomplete jobs remain visible.
+
+### Feature-conditioned uncertainty proposal (before evaluation)
+
+Using only stacking labels and the frozen search-only pDC50 bundle, test one
+fixed residual-scale model with pooled prediction, member disagreement, four
+existing molecular descriptors (MolWt, TPSA, MolLogP, NumRotatableBonds) and
+the existing POI, E3, cell, assay and time vectors. No identifiers or new input
+representations are added. Use 200 ExtraTrees with minimum leaf size 20, with
+all fitting confined to scale-fit groups. Keep identical outer folds and
+group-disjoint scale-fit, conformal-quantile and evaluation splits as the prior
+study; compare against its global and two-feature scales. Apply the earlier 10%
+width, group-all coverage and paired-interval rule unchanged. This is an
+exploratory development comparison, not final calibration or confirmation; a
+successful model would still require a portable inference artifact and parity
+checks before promotion.
+
+A later code audit found that the earlier neural/graph pilots and label audit
+materialized complete label arrays before selecting search rows. Their fitting
+and reported metrics indexed only search rows, but this was weaker isolation than
+the row-limited reader used by the tree benchmarks. The scripts are being
+corrected to read only search-row offsets, including two-column censoring bounds;
+no conclusions in the existing pilot reports rely on reserved labels.
+
+The selective-reader checks passed (**4719445**, 28 tests), as did a real-snapshot
+search-only label and censor-bound smoke test (**4719562**).
+
+Feature-conditioned uncertainty study **4719451** completed after six tests
+(**4719450**). Its mean interval width was 2.830 pDC50 versus 2.848 for the
+global method, a 0.6% reduction; group-all coverage was 0.889 for both. The
+paired width difference was −0.0179 [−0.1917, 0.1289], and the group-all
+coverage difference was 0 [−0.0222, 0.0222]. It therefore misses the fixed 10%
+width gate. The previous two-feature scale had mean width 2.584 and group-all
+coverage 0.871 on the same splits. These are stacking-development estimates;
+no final calibration or confirmation was performed. Keep the simpler global
+method provisional; detailed results are in
+`models/research_feature_conditional_study/pdc50_r2/report.json`.

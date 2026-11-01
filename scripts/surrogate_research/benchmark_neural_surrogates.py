@@ -14,11 +14,25 @@ from sklearn.model_selection import GroupShuffleSplit
 
 from tackai.fusion.data import make_splits
 from tackai.fusion.neural import NeuralPredictor, TASK_ORDER
-from tackai.fusion.research import sha256, write_once_json
+from tackai.fusion.research import read_npz_rows, sha256, write_once_json
 try:
     from .benchmark_surrogates import scores
 except ImportError:
     from benchmark_surrogates import scores
+
+
+def _load_search_targets(snapshot, roles, policy):
+    """Load search labels only; reserved rows remain NaN in all arrays."""
+    search = np.flatnonzero(roles == "search")
+    y = np.full((len(roles), len(TASK_ORDER)), np.nan)
+    yeval = np.full_like(y, np.nan)
+    bounds = np.full((len(roles), 2, 2), np.nan) if policy == "censored" else None
+    for i, task in enumerate(TASK_ORDER):
+        y[search, i] = read_npz_rows(snapshot / "labels.npz", f"{policy}_{task}", search)
+        yeval[search, i] = read_npz_rows(snapshot / "labels.npz", f"exact_{task}", search)
+        if bounds is not None and i < 2:
+            bounds[search, i, :] = read_npz_rows(snapshot / "labels.npz", f"censored_{task}_bounds", search)
+    return y, yeval, bounds
 
 
 def main():
@@ -45,11 +59,12 @@ def main():
         if sha256(args.snapshot / name) != manifest["artifact_hashes"][name]:
             raise ValueError(f"Snapshot hash mismatch: {name}")
     X = np.load(args.snapshot / f"{args.feature}.npy", mmap_mode="r")
-    with np.load(args.snapshot / "labels.npz") as labels:
-        y = np.column_stack([labels[f"{args.policy}_{task}"] for task in TASK_ORDER])
-        yeval = np.column_stack([labels[f"exact_{task}"] for task in TASK_ORDER])
-        bounds = (np.stack([labels[f"censored_{task}_bounds"] for task in TASK_ORDER[:2]], axis=1)
-                  if args.policy == "censored" else None)
+    roles = np.load(args.snapshot / "partition.npy", allow_pickle=False)
+    source = np.load(args.snapshot / "source_partition.npy", allow_pickle=False)
+    if np.any(np.isin(source, ["train", "eval"]) & (roles != "search")):
+        raise ValueError("Source stress rows must belong to search")
+    search = np.flatnonzero(roles == "search")
+    y, yeval, bounds = _load_search_targets(args.snapshot, roles, args.policy)
     active_tasks = TASK_ORDER if args.mode == "joint" else (args.task,)
     for i, task in enumerate(TASK_ORDER):
         if task not in active_tasks:
@@ -57,9 +72,6 @@ def main():
             if bounds is not None and i < 2:
                 bounds[:, i] = np.nan
     groups = np.load(args.snapshot / "groups.npy")
-    roles = np.load(args.snapshot / "partition.npy")
-    source = np.load(args.snapshot / "source_partition.npy")
-    search = np.flatnonzero(roles == "search")
     shared = make_splits(np.zeros(len(search)), groups[search], 1, 5)
     folds = [(f"repeat0_fold{f}", search[tr], search[va]) for f, (tr, va) in enumerate(shared[0])]
     folds.append(("source_holdout", np.flatnonzero(source == "train"), np.flatnonzero(source == "eval")))

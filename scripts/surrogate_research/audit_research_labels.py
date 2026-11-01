@@ -2,11 +2,12 @@
 import argparse
 import json
 from pathlib import Path
+import zipfile
 
 import numpy as np
 import pandas as pd
 
-from tackai.fusion.research import sha256
+from tackai.fusion.research import read_npz_rows, sha256
 
 
 def main():
@@ -22,9 +23,11 @@ def main():
         "partition", "source_partition", "e3_raw", "source", "publication",
         "Dmax_h", "DC50_h", "Dmax_operator", "DC50_operator", "dmax_raw_pct", "dc50_nM"])
     table = table.loc[table.partition.eq("search")].copy()
-    with np.load(args.snapshot / "labels.npz", allow_pickle=False) as data:
-        labels = {name: data[name][table.index] for name in data.files
-                  if name.endswith(("_activity", "_dmax", "_pdc50"))}
+    with zipfile.ZipFile(args.snapshot / "labels.npz") as archive:
+        names = [name[:-4] for name in archive.namelist() if name.endswith(".npy")
+                 and name[:-4].endswith(("_activity", "_dmax", "_pdc50"))]
+    labels = {name: read_npz_rows(args.snapshot / "labels.npz", name, table.index.to_numpy())
+              for name in names}
     table.reset_index(drop=True, inplace=True)
     reports = []
     for fields in (["e3_raw"], ["source_partition", "e3_raw"], ["source", "e3_raw"]):

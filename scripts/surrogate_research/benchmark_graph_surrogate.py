@@ -14,7 +14,7 @@ from sklearn.model_selection import GroupShuffleSplit
 
 from tackai.fusion.data import make_splits
 from tackai.fusion.graph import GraphPredictor, TASK_ORDER
-from tackai.fusion.research import sha256, write_once_json
+from tackai.fusion.research import read_npz_rows, sha256, write_once_json
 try:
     from .benchmark_surrogates import scores
 except ImportError:
@@ -35,8 +35,14 @@ def _load_snapshot(snapshot, feature, policy):
     expected = sum(dims[k] for k in ("descriptors", "e3", "cell", "poi", "assay", "assay_time"))
     if side.shape[1] != expected:
         raise ValueError("Feature manifest does not match descriptor/context matrix width")
-    with np.load(snapshot / "labels.npz", allow_pickle=False) as labels:
-        targets = np.column_stack([labels[f"{policy}_{task}"] for task in TASK_ORDER])
+    partition = np.load(snapshot / "partition.npy", allow_pickle=False)
+    source = np.load(snapshot / "source_partition.npy", allow_pickle=False)
+    if np.any(np.isin(source, ["train", "eval"]) & (partition != "search")):
+        raise ValueError("Source stress rows must belong to search")
+    search = np.flatnonzero(partition == "search")
+    targets = np.full((len(partition), len(TASK_ORDER)), np.nan)
+    for i, task in enumerate(TASK_ORDER):
+        targets[search, i] = read_npz_rows(snapshot / "labels.npz", f"{policy}_{task}", search)
     rows = pd.read_csv(snapshot / "rows.csv", usecols=["canonical_smiles"])
     return manifest, side, targets, rows.canonical_smiles.to_numpy(dtype=str)
 
