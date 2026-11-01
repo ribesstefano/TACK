@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--calibration-unit", choices=["row", "group_max"], default="row")
+    parser.add_argument("--tackos-source", type=Path,
+                        help="Optional TACKOS checkout for timing its HTTP predictor")
     args = parser.parse_args()
     if args.output.exists() or args.batch < 1 or args.repeats < 1:
         raise ValueError("Need a fresh output and positive batch/repeats")
@@ -130,6 +132,19 @@ def main():
 
                 cold = score()
                 warm = [score() for _ in range(args.repeats)]
+                tackos_warm = None
+                if args.tackos_source is not None:
+                    sys.path.insert(0, str(args.tackos_source.resolve()))
+                    from tackos.models.tack_http_predictor import TACKHTTPPredictor
+
+                    predictor = TACKHTTPPredictor(base, tasks=[task], max_batch=args.batch)
+                    tackos_warm = []
+                    for _ in range(args.repeats):
+                        begin = time.perf_counter()
+                        values = predictor.predict(smiles)
+                        tackos_warm.append((time.perf_counter() - begin) * 1000)
+                        if any(len(v) != args.batch or not np.isfinite(v).all() for v in values.values()):
+                            raise ValueError("TACKOS predictor returned invalid or misaligned outputs")
             finally:
                 process.terminate()
                 try:
@@ -146,6 +161,9 @@ def main():
               "startup_seconds": startup_seconds, "cold_request_ms": cold,
               "warm_request_ms": {"median": float(np.median(warm)), "p95": float(np.quantile(warm, .95))},
               "note": "Local HTTP with temporary stacking-only calibration; not a final model or RL run."}
+    if tackos_warm is not None:
+        result["tackos_warm_predict_ms"] = {"median": float(np.median(tackos_warm)),
+                                             "p95": float(np.quantile(tackos_warm, .95))}
     args.output.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
 
 

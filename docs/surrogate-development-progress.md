@@ -409,6 +409,9 @@ quantiles versus 0.939/0.889 for group-maximum quantiles. Mean interval widths
 were 2.22 and 2.85 pDC50 units respectively. The extra group-level protection
 therefore has a substantial width cost; these are grouped development estimates,
 not guarantees under distribution shift.
+A 2.85-unit pDC50 interval corresponds to roughly a 700-fold DC50 range; the
+practical value of that width needs explicit evaluation rather than treating
+coverage alone as success.
 
 The candidate artifact and locked-recipe format now support `group_max` as an
 explicit regression calibration unit. Its scores are maxima within each
@@ -433,3 +436,7 @@ A second temporary probe (**4711680**) exercised the new group-maximum interval
 path through the live service: startup 2.52 s, cold 2.35 s, warm median/p95
 48.9/130.0 ms. It used a disjoint split of stacking groups only and was deleted
 after timing; these are not final calibration results.
+A third probe (**4711750**) additionally called the actual isolated TACKOS HTTP
+predictor against the same temporary group-calibrated server: warm prediction
+median/p95 was 47.8/49.8 ms for 128 molecules over ten calls. This tests the
+adapter on the provisional model, not a complete TACKOS training run.
