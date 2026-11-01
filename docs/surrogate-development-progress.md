@@ -512,3 +512,23 @@ source/VHL degradation; do not treat exploratory subgroup tests as confirmation.
 The candidates were chosen after inspecting prior development results, so their
 intervals are exploratory. The weights are fixed in advance; no final model is trained or calibrated by
 this experiment, and reserved calibration/confirmation/test labels remain unused.
+
+Job **4719354** completed after fixing CSV round-trip parsing; its two synthetic
+checks passed. The initial job **4718616** stopped at label verification before
+writing predictions because the default CSV parser lost floating-point precision.
+Against matched exact-label XGBoost, the pDC50 blend achieved CV RMSE 0.7089
+versus 0.7331 (3.3% reduction) and source RMSE 1.0192 versus 1.0688. Dmax's
+three-model blend achieved CV RMSE 0.2023 versus 0.2064 (2.0%) and source RMSE
+0.2959 versus 0.3101. Neither meets the 5% CV gate.
+
+The activity XGBoost+ExtraTrees blend achieved CV AP 0.7664 versus 0.7675 and
+source AP 0.5192 versus 0.4884; the source paired publication-bootstrap
+interval for AP improvement was [0.0010, 0.0512]. CV/source Brier scores were
+0.1413/0.1648 versus 0.1450/0.1704, and log losses were 0.4273/0.5052 versus
+0.4463/0.5407. On source VHL (75 rows, 21 publications), AP was 0.4231 versus
+0.4272, with paired interval [−0.0484, 0.0359]. These source and subgroup
+comparisons are exploratory after candidate selection. The blend misses the
++0.03 CV AP gate and is not a promoted or calibrated model. The XGBoost+CatBoost
+activity blend also missed that gate (CV AP 0.7708). Results and slice ledgers
+are in `models/research_fixed_blends_summary.json` and
+`models/research_fixed_blend_slices/`; confirmation/test labels were not read.
