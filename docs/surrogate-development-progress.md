@@ -362,6 +362,15 @@ groups makes the reported intervals exploratory, and bootstrapping fixed
 out-of-fold predictions does not capture refitting variability. Interval
 methodology and alpha must also be fixed before reading calibration outcomes.
 
+The fixed input-dependent scale study **4711809** passed its synthetic checks
+(**4711804**) and completed using stacking labels only. Against global-scale
+group-maximum intervals, its mean width fell from 2.8478 to 2.5842 pDC50 units
+(9.26%), while group-all coverage changed from 0.8889 to 0.8711. The paired
+coverage difference was −0.0178 [−0.0444, 0.0089], and the width difference was
+−0.2637 [−0.3436, −0.1868]. It narrowly misses the prespecified 10% width gate;
+retain the simpler global scale provisionally. These are development estimates,
+not final-calibration results.
+
 A Dmax interval-loss XGBoost pilot **4711416** uses exact measurements as
 zero-width intervals and censored measurements as bounds; its comparison with
 fixed-parameter exact-label XGBoost is scheduled as **4711417**. This is a
