@@ -19,7 +19,7 @@ export UV_CACHE_DIR=/nobackup/proj/disk/naiss2024-5-630/personal/ribes/cache/uv
 tasks=(dmax pdc50 activity)
 task=${tasks[$SLURM_ARRAY_TASK_ID]}
 .venv/bin/python -m pytest test/test_benchmark_surrogates.py -q
-.venv/bin/python -u scripts/benchmark_surrogates.py \
+.venv/bin/python -u scripts/surrogate_research/benchmark_surrogates.py \
     --snapshot models/research_v1 --output "models/research_tuned_baseline/$task" \
     --task "$task" --model current_xgb --feature baseline \
     --trials 20 --jobs "$SLURM_CPUS_PER_TASK" --policy compat --eval-policy exact

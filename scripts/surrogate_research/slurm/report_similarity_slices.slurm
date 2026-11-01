@@ -17,7 +17,7 @@ tasks=(pdc50 activity)
 candidates=(pdc50_xgb_morgan_r2_2048_bit_exact activity_catboost_baseline_exact)
 i=$SLURM_ARRAY_TASK_ID
 .venv/bin/python -m pytest test/test_similarity_slices.py -q
-.venv/bin/python -u scripts/report_similarity_slices.py \
+.venv/bin/python -u scripts/surrogate_research/report_similarity_slices.py \
     --candidate "models/research_repeated_finalists/${candidates[$i]}" \
     --reference "models/research_repeated_reference/${tasks[$i]}" \
     --output "models/research_similarity_slices/${candidates[$i]}.json"

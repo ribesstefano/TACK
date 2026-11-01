@@ -70,8 +70,8 @@ def predict_endpoint(snapshot, run, output):
                 "source_run": str(run), "source_config_sha256": sha256(run / "config.json"),
                 "source_metrics_sha256": sha256(run / "metrics.json"),
                 "runner_sha256": sha256(__file__),
-                "fit_tool_sha256": sha256("scripts/fit_surrogate_candidate.py"),
-                "benchmark_sha256": sha256("scripts/benchmark_surrogates.py"),
+                "fit_tool_sha256": sha256("scripts/surrogate_research/fit_surrogate_candidate.py"),
+                "benchmark_sha256": sha256("scripts/surrogate_research/benchmark_surrogates.py"),
                 "feature": config["feature"],
                 "repeats": config["repeats"], "folds": config["folds"]}
     write_once_json(output / "config.json", metadata)

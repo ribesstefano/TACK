@@ -2,7 +2,7 @@
 import json
 import numpy as np
 
-from scripts.benchmark_surrogates import estimator, fit_learner, scores
+from scripts.surrogate_research.benchmark_surrogates import estimator, fit_learner, scores
 
 
 def test_constant_prediction_has_null_rank_correlation():

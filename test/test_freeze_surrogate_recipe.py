@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from scripts.freeze_surrogate_recipe import recipe_from_run
+from scripts.surrogate_research.freeze_surrogate_recipe import recipe_from_run
 
 
 def _run(path):

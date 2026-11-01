@@ -22,7 +22,7 @@ features=(baseline baseline morgan_r3_4096_bit morgan_r2_2048_bit baseline basel
 task=${tasks[$SLURM_ARRAY_TASK_ID]}
 model=${models[$SLURM_ARRAY_TASK_ID]}
 feature=${features[$SLURM_ARRAY_TASK_ID]}
-.venv/bin/python -u scripts/benchmark_surrogates.py \
+.venv/bin/python -u scripts/surrogate_research/benchmark_surrogates.py \
     --snapshot models/research_v1 \
     --output "models/research_tuned_shortlist/${task}_${model}_${feature}" \
     --task "$task" --model "$model" --feature "$feature" \

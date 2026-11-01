@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from scripts.report_similarity_slices import nearest_similarity
+from scripts.surrogate_research.report_similarity_slices import nearest_similarity
 
 
 def test_identical_molecule_has_similarity_one_and_order_is_preserved():

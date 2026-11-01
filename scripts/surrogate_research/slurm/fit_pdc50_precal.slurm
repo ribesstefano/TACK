@@ -12,6 +12,6 @@ set -euo pipefail
 cd /nobackup/proj/disk/naiss2024-5-630/personal/ribes/TACK
 unset PYTHONPATH
 export PYTHONNOUSERSITE=1 OMP_NUM_THREADS=1
-.venv/bin/python -u scripts/fit_surrogate_candidate.py \
+.venv/bin/python -u scripts/surrogate_research/fit_surrogate_candidate.py \
     --snapshot models/research_v1 --recipe models/research_recipes/pdc50_r2_precal.json \
     --output "${PRECAL_OUTPUT:-models/research_precal/pdc50_r2_v2}" --pre-calibration

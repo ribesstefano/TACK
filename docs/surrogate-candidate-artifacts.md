@@ -5,7 +5,7 @@ does not select a model, download an artifact or replace the published ensembles
 The candidate is not ready for production until the locked evaluation, calibration,
 latency and downstream checks in the development plan have passed.
 
-`scripts/fit_surrogate_candidate.py` takes a frozen snapshot and a JSON recipe.
+`scripts/surrogate_research/fit_surrogate_candidate.py` takes a frozen snapshot and a JSON recipe.
 The recipe pins the endpoint, molecular feature matrix, label policy, shared
 grouped fold schedule, a learner and parameter overrides for every member,
 stacking strategy and calibration alpha. Each base member trains only on search
@@ -23,7 +23,7 @@ reading calibration outcomes.
 
 Defaults not listed in `params` are defined by the fit tool; its source hash and
 the dependency versions are recorded with the artifact.
-After a run has been explicitly selected, `scripts/freeze_surrogate_recipe.py
+After a run has been explicitly selected, `scripts/surrogate_research/freeze_surrogate_recipe.py
 --run RUN_DIRECTORY --output RECIPE.json` extracts its nested-tuned member
 parameters and records the source hashes. It does not select or rank candidates.
 After choosing the interval method on development data, pass `--unit group_max`
@@ -54,7 +54,7 @@ counts are for understanding the format, not a recommended training recipe:
 For a locked recipe, run on a CPU allocation from the repository root:
 
 ```bash
-env -u PYTHONPATH OMP_NUM_THREADS=1 .venv/bin/python scripts/fit_surrogate_candidate.py \
+env -u PYTHONPATH OMP_NUM_THREADS=1 .venv/bin/python scripts/surrogate_research/fit_surrogate_candidate.py \
   --snapshot models/research_v1 --recipe /path/to/locked-recipe.json \
   --output /path/to/new-candidate/dmax
 ```
@@ -69,7 +69,7 @@ a learned decomposition of biological noise.
 For a preliminary search-only bundle, add `--pre-calibration` to the fit
 command. This mode does not read stacking, calibration or confirmation labels
 and cannot be loaded by the candidate server. Use
-`scripts/study_surrogate_stacking.py --snapshot SNAPSHOT --bundle BUNDLE --output
+`scripts/surrogate_research/study_surrogate_stacking.py --snapshot SNAPSHOT --bundle BUNDLE --output
 STUDY_DIR` to compare uniform and prespecified regularized convex weights with
 group-held-out stacking predictions. The study reports alternatives and does
 not select a strategy or read calibration labels. Select the final recipe from

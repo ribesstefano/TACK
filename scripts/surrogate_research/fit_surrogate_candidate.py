@@ -331,7 +331,7 @@ def _fit_one(snapshot, recipe, output, *, pre_calibration=False):
         if family in package_for_family:
             package_versions[package_for_family[family]] = importlib.metadata.version(
                 package_for_family[family])
-    code_files = [Path(__file__), Path("scripts/benchmark_surrogates.py"),
+    code_files = [Path(__file__), Path("scripts/surrogate_research/benchmark_surrogates.py"),
                   Path("tackai/fusion/candidate_artifact.py"),
                   Path("tackai/fusion/molecular_spec.py"), Path("tackai/fusion/research.py")]
     context_contract = {

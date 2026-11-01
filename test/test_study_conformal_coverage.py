@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from scripts import fit_surrogate_candidate as fit_cli
-from scripts import study_conformal_coverage as coverage_cli
+from scripts.surrogate_research import fit_surrogate_candidate as fit_cli
+from scripts.surrogate_research import study_conformal_coverage as coverage_cli
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES
 
 
@@ -136,7 +136,7 @@ def test_study_rejects_snapshot_artifact_hash_mismatch(tmp_path):
 def test_study_cli_help_runs_as_direct_script():
     repository = Path(__file__).resolve().parents[1]
     result = subprocess.run(
-        [sys.executable, "scripts/study_conformal_coverage.py", "--help"],
+        [sys.executable, "scripts/surrogate_research/study_conformal_coverage.py", "--help"],
         cwd=repository, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     assert "--alpha" in result.stdout and "--bundle" in result.stdout

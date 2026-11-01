@@ -15,7 +15,7 @@ unset PYTHONPATH
 export PYTHONNOUSERSITE=1 OMP_NUM_THREADS=1
 tasks=(dmax pdc50 activity)
 task=${tasks[$SLURM_ARRAY_TASK_ID]}
-.venv/bin/python -u scripts/benchmark_surrogates.py \
+.venv/bin/python -u scripts/surrogate_research/benchmark_surrogates.py \
     --snapshot models/research_v1 \
     --output "models/research_exact_current/${task}_current_xgb_baseline_exact" \
     --task "$task" --model current_xgb --feature baseline \

@@ -2,7 +2,7 @@
 import pandas as pd
 import pytest
 
-from scripts.report_surrogate_slices import METADATA, slice_report
+from scripts.surrogate_research.report_surrogate_slices import METADATA, slice_report
 
 
 def inputs():

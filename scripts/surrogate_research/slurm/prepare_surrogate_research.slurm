@@ -14,5 +14,5 @@ export PYTHONNOUSERSITE=1 OMP_NUM_THREADS=1
 export HF_HOME=/nobackup/proj/disk/naiss2024-5-630/personal/ribes/cache/hf
 export TACKAI_CACHE=/nobackup/proj/disk/naiss2024-5-630/personal/ribes/cache/TACK
 export UV_CACHE_DIR=/nobackup/proj/disk/naiss2024-5-630/personal/ribes/cache/uv
-.venv/bin/python -u scripts/prepare_surrogate_research.py \
+.venv/bin/python -u scripts/surrogate_research/prepare_surrogate_research.py \
     --cache-dir "$TACKAI_CACHE" --output models/research_v1

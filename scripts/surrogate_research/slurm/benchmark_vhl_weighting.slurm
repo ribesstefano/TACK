@@ -13,7 +13,7 @@ cd /nobackup/proj/disk/naiss2024-5-630/personal/ribes/TACK
 unset PYTHONPATH
 export PYTHONNOUSERSITE=1 OMP_NUM_THREADS=1
 .venv/bin/python -m pytest test/test_vhl_weighting.py -q
-.venv/bin/python -u scripts/benchmark_vhl_weighting.py \
+.venv/bin/python -u scripts/surrogate_research/benchmark_vhl_weighting.py \
     --snapshot models/research_v1 \
     --run models/research_repeated_finalists/activity_catboost_baseline_exact \
     --output models/research_vhl_weighting/activity_catboost_weighted --jobs "$SLURM_CPUS_PER_TASK"

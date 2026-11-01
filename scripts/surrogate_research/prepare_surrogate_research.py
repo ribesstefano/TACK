@@ -10,6 +10,7 @@ import os
 import hashlib
 from pathlib import Path
 import subprocess
+import sys
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 import numpy as np
@@ -20,7 +21,9 @@ from tackai.fusion.context import ContextEncoder, stage_context_tables
 from tackai.fusion.data import FusionData
 from tackai.fusion.labels import research_targets
 from tackai.fusion.research import assign_partitions, identity_groups, sha256, write_once_json
-from train_fast_models import test_overlap_smiles
+# The existing fast trainer remains at scripts/ while research tools live here.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from train_fast_models import test_overlap_smiles  # noqa: E402
 
 
 def main():

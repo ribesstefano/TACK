@@ -1,5 +1,11 @@
 # 🤖 Model Training and Ensemble Selection Scripts
 
+## Script layout
+
+- `surrogate_research/` contains the current surrogate experiments, audits, and candidate tools.
+- `surrogate_research/slurm/` contains their Slurm job recipes. Run them from the repository root, for example `sbatch scripts/surrogate_research/slurm/benchmark_exact_current.slurm`.
+- The scripts in this directory include the existing fast-model and legacy training entry points; local job scripts can continue to use them.
+
 This directory contains scripts for training PROTAC degradation prediction models on TACK and constructing optimal ensembles with uncertainty quantification.
 
 ## 📋 Overview

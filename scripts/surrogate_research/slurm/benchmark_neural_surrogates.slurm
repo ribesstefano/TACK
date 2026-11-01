@@ -20,13 +20,13 @@ export UV_CACHE_DIR=/nobackup/proj/disk/naiss2024-5-630/personal/ribes/cache/uv
 if (( SLURM_ARRAY_TASK_ID < 2 )); then
     features=(baseline morgan_r2_2048_bit)
     feature=${features[$SLURM_ARRAY_TASK_ID]}
-    .venv/bin/python -u scripts/benchmark_neural_surrogates.py \
+    .venv/bin/python -u scripts/surrogate_research/benchmark_neural_surrogates.py \
         --snapshot models/research_v1 --output "${NEURAL_ROOT:-models/research_neural_pilot}/joint_$feature" \
         --mode joint --feature "$feature" --epochs 100 --policy "${LABEL_POLICY:-exact}"
 else
     tasks=(dmax pdc50 activity)
     task=${tasks[$((SLURM_ARRAY_TASK_ID - 2))]}
-    .venv/bin/python -u scripts/benchmark_neural_surrogates.py \
+    .venv/bin/python -u scripts/surrogate_research/benchmark_neural_surrogates.py \
         --snapshot models/research_v1 --output "${NEURAL_ROOT:-models/research_neural_pilot}/single_$task" \
         --mode single --task "$task" --feature baseline --epochs 100 --policy "${LABEL_POLICY:-exact}"
 fi

@@ -283,7 +283,7 @@ its original checkout's unrelated changes remain untouched. Cross-repository
 loopback test **4693318** is still running; full TACKOS RL/container validation
 has not been performed.
 
-`scripts/freeze_surrogate_recipe.py` can extract explicitly selected, complete
+`scripts/surrogate_research/freeze_surrogate_recipe.py` can extract explicitly selected, complete
 grouped-fold settings with source-run hashes. The candidate fit recipe now pins
 the snapshot manifest SHA-256 and rejects another snapshot before training. This
 tool does not automatically choose a winner; do not freeze a final recipe until
@@ -326,8 +326,18 @@ optimized and no uncertainty interval is attached. They do not override the
 primary RMSE gate, but show that a model can change the high-degradation signal
 even when its aggregate RMSE changes little.
 
-Exact-label current-XGB comparators (**4711281**) are running with identical
-folds to separate label-policy effects from architecture/representation changes.
+Exact-label current-XGB comparators (**4711281**, summarized in **4716929**)
+completed on identical folds. For pDC50, radius 2 achieved CV RMSE 0.7108
+versus 0.7331 (3.0% lower; paired 95% improvement interval [0.0122, 0.0331]);
+source RMSE was 1.0179 versus 1.0688 (interval [0.0054, 0.0945]). Radius 3
+had CV RMSE 0.7091 and source RMSE 1.0274. Thus much of the larger gain over
+the compatibility-trained reference is associated with label-policy changes;
+the representation-only CV gain is below 5%. Dmax CatBoost improved CV RMSE
+from 0.2064 to 0.2013 (2.5%), while activity CatBoost changed CV AP from
+0.7675 to 0.7684. Neither supports promotion against this matched baseline.
+These are development comparisons, not confirmation or test results.
+Matched-baseline biological and source slice reports are queued as **4716990**
+to check whether the aggregate comparisons conceal subgroup degradation.
 The radius-2 pDC50 fold parameters were saved as a *pre-calibration* recipe in
 `models/research_recipes/pdc50_r2_precal.json`; no final candidate has been
 selected. A search-only endpoint-head activity ranking experiment (**4711307**,
@@ -408,6 +418,11 @@ CatBoost fold parameters and computes bounded VHL source-balancing weights from
 each training fold only. Source and E3 identifiers do not enter its feature
 matrix. Paired overall and E3 slice reports **4711454** and **4711455** depend
 on completion and compare against the otherwise identical unweighted model.
+The completed comparison found pooled CV AP 0.7664 versus 0.7684 unweighted
+(difference −0.0020; paired 95% interval [−0.0074, 0.0031]). Source-holdout
+AP was 0.4705 versus 0.4606 (difference 0.0100; interval [−0.0308, 0.0809]);
+the VHL slice contained only 75 rows and its interval also crossed zero. This
+does not establish a benefit from source weighting.
 
 The fold-specific similarity diagnostic **4711526** computes each held-out
 molecule's maximum chirality-aware radius-2 Morgan Tanimoto similarity to that

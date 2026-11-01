@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from scripts.benchmark_censored_dmax import interval_gradient, read_bound_rows
+from scripts.surrogate_research.benchmark_censored_dmax import interval_gradient, read_bound_rows
 
 
 def test_interval_gradient_matches_exact_and_censored_constraints():

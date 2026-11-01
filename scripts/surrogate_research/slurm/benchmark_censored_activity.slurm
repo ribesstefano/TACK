@@ -15,7 +15,7 @@ unset PYTHONPATH
 export PYTHONNOUSERSITE=1 OMP_NUM_THREADS=1
 models=(extratrees catboost xgb)
 model=${models[$SLURM_ARRAY_TASK_ID]}
-.venv/bin/python scripts/benchmark_surrogates.py \
+.venv/bin/python scripts/surrogate_research/benchmark_surrogates.py \
     --snapshot models/research_v1 \
     --output "models/research_censored_activity/activity_${model}_baseline" \
     --task activity --model "$model" --feature baseline \

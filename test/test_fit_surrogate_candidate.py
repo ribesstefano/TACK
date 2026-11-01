@@ -6,7 +6,7 @@ import json
 import numpy as np
 import pytest
 
-from scripts import fit_surrogate_candidate as fit_cli
+from scripts.surrogate_research import fit_surrogate_candidate as fit_cli
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES
 
 

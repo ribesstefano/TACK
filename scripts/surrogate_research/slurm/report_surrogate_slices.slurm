@@ -16,7 +16,7 @@ export PYTHONNOUSERSITE=1 OMP_NUM_THREADS=1
 tasks=(dmax pdc50 activity)
 candidates=(dmax_extratrees_baseline pdc50_xgb_morgan_r3_4096_bit activity_extratrees_baseline)
 for i in 0 1 2; do
-    .venv/bin/python scripts/report_surrogate_slices.py \
+    .venv/bin/python scripts/surrogate_research/report_surrogate_slices.py \
         --candidate "models/research_exact_pilot/${candidates[$i]}" \
         --reference "models/research_tuned_baseline/${tasks[$i]}" \
         --output "models/research_slices/${tasks[$i]}.json"

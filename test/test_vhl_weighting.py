@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from scripts.benchmark_vhl_weighting import vhl_source_weights
+from scripts.surrogate_research.benchmark_vhl_weighting import vhl_source_weights
 
 
 def test_vhl_sources_are_balanced_and_other_e3s_are_unchanged_relatively():

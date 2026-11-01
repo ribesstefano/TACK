@@ -15,7 +15,10 @@ from sklearn.model_selection import GroupShuffleSplit
 from tackai.fusion.data import make_splits
 from tackai.fusion.graph import GraphPredictor, TASK_ORDER
 from tackai.fusion.research import sha256, write_once_json
-from benchmark_surrogates import scores
+try:
+    from .benchmark_surrogates import scores
+except ImportError:
+    from benchmark_surrogates import scores
 
 
 def _load_snapshot(snapshot, feature, policy):

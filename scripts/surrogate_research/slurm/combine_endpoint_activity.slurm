@@ -15,7 +15,7 @@ unset PYTHONPATH
 export PYTHONNOUSERSITE=1 OMP_NUM_THREADS=1
 names=(dmax_catboost dmax_extratrees)
 name=${names[$SLURM_ARRAY_TASK_ID]}
-.venv/bin/python scripts/benchmark_endpoint_activity.py combine \
+.venv/bin/python scripts/surrogate_research/benchmark_endpoint_activity.py combine \
     --dmax "models/research_endpoint_activity/${name}" \
     --pdc50 models/research_endpoint_activity/pdc50_r2 \
     --output "models/research_endpoint_activity_combined/${name}"

@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.benchmark_endpoint_activity import bottleneck_score, combine
+from scripts.surrogate_research.benchmark_endpoint_activity import bottleneck_score, combine
 
 
 def test_bottleneck_score_respects_both_thresholds():

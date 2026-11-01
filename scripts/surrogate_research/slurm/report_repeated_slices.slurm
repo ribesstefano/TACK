@@ -18,7 +18,9 @@ candidates=(dmax_extratrees_baseline_exact dmax_catboost_baseline_exact
     pdc50_xgb_morgan_r2_2048_bit_exact pdc50_xgb_morgan_r3_4096_bit_exact
     activity_extratrees_baseline_exact activity_catboost_baseline_exact)
 i=$SLURM_ARRAY_TASK_ID
-.venv/bin/python scripts/report_surrogate_slices.py \
+reference_root=${REFERENCE_ROOT:-models/research_repeated_reference}
+output_root=${OUTPUT_ROOT:-models/research_repeated_slices}
+.venv/bin/python scripts/surrogate_research/report_surrogate_slices.py \
     --candidate "models/research_repeated_finalists/${candidates[$i]}" \
-    --reference "models/research_repeated_reference/${tasks[$i]}" \
-    --output "models/research_repeated_slices/${candidates[$i]}.json"
+    --reference "${reference_root}/${tasks[$i]}" \
+    --output "${output_root}/${candidates[$i]}.json"

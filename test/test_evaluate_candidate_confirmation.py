@@ -8,7 +8,7 @@ import pytest
 from rdkit import rdBase
 from sklearn.ensemble import ExtraTreesClassifier, ExtraTreesRegressor
 
-from scripts import evaluate_candidate_confirmation as eval_cli
+from scripts.surrogate_research import evaluate_candidate_confirmation as eval_cli
 from tackai.fusion.candidate_artifact import CandidateArtifact
 from tackai.fusion.molecular_spec import MolecularFeatureSpec
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES

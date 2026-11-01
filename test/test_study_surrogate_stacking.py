@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts import fit_surrogate_candidate as fit_cli
-from scripts import study_surrogate_stacking as study_cli
+from scripts.surrogate_research import fit_surrogate_candidate as fit_cli
+from scripts.surrogate_research import study_surrogate_stacking as study_cli
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES
 
 
@@ -142,7 +142,7 @@ def test_study_rejects_calibrated_or_wrong_snapshot_bundle(tmp_path):
 def test_study_cli_help_runs_as_direct_script():
     repository = Path(__file__).resolve().parents[1]
     result = subprocess.run(
-        [sys.executable, "scripts/study_surrogate_stacking.py", "--help"],
+        [sys.executable, "scripts/surrogate_research/study_surrogate_stacking.py", "--help"],
         cwd=repository, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     assert "--snapshot" in result.stdout and "--bundle" in result.stdout

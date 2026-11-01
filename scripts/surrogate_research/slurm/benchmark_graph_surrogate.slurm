@@ -16,7 +16,7 @@ export HF_HOME=/nobackup/proj/disk/naiss2024-5-630/personal/ribes/cache/hf
 export TACKAI_CACHE=/nobackup/proj/disk/naiss2024-5-630/personal/ribes/cache/TACK
 export UV_CACHE_DIR=/nobackup/proj/disk/naiss2024-5-630/personal/ribes/cache/uv
 .venv/bin/python -m pytest test/test_graph_surrogate.py -q
-.venv/bin/python -u scripts/benchmark_graph_surrogate.py \
+.venv/bin/python -u scripts/surrogate_research/benchmark_graph_surrogate.py \
     --snapshot models/research_v1 \
     --output "${GRAPH_ROOT:-models/research_graph_pilot}/dmpnn_probe" \
     --evaluated-splits fold0 source_holdout --policy exact \

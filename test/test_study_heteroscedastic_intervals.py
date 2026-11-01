@@ -8,8 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts import fit_surrogate_candidate as fit_cli
-from scripts import study_heteroscedastic_intervals as study_cli
+from scripts.surrogate_research import fit_surrogate_candidate as fit_cli
+from scripts.surrogate_research import study_heteroscedastic_intervals as study_cli
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES
 
 
@@ -112,7 +112,7 @@ def test_calibration_and_confirmation_label_changes_do_not_change_study_metrics(
 def test_study_cli_help_runs_as_direct_script():
     repository = Path(__file__).resolve().parents[1]
     result = subprocess.run(
-        [sys.executable, "scripts/study_heteroscedastic_intervals.py", "--help"],
+        [sys.executable, "scripts/surrogate_research/study_heteroscedastic_intervals.py", "--help"],
         cwd=repository, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     assert "--alpha" in result.stdout and "--scale-fraction" in result.stdout

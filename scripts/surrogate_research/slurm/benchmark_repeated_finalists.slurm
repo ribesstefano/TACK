@@ -28,7 +28,7 @@ task=${tasks[$i]}
 model=${models[$i]}
 feature=${features[$i]}
 policy=${policies[$i]}
-.venv/bin/python -u scripts/benchmark_surrogates.py \
+.venv/bin/python -u scripts/surrogate_research/benchmark_surrogates.py \
     --snapshot models/research_v1 \
     --output "models/research_repeated_finalists/${task}_${model}_${feature}_${policy}" \
     --task "$task" --model "$model" --feature "$feature" \

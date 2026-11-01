@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.summarize_surrogate_benchmarks import paired_interval, paired_view
+from scripts.surrogate_research.summarize_surrogate_benchmarks import paired_interval, paired_view
 
 
 def ledger():
