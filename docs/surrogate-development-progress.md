@@ -332,7 +332,8 @@ versus 0.7331 (3.0% lower; paired 95% improvement interval [0.0122, 0.0331]);
 source RMSE was 1.0179 versus 1.0688 (interval [0.0054, 0.0945]). Radius 3
 had CV RMSE 0.7091 and source RMSE 1.0274. Thus much of the larger gain over
 the compatibility-trained reference is associated with label-policy changes;
-the representation-only CV gain is below 5%. Dmax CatBoost improved CV RMSE
+the matched-label candidate's CV gain is below 5%. Its representation and
+training settings both differ from the comparator. Dmax CatBoost improved CV RMSE
 from 0.2064 to 0.2013 (2.5%), while activity CatBoost changed CV AP from
 0.7675 to 0.7684. Neither supports promotion against this matched baseline.
 These are development comparisons, not confirmation or test results.
