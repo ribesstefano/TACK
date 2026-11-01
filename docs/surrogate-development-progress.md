@@ -182,6 +182,16 @@ coverage change, rather than observed-label flips, drive this policy comparison.
 This makes endpoint-time missingness and cohort selection important next checks;
 it does not justify inventing missing times or treating uncertain positives as true.
 
+A raw search-row time audit found 3,342 rows with both endpoint times known,
+including 21 with differing times; 3,369 have only one time and 2,048 have none.
+Only 15 of the differing-time rows have a Dmax value and 21 have a DC50 value;
+among rows with just one time, seven Dmax-valued rows and 20 DC50-valued rows
+currently inherit the other endpoint's time. These counts precede exact-label
+eligibility checks. Endpoint-specific time handling is scientifically worth
+documenting, but this small directly affected subset is unlikely by itself to
+explain the aggregate error. The reproducible search-only audit is
+`models/research_label_attrition_v2.json` (job **4711866**).
+
 ### Remaining implementation work now underway
 
 A separate Chemprop graph probe replaces only the molecular fingerprint branch.
@@ -308,6 +318,14 @@ misses the +0.03 gate. Activity source VHL AP is 0.2693 for CatBoost and 0.3295
 for ExtraTrees versus 0.3936 for the baseline (75 rows, 21 publications); both
 intervals include zero but do not exclude material degradation.
 
+As a descriptive Dmax threshold check, scoring `Dmax > 0.80` at a fixed
+predicted-Dmax threshold of 0.80 gave repeated-CV recall 0.528 for CatBoost,
+0.450 for ExtraTrees and 0.406 for the current baseline; the corresponding
+source-holdout recalls were 0.413, 0.180 and 0.382. These thresholds were not
+optimized and no uncertainty interval is attached. They do not override the
+primary RMSE gate, but show that a model can change the high-degradation signal
+even when its aggregate RMSE changes little.
+
 Exact-label current-XGB comparators (**4711281**) are running with identical
 folds to separate label-policy effects from architecture/representation changes.
 The radius-2 pDC50 fold parameters were saved as a *pre-calibration* recipe in
@@ -334,6 +352,8 @@ The cross-repository live check **4711192** passed after earlier filesystem-stal
 job **4693318** timed out. It exercised the actual TACK candidate server,
 REINVENT client and isolated TACKOS HTTP predictor on synthetic models; it is
 not a full TACKOS RL run.
+TACKOS commit `9270f54` adds invalid-row consistency checks; focused tests
+**4711806** and the cross-repository loopback check **4711807** passed.
 
 The isolated TACKOS branch's lean REINVENT configuration and HTTP predictor
 tests passed together (**4711635**, 18 tests). Its changed files pass Ruff. A

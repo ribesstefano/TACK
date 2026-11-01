@@ -20,7 +20,7 @@ def main():
             raise ValueError(f"Snapshot changed: {filename}")
     table = pd.read_csv(args.snapshot / "rows.csv", usecols=[
         "partition", "source_partition", "e3_raw", "source", "publication",
-        "Dmax_h", "DC50_h", "Dmax_operator", "DC50_operator"])
+        "Dmax_h", "DC50_h", "Dmax_operator", "DC50_operator", "dmax_raw_pct", "dc50_nM"])
     table = table.loc[table.partition.eq("search")].copy()
     with np.load(args.snapshot / "labels.npz", allow_pickle=False) as data:
         labels = {name: data[name][table.index] for name in data.files
@@ -55,9 +55,24 @@ def main():
             record["observed_activity_disagreements"] = int((np.isfinite(compat) & np.isfinite(exact)
                                                             & (compat != exact)).sum())
             reports.append(record)
+    dtime = pd.to_numeric(table.Dmax_h, errors="coerce")
+    ptime = pd.to_numeric(table.DC50_h, errors="coerce")
+    dvalue = pd.to_numeric(table.dmax_raw_pct, errors="coerce")
+    pvalue = pd.to_numeric(table.dc50_nM, errors="coerce")
+    known_d, known_p = np.isfinite(dtime), np.isfinite(ptime)
+    different = known_d & known_p & ~np.isclose(dtime, ptime, rtol=0, atol=1e-6)
+    time_audit = {"both_times": int((known_d & known_p).sum()),
+                  "different_both_times": int(different.sum()),
+                  "different_with_dmax": int((different & np.isfinite(dvalue)).sum()),
+                  "different_with_dc50": int((different & np.isfinite(pvalue)).sum()),
+                  "only_one_time": int((known_d ^ known_p).sum()),
+                  "no_time": int((~known_d & ~known_p).sum()),
+                  "dmax_missing_uses_dc50_time": int((~known_d & known_p & np.isfinite(dvalue)).sum()),
+                  "dc50_missing_uses_dmax_time": int((~known_p & known_d & np.isfinite(pvalue)).sum())}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({"snapshot_hash": sha256(args.snapshot / "manifest.json"),
-        "scope": "search rows only; reasons can overlap; no confirmation/test analysis", "slices": reports},
+        "scope": "search rows only; reasons can overlap; no confirmation/test analysis",
+        "endpoint_time_audit": time_audit, "slices": reports},
         indent=2, allow_nan=False) + "\n")
 
 
