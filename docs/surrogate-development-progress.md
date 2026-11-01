@@ -497,3 +497,18 @@ A third probe (**4711750**) additionally called the actual isolated TACKOS HTTP
 predictor against the same temporary group-calibrated server: warm prediction
 median/p95 was 47.8/49.8 ms for 128 molecules over ten calls. This tests the
 adapter on the provisional model, not a complete TACKOS training run.
+
+### Fixed-weight blend experiment (preregistered)
+
+The prior repeated predictions permit a development-only test of complementary
+errors without fitting blending weights. Before examining blend metrics, use
+uniform mixtures of pDC50 r2+r3, Dmax exact XGBoost+CatBoost+ExtraTrees, and
+activity exact XGBoost+CatBoost and exact XGBoost+ExtraTrees. Match every fold,
+row, label and group and score against exact-label current XGBoost on identical
+rows. Report paired chemical-group CV and publication source-holdout intervals,
+activity Brier/log loss and E3 slices. Apply the existing 5% regression RMSE
+and +0.03 activity AP gates, require supportive uncertainty and no material
+source/VHL degradation; do not treat exploratory subgroup tests as confirmation.
+The candidates were chosen after inspecting prior development results, so their
+intervals are exploratory. The weights are fixed in advance; no final model is trained or calibrated by
+this experiment, and reserved calibration/confirmation/test labels remain unused.
