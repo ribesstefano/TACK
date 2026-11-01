@@ -604,6 +604,11 @@ simplest method unless probability losses improve without material AP or slice
 regression; any selected method requires a separate locked recipe, independent
 calibration and confirmation. This study does not select a final activity model
 and does not access real calibration, confirmation or historical-test labels.
+Use five group folds (seed 20261101); constrain Platt's slope to be nonnegative
+and penalize squared deviations from slope 1 and intercept 0 with strength 0.01.
 Search-only bundle array **4719992** has been submitted; neither bundle is a
 calibrated or promoted model. Its output recipes pin the exact source runs and
 snapshot before fitting.
+The grouped calibration-study implementation passed 11 focused tests in
+**4720187**. XGBoost study **4720332** and ExtraTrees study **4720333** are
+queued after their respective bundle-array tasks; they use only stacking labels.

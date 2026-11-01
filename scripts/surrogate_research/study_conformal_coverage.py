@@ -62,7 +62,7 @@ def _interval_metrics(y, mean, scale, q, groups):
     }
 
 
-def _validate_bundle(snapshot, bundle):
+def _validate_bundle(snapshot, bundle, *, task_type="regression"):
     """Load and cross-check the frozen snapshot and uncalibrated bundle."""
     snapshot, bundle = Path(snapshot), Path(bundle)
     manifest_path = snapshot / "manifest.json"
@@ -82,8 +82,9 @@ def _validate_bundle(snapshot, bundle):
         raise ValueError("bundle context contract is pinned to a different snapshot")
     if bundle_manifest.get("recipe") != recipe or bundle_manifest.get("context_contract") != contract:
         raise ValueError("candidate bundle provenance differs from its serialized artifact")
-    if artifact.task != "regression" or recipe.get("task") not in {"dmax", "pdc50"}:
-        raise ValueError("conformal interval study requires a regression candidate")
+    expected_tasks = {"regression": {"dmax", "pdc50"}, "classification": {"activity"}}
+    if task_type not in expected_tasks or artifact.task != task_type or recipe.get("task") not in expected_tasks[task_type]:
+        raise ValueError(f"study requires a {task_type} candidate")
     if (artifact.residual_scale_ is not None or artifact.q_hat_ is not None
             or artifact.alpha_ is not None or artifact.temperature_ is not None):
         raise ValueError("candidate bundle must be uncalibrated")
