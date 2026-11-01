@@ -18,7 +18,7 @@ from rdkit.Chem import rdFingerprintGenerator
 
 from tackai.chem_utils import canonicalize_smiles
 from tackai.fusion.context import ContextEncoder, stage_context_tables
-from tackai.fusion.data import FusionData
+from tackai.fusion.data import FusionData, _block_cache_provenance
 from tackai.fusion.labels import research_targets
 from tackai.fusion.research import assign_partitions, identity_groups, sha256, write_once_json
 # The existing fast trainer remains at scripts/ while research tools live here.
@@ -41,7 +41,8 @@ def main():
     encoder = ContextEncoder(cache_dir=args.cache_dir, protein_space="combined")
     stage_context_tables(args.cache_dir, output / "context", protein_space="combined")
     exclude = test_overlap_smiles(args.dev_files, args.test_file)
-    data = FusionData.from_csv(args.dev_files, encoder=encoder, exclude_smiles=exclude,
+    # Freeze freshly computed blocks, not a cache with potentially unknown provenance.
+    data = FusionData.from_csv(args.dev_files, encoder=encoder, cache=False, exclude_smiles=exclude,
                                verbose=True)
     tab = data.table.copy()
     canonical = [canonicalize_smiles(s) for s in tab.smiles]
@@ -116,10 +117,11 @@ def main():
         "input_hashes": input_hashes, "context_fingerprint": encoder.fingerprint(),
         "protein_space": "combined", "features": features,
         "code_revision": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        "code_hashes": {str(p): sha256(p) for p in [Path(__file__),
+        "code_hashes": {str(p): sha256(p) for p in [Path(__file__), Path("tackai/chem_utils.py"),
             Path("tackai/fusion/data.py"), Path("tackai/fusion/labels.py"),
             Path("tackai/fusion/research.py"), Path("tackai/fusion/mol_encoder.py"),
             Path("tackai/fusion/context.py")]},
+        "molecular_block_provenance": _block_cache_provenance(data.featurizer),
         "versions": {name: importlib.metadata.version(name) for name in
                      ("numpy", "pandas", "scikit-learn", "xgboost", "rdkit")},
         "artifact_hashes": {p.name: sha256(p) for p in output.iterdir() if p.is_file()},

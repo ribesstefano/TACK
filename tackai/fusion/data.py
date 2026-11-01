@@ -7,19 +7,25 @@ again per table-content hash; molecular features are always computed on the fly,
 screening loop can score molecules that did not exist when the models were fitted.
 """
 import hashlib
+import inspect
 import json
+import platform
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from rdkit import Chem, RDLogger
+from rdkit import Chem, RDLogger, rdBase
 from rdkit.Chem.Scaffolds import MurckoScaffold
 from sklearn.model_selection import StratifiedGroupKFold
 
 from tackai.data.utils import get_cache_dir
+from tackai import chem_utils
+from tackai.fusion import context as context_module
+from tackai.fusion import mol_encoder as mol_encoder_module
 from tackai.fusion.context import (CONTEXT_BLOCKS, CONTEXT_FILES, DEFAULT_CONTEXT_REPO,
                                    SEQUENCE_BLOCKS, ContextEncoder, assay_time_or_default,
                                    stage_context_tables, upload_context_tables)
@@ -37,7 +43,34 @@ TASK_SUPPORT = {"dmax": (0.0, 1.0), "pdc50": None, "activity": (0.0, 1.0)}
 
 N_STRAT_BINS = 5
 REPEAT_SEEDS = [1000 + r for r in range(5)]   # the first five of repeat_seeds(n)
-CACHE_VERSION = "v2"   # v2: a missing assay_time is stored as ASSAY_TIME_DEFAULT, not NaN
+CACHE_VERSION = "v3"   # v3: record molecular implementation and numerical dependencies
+
+
+def _block_cache_provenance(featurizer):
+    """Describe code and numeric dependencies that can change computed blocks.
+
+    Never reuse an old block cache when this provenance cannot be obtained.
+    Inference and explicitly uncached training do not need this information.
+    """
+    try:
+        featurizer_source = inspect.getsourcefile(type(featurizer))
+    except (TypeError, OSError) as exc:
+        raise ValueError("Cannot safely cache this featurizer; use cache=False") from exc
+    sources = [__file__, chem_utils.__file__, context_module.__file__, mol_encoder_module.__file__,
+               featurizer_source]
+    source_hashes = {}
+    for source in sources:
+        if not source or not Path(source).is_file():
+            raise ValueError("Cannot safely cache features without readable source; use cache=False")
+        path = Path(source).resolve()
+        source_hashes[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+    numpy_build = getattr(np.__config__, "CONFIG", None) or {}
+    blas = numpy_build.get("Build Dependencies", {}).get("blas", {})
+    return {"source_sha256": source_hashes, "numpy": np.__version__,
+            "rdkit": rdBase.rdkitVersion, "python": platform.python_version(),
+            "machine": platform.machine(), "byteorder": sys.byteorder,
+            "blas_name": blas.get("name"),
+            "blas_configuration": blas.get("openblas configuration")}
 
 #: Every block of the design matrix, in column order: molecular first, then the context.
 BLOCK_ORDER = [*MOL_BLOCKS, *CONTEXT_BLOCKS]
@@ -697,11 +730,12 @@ class FusionData:
         context blocks from the previous embedding space.
         """
         cols = ["smiles", "e3_seq", "poi_seq", "cell_key", "assay_raw", "assay_time"]
-        h = hashlib.sha1(json.dumps([CACHE_VERSION, self.encoder.protein_space,
+        h = hashlib.sha1(json.dumps([CACHE_VERSION, _block_cache_provenance(self.featurizer),
+                                     self.encoder.protein_space,
                                      self.encoder.fingerprint(),
                                      self.featurizer.radius, self.featurizer.fp_size,
                                      self.featurizer.share_ipc, self.featurizer.descriptors,
-                                     sorted(self.dims.items())]).encode())
+                                     sorted(self.dims.items())], sort_keys=True).encode())
         if hasattr(self.featurizer, "spec"):
             # Count/binary fingerprints can have identical dimensions. A versioned
             # encoder must never reuse blocks from a different molecular contract.
@@ -711,7 +745,7 @@ class FusionData:
 
     def _build_matrix(self, cache: bool = True) -> None:
         """Fill ``X``, the scaffold groups and the targets, using the block cache if allowed."""
-        directory = self._cache_dir()
+        directory = self._cache_dir() if cache else None
         if cache and all((directory / f"{b}.npy").exists() for b in BLOCK_ORDER):
             blocks = {b: np.load(directory / f"{b}.npy") for b in BLOCK_ORDER}
         else:
@@ -726,7 +760,8 @@ class FusionData:
                     "fingerprint": [self.featurizer.radius, self.featurizer.fp_size],
                     "share_ipc": self.featurizer.share_ipc,
                     "descriptors": self.featurizer.descriptors,
-                    "version": CACHE_VERSION}, indent=1))
+                    "version": CACHE_VERSION,
+                    "provenance": _block_cache_provenance(self.featurizer)}, indent=1))
         self._X = np.concatenate([blocks[b] for b in BLOCK_ORDER], axis=1).astype(np.float32)
         self._groups, self.scaffold_info = scaffold_groups(self.table["smiles"])
         self._targets = make_targets(self.table["dmax_pct"], self.table["dc50_nM"])

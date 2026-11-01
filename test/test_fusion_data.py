@@ -150,6 +150,47 @@ def test_context_blocks_are_cached_between_constructions(fake_cache, tiny_csv):
     assert (fake_cache / "fusion_blocks").is_dir()
 
 
+def test_block_cache_is_invalidated_by_numeric_or_source_provenance(fake_cache, tiny_csv, monkeypatch):
+    """A library or implementation change cannot silently reuse prior blocks."""
+    import json
+    import tackai.fusion.data as data_module
+
+    first = FusionData.from_csv([tiny_csv], cache=True)
+    old = first._cache_dir()
+    provenance = json.loads((old / "manifest.json").read_text())["provenance"]
+    assert provenance["numpy"] and provenance["rdkit"] and provenance["source_sha256"]
+    actual_provenance = data_module._block_cache_provenance
+
+    def changed(featurizer):
+        return {**actual_provenance(featurizer), "numpy": "changed-for-test"}
+
+    monkeypatch.setattr(data_module, "_block_cache_provenance", changed)
+    second = FusionData.from_csv([tiny_csv], cache=True)
+    assert second._cache_dir() != old
+    assert old.is_dir()  # Existing, potentially expensive caches are preserved.
+    assert np.allclose(first.X, second.X, equal_nan=True)
+
+
+def test_uncached_build_does_not_require_cache_provenance(fake_cache, tiny_csv, monkeypatch):
+    def forbidden(_self):
+        raise AssertionError("uncached builds must not inspect cache provenance")
+
+    monkeypatch.setattr(FusionData, "_cache_dir", forbidden)
+    assert len(FusionData.from_csv([tiny_csv], cache=False).X) > 0
+
+
+def test_cache_rejects_unavailable_custom_featurizer_source(fake_cache, tiny_csv, monkeypatch):
+    import tackai.fusion.data as data_module
+
+    def unavailable(_type):
+        raise TypeError("source not available")
+
+    monkeypatch.setattr(data_module.inspect, "getsourcefile", unavailable)
+    with pytest.raises(ValueError, match="use cache=False"):
+        FusionData.from_csv([tiny_csv], cache=True)
+    assert len(FusionData.from_csv([tiny_csv], cache=False).X) > 0
+
+
 def _csv_with_unencodable_rows(tmp_path):
     """A table where one row has an unknown POI, one an unknown cell line, one no ligase."""
     import pandas as pd

@@ -658,4 +658,37 @@ remains dependent on its search-only bundle.
 For the AvgIpc parity discrepancy, the single-thread probe **4720732** found no
 change in either model's mean for that molecule when substituting its frozen
 versus recomputed value. This single case does not establish feature parity or
-exclude effects on other molecules; the inherited-threading probe is pending.
+exclude effects on other molecules. The inherited-threading probe **4720671**
+found the same mismatch and unchanged means; the cause remains unknown.
+
+The parity investigation also found that snapshot preparation called
+`FusionData.from_csv` with its default block cache enabled. The cache key used
+at that time did not include the RDKit or NumPy version. This is a possible provenance
+risk, not yet an established cause of the mismatch; cache provenance and a
+forward-compatible key are under review. Existing snapshots and caches are being
+preserved while the cause is investigated.
+The snapshot descriptor block exactly matches
+`fusion_blocks/570be08f8264/descriptors.npy`, whose modification time predates
+the snapshot by about one day. This establishes reuse of those values but not
+which software produced the cache; the 128-molecule probe is not a prevalence
+estimate.
+
+The ExtraTrees search-only bundle and its stacking-only study **4720333** also
+completed. Raw/temperature/Platt Brier scores were 0.1537/0.1557/0.1511,
+log losses 0.4672/0.4760/0.4655, and APs 0.7888/0.7910/0.7879 on the same
+310 rows and 126 groups. The paired Platt-minus-raw Brier interval was
+[−0.0104, 0.0053]. On 50 VHL rows, Platt Brier was 0.1627 versus 0.1521 raw
+(interval [−0.0042, 0.0303]). These exploratory data do not establish a gain
+from calibration; no final method was selected and confirmation remains unused.
+A seeded 512-molecule search-only parity and prediction-impact audit **4721302**
+is queued to test the descriptor discrepancy beyond the initial convenience
+sample.
+
+The seeded sample **4721302** found frozen/live molecular-feature differences
+for two of 512 unique search molecules, both in AvgIpc (maximum absolute
+feature difference 0.0845). One molecule's mean changed by 0.00256 pDC50 for
+the historical reference and 0.000432 for the provisional candidate. These
+are small observed changes, not proof of parity for the remaining molecules or
+identification of the cache producer. The audit used no labels. A new snapshot
+must use freshly computed features and be revalidated before an exact-parity
+claim; existing artifacts remain unchanged.
