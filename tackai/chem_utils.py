@@ -26,10 +26,19 @@ def canonicalize_smiles(
     Returns:
         str or None: The canonical SMILES string, or None if invalid or duplicate.
     """
-    if (not isinstance(smiles, str)) or (not smiles):
+    if not isinstance(smiles, str):
+        # Covers None and the float NaN a CSV read leaves in an empty cell.
         return None
 
-    mol = Chem.MolFromSmiles(smiles.strip(), sanitize=False)
+    text = smiles.strip()
+    if not text:
+        # Must be checked *after* stripping: Chem.MolFromSmiles('') returns an
+        # empty Mol rather than None, so a whitespace-only cell would otherwise
+        # canonicalize to '' -- falsy, not None, so it slips past an
+        # `if result is None` check and lands in a CSV as a blank SMILES.
+        return None
+
+    mol = Chem.MolFromSmiles(text, sanitize=False)
     if mol is None:
         return None
     try:
