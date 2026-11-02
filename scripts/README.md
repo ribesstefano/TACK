@@ -2,7 +2,7 @@
 
 ## Script layout
 
-- `surrogate_research/` contains the current surrogate experiments, audits, and candidate tools.
+- [`surrogate_research/`](surrogate_research/README.md) contains the current surrogate experiments, audits, candidate tools, and reproduction guide.
 - `surrogate_research/slurm/` contains their Slurm job recipes. Run them from the repository root, for example `sbatch scripts/surrogate_research/slurm/benchmark_exact_current.slurm`.
 - The scripts in this directory include the existing fast-model and legacy training entry points; local job scripts can continue to use them.
 
