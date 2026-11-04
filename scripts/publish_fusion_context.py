@@ -54,11 +54,9 @@ def cmd_stage(args: argparse.Namespace) -> None:
     stage(cache_dir, Path(args.out), args.repo_id)
 
 
-def upload(staged_dir: Path, repo_id: str, private: bool, commit_message: str,
-          subfolder: str = None) -> str:
+def upload(staged_dir: Path, repo_id: str, private: bool, commit_message: str) -> str:
     """Thin CLI wrapper over :func:`tackai.fusion.context.upload_context_tables`."""
-    return upload_context_tables(staged_dir, repo_id, private, commit_message,
-                                 subfolder=subfolder)
+    return upload_context_tables(staged_dir, repo_id, private, commit_message)
 
 
 def cmd_upload(args: argparse.Namespace) -> None:
@@ -66,7 +64,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
     if not staged_dir.exists():
         print(f"No staging directory found at {staged_dir}. Run the 'stage' phase first.")
         raise SystemExit(1)
-    upload(staged_dir, args.repo_id, args.private, args.commit_message, subfolder=args.subfolder)
+    upload(staged_dir, args.repo_id, args.private, args.commit_message)
 
 
 def main() -> None:
@@ -88,9 +86,9 @@ def main() -> None:
     upload_p.add_argument("--staged", default=str(STAGING_ROOT))
     upload_p.add_argument("--private", action="store_true")
     upload_p.add_argument("--commit-message", default="Update fusion context embeddings")
-    upload_p.add_argument("--subfolder", default=None,
-                          help="Upload into this subdirectory of the repo, so several "
-                               "published snapshots can share one repo.")
+    # No --subfolder: the context tables do not depend on the task, so one repo root holds
+    # one generation of them. The per-task subfolders belong to the ensemble repo, where each
+    # task has its own fitted models.
     upload_p.set_defaults(func=cmd_upload)
 
     args = parser.parse_args()
