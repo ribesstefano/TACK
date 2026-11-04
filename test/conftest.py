@@ -9,37 +9,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fusion_fixtures import (ASSAY_FILE, ASSAY_PCA_FILE, ASSAYS, CELL_FILE, CELLS,
-                             COMBINED_FILE, E3_FILE, NOT_FOUND, POI_FILE, SEQS, SMILES)
-
-
-def _write(path, keys, dim, seed):
-    rng = np.random.default_rng(seed)
-    np.savez(path, **{k: rng.normal(size=dim).astype(np.float32) for k in keys})
-
-
-def _write_pca_model(path, full_dim, out_dim, seed):
-    rng = np.random.default_rng(seed)
-    np.savez(path, mean_=rng.normal(size=full_dim).astype(np.float32),
-             components_=rng.normal(size=(out_dim, full_dim)).astype(np.float32),
-             explained_variance_ratio_=np.full(out_dim, 1.0 / out_dim, dtype=np.float32))
+from fusion_fixtures import ASSAYS, CELLS, SEQS, SMILES, write_context_source
 
 
 @pytest.fixture
 def fake_cache(tmp_path, monkeypatch):
-    """A TACKAI_CACHE holding the five npz tables under their real names. Returns the Path."""
+    """A TACKAI_CACHE holding the five npz tables under their real names, plus the manifest
+    that names them — the shape ``FusionData.from_pretrained`` installs, and the shape a bare
+    ``ContextEncoder`` needs, since the filenames are read from the manifest rather than
+    hardcoded. Returns the Path."""
     cache = tmp_path / "cache"
-    cache.mkdir()
-    _write(cache / CELL_FILE, CELLS + [NOT_FOUND], 56, 1)
-    _write(cache / POI_FILE, SEQS["poi"], 78, 2)
-    _write(cache / COMBINED_FILE, SEQS["poi"] + SEQS["e3"], 86, 3)
-    _write(cache / E3_FILE, SEQS["e3"], 24, 4)
-    _write(cache / ASSAY_FILE, ASSAYS, 8, 5)
-    _write_pca_model(cache / CELL_FILE.replace(".npz", "_model.npz"), 768, 56, 6)
-    _write_pca_model(cache / POI_FILE.replace(".npz", "_model.npz"), 640, 78, 7)
-    _write_pca_model(cache / E3_FILE.replace(".npz", "_model.npz"), 640, 24, 8)
-    _write_pca_model(cache / ASSAY_PCA_FILE, 768, 8, 9)
-    _write_pca_model(cache / COMBINED_FILE.replace(".npz", "_model.npz"), 640, 86, 10)
+    write_context_source(cache, {"cell": 56, "poi": 78, "e3": 24, "combined": 86, "assay": 8})
     monkeypatch.setenv("TACKAI_CACHE", str(cache))
     return cache
 

@@ -11,6 +11,12 @@ from tackai.fusion.data import BLOCK_ORDER, block_index  # noqa: F401  (re-expor
 #: ``test_fusion_data.py`` checks that they agree with what the library discovers.
 BLOCK_DIMS = {"fingerprint": 1024, "descriptors": 216, "e3": 24, "cell": 56, "poi": 78,
               "assay": 8, "assay_time": 1}
+
+#: Width of the shared POI+E3 table, which ``protein_space="combined"`` reads instead of the
+#: two per-block ones. Assert against this rather than a literal: the published tables are
+#: refitted periodically, and a test that repeats a width goes stale the same way the library
+#: used to.
+COMBINED_DIM = 86
 DEFAULT_BLOCKS = block_index(BLOCK_DIMS)
 
 CELL_FILE = "cell_embeddings_model=sentence-transformer_pooling=mean_pca56.npz"
@@ -53,6 +59,97 @@ SMILES = [
     "CN1CCN(CC1)c1ccc(cc1)NC(=O)c1ccc(Cl)cc1",
     "CCOC(=O)c1ccc(cc1)N1CCN(CC1)C(=O)c1ccccc1",
 ]
+
+
+#: Name templates of the published context files, parameterised by PCA width. The published
+#: repo encodes each block's width in its filename, so a regenerated table arrives under a name
+#: no previous release used. Tests build sources at arbitrary widths from these.
+_PROTEIN_STEM = "protein_embeddings_esm_model=facebook-esm2_t30_150M_UR50D"
+_ASSAY_STEM = "vocab=open20_model=all-mpnet-base-v1_pooling=mean"
+NAME_TEMPLATES = {
+    "cell": ("cell_embeddings_model=sentence-transformer_pooling=mean_pca{d}.npz",
+             "cell_embeddings_model=sentence-transformer_pooling=mean_pca{d}_model.npz"),
+    "poi": (f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=poi_pca{{d}}.npz",
+            f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=poi_pca{{d}}_model.npz"),
+    "e3": (f"{_PROTEIN_STEM}_layer=30_pooling=mean_rm_pc2_window=1022_block=e3_pca{{d}}.npz",
+           f"{_PROTEIN_STEM}_layer=30_pooling=mean_rm_pc2_window=1022_block=e3_pca{{d}}_model.npz"),
+    "combined": (f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=combined_pca{{d}}.npz",
+                 f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=combined_pca{{d}}"
+                 "_model.npz"),
+    "assay": (f"assay_embeddings_{_ASSAY_STEM}_pca{{d}}.npz",
+              f"assay_pca_{_ASSAY_STEM}_pca{{d}}.npz"),
+}
+
+#: Keys each block's table is written with, matching the synthetic cache in conftest.
+BLOCK_KEYS = {"cell": CELLS + [NOT_FOUND], "poi": SEQS["poi"], "e3": SEQS["e3"],
+              "combined": SEQS["poi"] + SEQS["e3"], "assay": ASSAYS}
+
+#: Width of the embedding each block's PCA reduces, before reduction.
+FULL_DIMS = {"cell": 768, "poi": 640, "e3": 640, "combined": 640, "assay": 768}
+
+
+def write_context_source(out_dir, dims, *, protein_space=None, mutate=None):
+    """Write a published-shaped context source: npz tables plus the manifest describing them.
+
+    Mirrors what :func:`tackai.fusion.context.stage_context_tables` publishes, but at widths
+    the caller chooses, so a test can present a generation the library has never seen.
+
+    Args:
+        out_dir: Directory to create and write into.
+        dims: Block name -> PCA width, e.g. ``{"cell": 40, "poi": 33, ...}``.
+        protein_space: Value to record under ``"protein_space"`` in the manifest.
+        mutate: Optional callable receiving the finished manifest dict for in-place edits
+            before it is written, for tests that need a malformed one.
+
+    Returns:
+        The manifest that was written, as a dict.
+    """
+    import hashlib
+    import json
+    from pathlib import Path
+
+    import numpy as np
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "format": "tack-context-encoding/v1",
+        "tackai_version": "test",
+        "protein_space": protein_space,
+        "block_dims": {"assay_time": 1},
+        "combined_dim": None,
+        "models": {},
+        "files": {},
+    }
+    for seed, (block, dim) in enumerate(sorted(dims.items())):
+        table_name, pca_name = (t.format(d=dim) for t in NAME_TEMPLATES[block])
+        rng = np.random.default_rng(seed + 1)
+        keys = BLOCK_KEYS[block]
+        np.savez(out_dir / table_name,
+                 **{k: rng.normal(size=dim).astype(np.float32) for k in keys})
+        full = FULL_DIMS[block]
+        np.savez(out_dir / pca_name,
+                 mean_=rng.normal(size=full).astype(np.float32),
+                 components_=rng.normal(size=(dim, full)).astype(np.float32),
+                 explained_variance_ratio_=np.full(dim, 1.0 / dim, dtype=np.float32))
+        if block == "combined":
+            manifest["combined_dim"] = dim
+        else:
+            manifest["block_dims"][block] = dim
+        for name, role in ((table_name, "table"), (pca_name, "pca_model")):
+            path = out_dir / name
+            entry = {"block": block, "role": role,
+                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                     "bytes": path.stat().st_size}
+            if role == "table":
+                entry["dim"], entry["n_keys"] = dim, len(keys)
+            else:
+                entry["full_dim"], entry["reduced_dim"] = full, dim
+            manifest["files"][name] = entry
+    if mutate is not None:
+        mutate(manifest)
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=1))
+    return manifest
 
 
 def build_ensemble(factory, data, task, n_members=3, n_folds=3):

@@ -364,9 +364,13 @@ def serve(argv: Optional[List[str]] = None) -> None:
                              "the published ensembles expect. Cached files are reused.")
     context_source.add_argument("--local-context", action="store_true",
                         help="Read the context tables straight from TACKAI_CACHE with no "
-                             "manifest and no network access, for an offline compute node. "
-                             "The protein space then comes from --protein-space, and a wrong "
-                             "choice is what produces a feature-count mismatch.")
+                             "network access, for an offline compute node. The cache must "
+                             "hold the manifest.json that names the tables, which a previous "
+                             "--context-repo run installs alongside them: the filenames carry "
+                             "each block's PCA width, so only the manifest says which table "
+                             "goes with which fit. The protein space then comes from "
+                             "--protein-space, and a wrong choice is what produces a "
+                             "feature-count mismatch.")
     parser.add_argument("--protein-space", default=None, choices=["per_block", "combined"],
                         help="POI/E3 embedding space, which fixes those blocks' widths. "
                              "Normally inferred from the context manifest; set it explicitly "

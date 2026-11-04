@@ -20,8 +20,9 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 from sklearn.model_selection import StratifiedGroupKFold
 
 from tackai.data.utils import get_cache_dir
-from tackai.fusion.context import (CONTEXT_BLOCKS, CONTEXT_FILES, DEFAULT_CONTEXT_REPO,
-                                   SEQUENCE_BLOCKS, ContextEncoder, assay_time_or_default,
+from tackai.fusion.context import (CONTEXT_BLOCKS, DEFAULT_CONTEXT_REPO, SEQUENCE_BLOCKS,
+                                   ContextEncoder, assay_time_or_default,
+                                   read_context_manifest, resolve_context_files,
                                    stage_context_tables, upload_context_tables)
 from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES, MOL_BLOCKS, MolEncoder
 
@@ -483,29 +484,22 @@ class FusionData:
                                             revision=revision, token=token))
 
         manifest_path = source / "manifest.json"
-        if not manifest_path.exists():
-            raise FileNotFoundError(
-                f"no manifest.json found in {source}; this does not look like a context "
-                "embedding repo published by scripts/publish_fusion_context.py"
-            )
-        manifest = json.loads(manifest_path.read_text())
+        manifest = read_context_manifest(source)
 
-        # The set of files this tackai version needs is CONTEXT_FILES, not whatever keys the
-        # manifest happens to list: a manifest key is untrusted input (it names the download,
-        # not this code), so it is never joined onto a path. Iterating CONTEXT_FILES instead
-        # means a crafted or corrupted manifest entry can neither escape cache_dir via a
-        # traversal path nor get installed as an unread file, and an older/newer manifest that
-        # is missing an entry this version needs is reported as a version mismatch instead of
-        # a confusing downstream error.
-        required = {filename for files in CONTEXT_FILES.values() for filename in files.values()}
-        missing_from_manifest = sorted(required - set(manifest.get("files", {})))
-        if missing_from_manifest:
-            raise ValueError(
-                f"{source} is missing {len(missing_from_manifest)} file(s) this tackai "
-                f"version expects: {missing_from_manifest}. The published repo and this "
-                "tackai version disagree about the context table layout — pass revision= to "
-                "pin an older snapshot of the repo, or upgrade tackai."
-            )
+        # Which files to install comes from the manifest's own 'block' and 'role' fields, not
+        # from a list of names kept in this package. The published filenames encode each
+        # block's PCA width, so regenerating the tables renames every one of them: a hardcoded
+        # list would reject the new generation until someone edited this file, and a width
+        # stated here could only ever be a stale second opinion on what the tables already say.
+        #
+        # The protection that list used to provide — a manifest key is untrusted input (it
+        # names the download, not this code) and must never be joined onto a path — is now an
+        # explicit check instead of a side effect: resolve_context_files() requires every name
+        # to be a bare .npz basename, so a crafted or corrupted entry can neither escape
+        # cache_dir via a traversal path nor get installed as some other file. A block the
+        # manifest does not cover, or covers twice, still refuses to load.
+        resolved = resolve_context_files(manifest, where=str(manifest_path))
+        required = {name for files in resolved.values() for name in files.values()}
 
         # The manifest records which protein_space the publishing encoder actually used
         # (None for a manifest staged over a whole cache rather than one encoder's, e.g. by
@@ -566,7 +560,17 @@ class FusionData:
         for filename in to_copy:
             shutil.copy2(source / filename, target / filename)
 
-        encoder = ContextEncoder(cache_dir=target, protein_space=protein_space)
+        # The manifest travels with the tables. It is what names them, so a cache holding only
+        # npz files cannot be read back at all — `tack serve --local-context` and any bare
+        # ContextEncoder over TACKAI_CACHE resolve their filenames from exactly this copy. It
+        # also records which generation the cache now serves, which matters because a cache
+        # can accumulate several: their filenames differ, so nothing above conflicts.
+        installed_manifest = target / "manifest.json"
+        if (not installed_manifest.exists()
+                or installed_manifest.read_bytes() != manifest_path.read_bytes()):
+            shutil.copy2(manifest_path, installed_manifest)
+
+        encoder = ContextEncoder(cache_dir=target, protein_space=protein_space, files=resolved)
         data = cls(table=None, encoder=encoder, featurizer=featurizer, descriptors=descriptors)
 
         expected = dict(manifest.get("block_dims", {}))

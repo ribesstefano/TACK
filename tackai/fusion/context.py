@@ -95,6 +95,122 @@ DEFAULT_CONTEXT_REPO = "ailab-bio/TACK-Context-Encoding"
 
 MANIFEST_FORMAT = "tack-context-encoding/v1"
 
+#: Blocks backed by a lookup table. ``assay_time`` is a scalar passed straight through.
+TABLE_BLOCKS = ("cell", "poi", "e3", "combined", "assay")
+
+#: Roles every block publishes: the embedding table and the PCA that produced it.
+TABLE_ROLES = ("table", "pca_model")
+
+# A published filename, as strict as the real ones allow: the stems carry '=', '-', '_' and
+# '.', and nothing else. Anchored, so a separator or a parent reference cannot appear anywhere.
+_SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._=+-]*\.npz$")
+
+
+def _safe_basename(name: str, where: str) -> str:
+    """Validate a filename read out of a manifest before it is ever joined to a path.
+
+    A manifest key names a download; it is data, not code, and on an untrusted or corrupted
+    repo it is attacker-controlled. Requiring a bare npz basename means such a key can neither
+    escape the cache directory via a traversal path nor get installed as some other file.
+
+    Args:
+        name: The candidate filename, exactly as the manifest spells it.
+        where: Path of the manifest, for the error message.
+
+    Returns:
+        The validated name, unchanged.
+
+    Raises:
+        ValueError: If the name is not a plain ``.npz`` basename.
+    """
+    if not isinstance(name, str) or ".." in name or not _SAFE_FILENAME.match(name):
+        raise ValueError(
+            f"{where} names a context file that is not a plain .npz filename: {name!r}. "
+            "Manifest entries must be bare basenames; a path is never installed."
+        )
+    return name
+
+
+def resolve_context_files(manifest: Dict, where: str = "manifest",
+                          blocks: Sequence[str] = TABLE_BLOCKS) -> Dict[str, Dict[str, str]]:
+    """Map each block to its table and PCA side file, as the manifest itself declares them.
+
+    The published filenames encode each block's PCA width, so regenerating the tables renames
+    all of them. Every manifest entry already records the ``block`` it belongs to and its
+    ``role``, so the names are read from there rather than carried as a hardcoded copy that a
+    regeneration would silently invalidate. A width this code pinned would only ever be a
+    stale second opinion; the tables state their own, and
+    :meth:`~tackai.fusion.data.FusionData.from_pretrained` checks them against the manifest's
+    ``block_dims`` and the ensemble against its own ``n_features_in_``.
+
+    Args:
+        manifest: The parsed ``manifest.json``.
+        where: Path of the manifest, for error messages.
+        blocks: Blocks that must be present.
+
+    Returns:
+        ``{block: {"table": filename, "pca_model": filename}}``.
+
+    Raises:
+        ValueError: If ``files`` is missing or malformed, if a block has no entry for a role,
+            if it has more than one (two generations staged together, which would otherwise
+            pair tables from different PCA fits), or if a filename is not a bare basename.
+    """
+    files = manifest.get("files")
+    if not isinstance(files, dict):
+        raise ValueError(f"{where} has no 'files' mapping; it does not look like a context "
+                         "embedding repo published by stage_context_tables()")
+
+    candidates: Dict[str, Dict[str, list]] = {}
+    for name, entry in files.items():
+        if not isinstance(entry, dict):
+            continue
+        block, role = entry.get("block"), entry.get("role")
+        if block in blocks and role in TABLE_ROLES:
+            candidates.setdefault(block, {}).setdefault(role, []).append(name)
+
+    resolved: Dict[str, Dict[str, str]] = {}
+    for block in blocks:
+        for role in TABLE_ROLES:
+            found = sorted(candidates.get(block, {}).get(role, []))
+            if not found:
+                raise ValueError(
+                    f"{where} declares no {role} for block {block!r}. The published repo and "
+                    f"this tackai version disagree about which blocks exist: it lists "
+                    f"{sorted(candidates)} and {block!r} is required."
+                )
+            if len(found) > 1:
+                raise ValueError(
+                    f"{where} declares {len(found)} files as the {role} for block {block!r}: "
+                    f"{found}. Exactly one is required — publishing two generations side by "
+                    "side would pair tables from different PCA fits."
+                )
+            resolved.setdefault(block, {})[role] = _safe_basename(found[0], where)
+    return resolved
+
+
+def read_context_manifest(source: Union[str, Path]) -> Dict:
+    """Parse the ``manifest.json`` of a staged, downloaded or installed context directory.
+
+    Args:
+        source: Directory expected to hold ``manifest.json``.
+
+    Returns:
+        The parsed manifest.
+
+    Raises:
+        FileNotFoundError: If the directory holds no manifest.
+    """
+    path = Path(source) / "manifest.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"no manifest.json found in {source}; this does not look like a context embedding "
+            "repo published by scripts/publish_fusion_context.py. The manifest is what names "
+            "the tables, so a directory without one cannot be read — install the tables with "
+            "FusionData.from_pretrained(), or pass --context-repo to fetch them."
+        )
+    return json.loads(path.read_text())
+
 
 def sha256_of(path: Path) -> str:
     """Streamed sha256 of a file, so staging never loads a whole npz into memory to hash it."""
@@ -404,11 +520,17 @@ class ContextEncoder:
 
     NOT_FOUND = "Unknown cell line."
 
-    def __init__(self, cache_dir: Optional[str] = None, protein_space: str = "per_block"):
+    def __init__(self, cache_dir: Optional[str] = None, protein_space: str = "per_block",
+                 files: Optional[Dict[str, Dict[str, str]]] = None):
         if protein_space not in {"per_block", "combined"}:
             raise ValueError(f"protein_space must be 'per_block' or 'combined', got {protein_space!r}")
         self.cache_dir = Path(cache_dir or get_cache_dir())
         self.protein_space = protein_space
+        # The names come from the manifest installed alongside the tables, never from a copy
+        # kept in this module: a cache can hold more than one generation, and only the
+        # manifest says which table goes with which PCA fit.
+        self._files = files if files is not None else resolve_context_files(
+            read_context_manifest(self.cache_dir), where=str(self.cache_dir / "manifest.json"))
         self._tables: Dict[str, Dict[str, np.ndarray]] = {}
         self._warned_assay_misses: set = set()
 
@@ -422,10 +544,10 @@ class ContextEncoder:
             Mapping with ``"table"`` and ``"pca_model"`` filenames.
         """
         if block in SEQUENCE_BLOCKS and self.protein_space == "combined":
-            return CONTEXT_FILES["combined"]
-        if block not in CONTEXT_FILES:
+            return self._files["combined"]
+        if block not in self._files:
             raise KeyError(f"unknown context block {block!r}")
-        return CONTEXT_FILES[block]
+        return self._files[block]
 
     def _lookup_key(self, block: str, key, table: Dict[str, np.ndarray]) -> str:
         """The table key a raw key resolves to: the stripped string, or, for a protein block

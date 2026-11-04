@@ -10,8 +10,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import publish_fusion_context as pfc  # noqa: E402
 
-from fusion_fixtures import (ASSAY_FILE, ASSAY_PCA_FILE, CELL_FILE, COMBINED_FILE, E3_FILE,
-                             POI_FILE)
+from fusion_fixtures import (ASSAY_FILE, ASSAY_PCA_FILE, BLOCK_DIMS, CELL_FILE, COMBINED_DIM,
+                             COMBINED_FILE, E3_FILE, POI_FILE, write_context_source)
 from tackai.fusion.context import CONTEXT_FILES, ContextEncoder
 from tackai.fusion.data import FusionData
 
@@ -29,7 +29,7 @@ def test_fake_cache_has_every_context_files_entry(fake_cache):
 
 def test_default_context_repo_is_exported():
     from tackai.fusion import DEFAULT_CONTEXT_REPO
-    assert DEFAULT_CONTEXT_REPO == "ailab-bio/TACK-fusion-context"
+    assert DEFAULT_CONTEXT_REPO == "ailab-bio/TACK-Context-Encoding"
 
 
 def test_stage_copies_all_ten_files_and_writes_a_manifest(fake_cache, tmp_path):
@@ -38,9 +38,10 @@ def test_stage_copies_all_ten_files_and_writes_a_manifest(fake_cache, tmp_path):
     for name in _all_context_filenames():
         assert (out / name).exists()
     assert (out / "manifest.json").exists()
-    assert manifest["block_dims"] == {"e3": 7, "cell": 47, "poi": 51, "assay": 8,
-                                      "assay_time": 1}
-    assert manifest["combined_dim"] == 52
+    expected = {block: BLOCK_DIMS[block] for block in ("e3", "cell", "poi", "assay")}
+    expected["assay_time"] = 1
+    assert manifest["block_dims"] == expected
+    assert manifest["combined_dim"] == COMBINED_DIM
 
 
 def test_stage_writes_a_readme_mentioning_the_repo_and_from_pretrained(fake_cache, tmp_path):
@@ -121,8 +122,7 @@ def test_from_pretrained_installs_into_an_empty_cache(fake_cache, tmp_path):
     target = tmp_path / "fresh_cache"          # does not exist yet
     data = FusionData.from_pretrained(staged, cache_dir=target)
     assert data.table is None
-    assert data.dims == {"fingerprint": 1024, "descriptors": 216, "e3": 7, "cell": 47,
-                         "poi": 51, "assay": 8, "assay_time": 1}
+    assert data.dims == BLOCK_DIMS
     for name in _all_context_filenames():
         assert (target / name).exists()
     with pytest.raises(ValueError, match="no table"):
@@ -163,7 +163,7 @@ def test_from_pretrained_supports_the_combined_protein_space(fake_cache, tmp_pat
     pfc.stage(fake_cache, staged)
     data = FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache",
                                       protein_space="combined")
-    assert data.dims["poi"] == 52 and data.dims["e3"] == 52
+    assert data.dims["poi"] == COMBINED_DIM and data.dims["e3"] == COMBINED_DIM
 
 
 def test_stage_with_no_protein_space_leaves_the_manifest_key_none(fake_cache, tmp_path):
@@ -343,7 +343,7 @@ def test_from_pretrained_uses_snapshot_download_for_a_repo_id(fake_cache, tmp_pa
     data = FusionData.from_pretrained("ailab-bio/TACK-fusion-context",
                                       cache_dir=tmp_path / "fresh_cache")
     assert calls["args"] == ("ailab-bio/TACK-fusion-context", "dataset", None, None)
-    assert data.dims["cell"] == 47
+    assert data.dims["cell"] == BLOCK_DIMS["cell"]
 
 
 # ---------------------------------------------------------------------- push_to_hub
@@ -435,3 +435,89 @@ def test_push_to_hub_output_round_trips_through_from_pretrained(fake_cache, tmp_
     reloaded = FusionData.from_pretrained(staged, cache_dir=tmp_path / "fresh_cache")
 
     assert reloaded.dims == data.dims
+
+
+# --- Discovering the table names from the manifest ------------------------------------------
+#
+# The published filenames encode each block's PCA width, so regenerating the tables renames
+# every one of them. The library reads the names out of the manifest the repo publishes rather
+# than carrying its own copy, so a new generation needs no code change.
+
+
+def test_from_pretrained_loads_a_generation_with_unfamiliar_pca_widths(tmp_path):
+    source = tmp_path / "published"
+    write_context_source(source, {"cell": 40, "poi": 33, "e3": 5, "combined": 38, "assay": 8})
+
+    data = FusionData.from_pretrained(source, cache_dir=tmp_path / "cache")
+
+    assert data.encoder.dims["cell"] == 40
+    assert data.encoder.dims["poi"] == 33
+    assert data.encoder.dims["e3"] == 5
+
+
+A_GENERATION = {"cell": 40, "poi": 33, "e3": 5, "combined": 38, "assay": 8}
+
+
+def test_from_pretrained_installs_the_manifest_so_the_cache_can_be_read_back(tmp_path):
+    """The manifest is what names the tables, so a cache without it cannot be read. This is
+    the path `tack serve --local-context` takes on a cache a previous run installed."""
+    source = tmp_path / "published"
+    write_context_source(source, A_GENERATION)
+    target = tmp_path / "cache"
+
+    FusionData.from_pretrained(source, cache_dir=target)
+
+    assert (target / "manifest.json").exists()
+    reopened = ContextEncoder(cache_dir=target)          # no files=: discovers them itself
+    assert reopened.dims["cell"] == 40
+
+
+def test_a_context_encoder_refuses_a_cache_with_no_manifest(tmp_path):
+    bare = tmp_path / "bare"
+    bare.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="manifest.json"):
+        ContextEncoder(cache_dir=bare)
+
+
+def test_from_pretrained_refuses_two_tables_offered_for_one_block(tmp_path):
+    """Two generations in one manifest leave nothing to say which PCA fit is live, and pairing
+    a table with the wrong fit would silently serve vectors from a space that no longer is."""
+    def add_a_second_cell_table(manifest):
+        manifest["files"]["cell_embeddings_model=sentence-transformer_pooling=mean_pca41.npz"] = {
+            "block": "cell", "role": "table", "sha256": "0" * 64, "bytes": 1,
+            "dim": 41, "n_keys": 5,
+        }
+
+    source = tmp_path / "published"
+    write_context_source(source, A_GENERATION, mutate=add_a_second_cell_table)
+
+    with pytest.raises(ValueError, match="2 files as the table for block 'cell'"):
+        FusionData.from_pretrained(source, cache_dir=tmp_path / "cache")
+
+
+def test_from_pretrained_rejects_a_manifest_naming_a_path_instead_of_a_filename(tmp_path):
+    """A manifest key names a download, not this code: it is never joined onto a path."""
+    def point_the_cell_table_outside_the_cache(manifest):
+        name = next(n for n, e in manifest["files"].items()
+                    if e["block"] == "cell" and e["role"] == "table")
+        manifest["files"]["../../escaped.npz"] = manifest["files"].pop(name)
+
+    source = tmp_path / "published"
+    write_context_source(source, A_GENERATION, mutate=point_the_cell_table_outside_the_cache)
+
+    with pytest.raises(ValueError, match="not a plain .npz filename"):
+        FusionData.from_pretrained(source, cache_dir=tmp_path / "cache")
+    assert not (tmp_path / "escaped.npz").exists()
+
+
+def test_from_pretrained_refuses_a_manifest_that_covers_no_assay_block(tmp_path):
+    def drop_the_assay_block(manifest):
+        for name in [n for n, e in manifest["files"].items() if e["block"] == "assay"]:
+            del manifest["files"][name]
+
+    source = tmp_path / "published"
+    write_context_source(source, A_GENERATION, mutate=drop_the_assay_block)
+
+    with pytest.raises(ValueError, match="declares no table for block 'assay'"):
+        FusionData.from_pretrained(source, cache_dir=tmp_path / "cache")
