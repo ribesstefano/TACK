@@ -172,7 +172,6 @@ lightning_logs/
 notebooks/per-protein*
 *slurm*.out
 .DS_Store
-ensembles*/
 checkpoints*/
 predictions*/
 ensemble_results*/
@@ -191,10 +190,9 @@ logs/
 tackai_ensemble*/
 TPD-html-files.zip
 
-boltz_*
+backups/
 outputs/
 cache/
-ensembles/
 hf_staging/
 **/*.npz
 **/*.zip
@@ -203,7 +201,7 @@ hf_staging/
 docs/tutorial/*.ipynb
 
 # Fitted fusion surrogate ensembles (regenerate with notebooks/fusion_surrogates.ipynb)
-ensembles/fusion_*/
+outputs/ensembles/fusion_*/
 *.pkl
 *.json
 *.csv
@@ -211,3 +209,5 @@ models/
 # The demo Space's dropdown vocabulary is generated (demo/build_vocab.py) but committed:
 # the Space is deployed as a file copy of demo/ and cannot run the build step itself.
 !demo/vocab.json
+plans/
+.container_extra_site_packages

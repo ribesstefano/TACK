@@ -6,10 +6,10 @@ Two phases, run separately so the staged folders can be inspected before
 anything is uploaded:
 
     # 1. Stage locally (pure file copies, no network writes)
-    python scripts/publish_hf.py stage --all
+    python scripts/publish_ensemble_hf.py stage --all
 
     # 2. Review hf_staging/ensembles/ and hf_staging/cache/, then upload
-    python scripts/publish_hf.py upload --all
+    python scripts/publish_ensemble_hf.py upload --all
 
 Staging reuses collect_ensemble_checkpoints.py's file-discovery logic so only
 the checkpoints actually referenced by each ensemble_weights_*.json are
