@@ -37,7 +37,8 @@ scripts that touch embeddings need `TACKAI_CACHE` to point at a populated cache.
 > **Regenerating a cached embedding table changes the embedding space.** The
 > pretrained ensembles were fitted against the published tables — a mismatched
 > one gives a feature-shape or silent-accuracy failure on every later
-> prediction. Prefer `--verify` / `--dry-run` over `--write`.
+> prediction. **A run of these scripts overwrites the cache**, so check with
+> `--verify` (or `--dry-run`, assay only) first when the old space still matters.
 
 ## 🎯 `training/` — model training
 
@@ -144,22 +145,107 @@ names, writing into `TACKAI_CACHE`. They are the generation half of the
 corresponding notebook with the sweep and analysis removed, so the published
 tables have a reproducible recipe.
 
+The vocabulary is read from the public [`ailab-bio/AutoTPDplus`](https://huggingface.co/datasets/ailab-bio/AutoTPDplus)
+dataset on the Hugging Face Hub, loaded by config name — no token, no local
+`data/` folder needed:
+
+```python
+protac = load_dataset("ailab-bio/AutoTPDplus", "autotpdplus-protac")
+```
+
+Each script loads the `autotpdplus-protac` config (the living PROTAC release,
+6,766 rows) and hands the split straight to its reader as a DataFrame. Nothing
+is written to or read from a CSV: `build_table` accepts frames as well as paths,
+so no file sits between the Hub and the embedding tables.
+
 ```bash
 # POI / E3 protein embeddings (ESM); runs only the winning (layer, pooling) combos
-python scripts/embeddings/generate_protein_embeddings.py --csv data/AutoTPD-TPDdb.csv
+python scripts/embeddings/generate_protein_embeddings.py
 
 # Cell-line embeddings from Cellosaurus descriptions; vocabulary taken from the
 # production FusionData.build_table key resolution, not from a single column
-python scripts/embeddings/generate_cell_embeddings.py --csv data/AutoTPD-TPDdb.csv
+python scripts/embeddings/generate_cell_embeddings.py
 
-# Assay-type embeddings; writes both the `closed` (14 fixed) and `open`
-# (data-driven, used in production) vocabularies
-python scripts/embeddings/generate_assay_embeddings.py --csv data/AutoTPD-TPDdb.csv
+# Assay-type embeddings; one table over tackai.fusion.context.ASSAY_VOCAB
+python scripts/embeddings/generate_assay_embeddings.py
+
+# Pin a revision for a reproducible regeneration
+python scripts/embeddings/generate_assay_embeddings.py --revision <sha>
 ```
 
-Safe modes before committing to a rewrite: `--verify` recomputes and diffs
-against the cache, `--dry-run` reports without writing, `--write` overwrites.
-`--verify` agreement is numerical, not bit-exact (~1e-7 on full tables, ~1e-5
+Compute nodes have no reliable outbound network. `datasets` caches the download
+under `HF_HOME`, so run any one of the scripts on a login node first to populate
+that cache; the job then reuses it without touching the Hub. Export
+`HF_DATASETS_OFFLINE=1` in the job so an accidental fetch fails loudly instead
+of hanging.
+
+### Running them on a GPU
+
+The encoders default to CPU, so a GPU needs three things *together*: an
+allocation, `--nv` on `apptainer exec` to expose the host driver, and
+`--device cuda` to tell the script to use it. With any one missing the pass
+silently stays on CPU — check with
+`python -c "import torch; print(torch.cuda.is_available())"` inside the same
+`apptainer exec` if in doubt.
+
+```bash
+# Protein (ESM) -- the one that genuinely benefits: ~450 sequences, some >1000 aa
+srun -A <account> -p <gpu-partition> --gpus=1 -t 01:00:00 \
+  apptainer exec --nv $(bash apptainer/bind_live_repo.sh) --pwd /opt/repo \
+    apptainer/training.sif \
+    python scripts/embeddings/generate_protein_embeddings.py --device cuda
+
+# Cell lines -- ~360 short descriptions; the GPU saves seconds, CPU is fine
+    ... python scripts/embeddings/generate_cell_embeddings.py --device cuda --batch-size 256
+```
+
+The assay script has no `--device`: it encodes 78 short sentences, where loading
+the model costs more than the forward pass.
+
+No `--bind` for the cache is needed above, for two reasons worth knowing
+separately. The *variable* comes from `.env`, which the scripts load themselves
+and which `bind_live_repo.sh` mounts into the container (it binds dotfiles — see
+its comment; before that it did not, and `get_cache_dir()` silently fell back to
+`~/.cache/tackai` on a full `$HOME`). The *path* it names resolves because this
+cluster auto-mounts `/proj`; on a site that does not, add
+`--bind "$TACKAI_CACHE"` so the path exists inside the container under its own
+name. `HF_HOME` is **not** in `.env`, so export it (or add it) or the dataset and
+model downloads go to `$HOME`.
+
+### The assay vocabulary
+
+The assay block is a **closed vocabulary**, `tackai.fusion.context.ASSAY_VOCAB`, and
+`normalize_assay` folds every raw string into one of its keys. There is one
+scheme — the finer "open" one; the 14-category "closed" scheme the notebook
+also wrote is gone. Two keys are not readouts but outcomes of the fold:
+
+- **`other`** — a real but uncategorised readout (`"cell-based degradation assay"`).
+- **`unknown`** — reserved for a missing value, or text saying the method was
+  not recorded (`"not specified"`, `"(method not specified)"`).
+
+Keeping them apart matters: "we measured something this vocabulary has no word
+for" and "nobody wrote down what was measured" are different facts, and the
+surrogates see them as different vectors.
+
+**To add a category:**
+
+1. add the key to `ASSAY_VOCAB` and its pattern to `ASSAY_RULES`, both in
+   [`tackai/fusion/context.py`](../tackai/fusion/context.py) — order matters,
+   first match wins, so a compound rule goes above its parts;
+2. add three descriptions under that key in `ASSAY_DESCRIPTIONS` in
+   `generate_assay_embeddings.py`; the script refuses to start otherwise;
+3. rerun the script. The vocabulary size is part of the file name
+   (`vocab=open<N>`), so the table lands under a new name and `CONTEXT_FILES`
+   must be updated to match — the script warns when they disagree.
+
+Adding a key refits the PCA over one more row, so **every** compressed vector
+moves, not only the new one. The full (pre-PCA) vectors of existing keys do not
+change, since they depend only on their own descriptions.
+
+A plain run overwrites the cache. The safe modes before that: `--verify`
+recomputes and diffs against what is already there, writing nothing, and the
+assay script also takes `--dry-run` to report the vocabulary and file names
+only. `--verify` agreement is numerical, not bit-exact (~1e-7 on full tables, ~1e-5
 after PCA): the sentence-transformer/ESM forward pass is float32 and varies with
 library version and thread count. A genuine logic change shows up orders of
 magnitude larger.

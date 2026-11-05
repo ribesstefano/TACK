@@ -211,3 +211,8 @@ models/
 !demo/vocab.json
 plans/
 .container_extra_site_packages
+# Apptainer images: multi-GB binaries, and a .sif embeds absolute paths + CUDA
+# wheels resolved for one cluster. Build per-cluster from apptainer/*.def
+# (see apptainer/README.md); never commit one.
+apptainer/*.sif
+.apptainer/
