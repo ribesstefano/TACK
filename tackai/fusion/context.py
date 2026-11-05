@@ -15,9 +15,16 @@ blocks on an unexpected network call.
 
 The other direction — staging a cache's tables into a manifest-described folder and uploading
 that folder (:func:`stage_context_tables` / :func:`upload_context_tables`) — lives here rather
-than in ``scripts/publish_fusion_context.py`` because both the maintainer publish script and
-:meth:`~tackai.fusion.data.FusionData.push_to_hub` need the exact same manifest format; the
-script is a thin CLI wrapper over these two functions, not its own implementation.
+than in ``scripts/embeddings/publish_fusion_context.py`` because both the maintainer publish
+script and :meth:`~tackai.fusion.data.FusionData.push_to_hub` need the exact same manifest
+format; the script is a thin CLI wrapper over these functions, not its own implementation.
+
+A cache can hold several generations of a table, since each PCA width gets its own file name,
+so the files alone do not say which one is current. Each generator in ``scripts/embeddings/``
+therefore records what it wrote in its own part manifest (:func:`write_part_manifest`), and
+the publish script aggregates those into the final ``manifest.json``
+(:func:`stage_from_part_manifests`). Part manifests never replace ``manifest.json`` in the
+cache: that file names the tables the encoder reads, and only an install changes it.
 
 Both the ``per_block`` and ``combined`` protein tables are always staged together — a reader
 may want either — so the files on disk cannot tell a space apart; the manifest's
@@ -32,12 +39,12 @@ reconstructed at all:
 * **cell** — a missing or blank accession gets the table's ``"Unknown cell line."`` vector;
   an accession that is simply absent raises, because silently substituting "unknown" for a
   real cell line would hide the mistake.
-* **assay** — free text is canonised, and an unseen canonical type falls back to the table's
-  ``"unknown"`` vector (part of the fixed vocabulary — see ``notebooks/assay_embeddings.ipynb``)
-  with a one-time warning listing the types the table does hold, rather than embedding it on
-  the fly: the canonical vocabulary is small and closed enough that an unrecognised assay is
-  almost always a typo or a new abbreviation worth adding to :func:`normalize_assay`, not a
-  genuinely novel measurement technique.
+* **assay** — free text is canonised by :func:`normalize_assay` into one of the
+  :data:`ASSAY_VOCAB` keys, every one of which the table holds, so there is nothing to embed
+  on the fly: an unrecognised readout becomes ``"other"`` and a value that is missing, or
+  says the method was not recorded, becomes ``"unknown"``. A key the table nonetheless lacks
+  — a cache older than the vocabulary — still falls back to the ``"unknown"`` vector with a
+  one-time warning listing the types the table does hold.
 * **poi / e3** — an unseen sequence raises. It cannot be fixed on the fly: the winning
   poolings are ``lse`` (not yet in :class:`~tackai.data.embeddings.protein_embeddings.ProteinEmbedding`)
   and ``mean_rm_pc2``, which is fitted over a whole vocabulary and therefore undefined for a
@@ -49,6 +56,7 @@ import re
 import shutil
 import unicodedata
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple, Union
 
@@ -61,32 +69,83 @@ CELL_MODEL = "sentence-transformers/all-mpnet-base-v1"
 ASSAY_MODEL = "sentence-transformers/all-mpnet-base-v1"
 POI_ESM_MODEL = "facebook/esm2_t30_150M_UR50D"
 
-_PROTEIN_STEM = "protein_embeddings_esm_model=facebook-esm2_t30_150M_UR50D"
-_ASSAY_STEM = "vocab=open20_model=all-mpnet-base-v1_pooling=mean"
+# ------------------------------- assay vocabulary ------------------------------------------- #
+# The assay block is a *closed* vocabulary: :func:`normalize_assay` folds every raw string into
+# one of these keys, so a table built from ASSAY_VOCAB covers every value the encoder can be
+# asked for. ``"other"`` absorbs a real but unrecognised readout; ``"unknown"`` is reserved for
+# a missing value or text that states the method was not recorded.
+#
+# To add a category:
+#   1. add its key to ASSAY_VOCAB and the pattern selecting it to ASSAY_RULES. Order matters --
+#      the first match wins, so a compound rule ("elisa + western blot") goes above its parts,
+#      and a specific platform above the generic family it belongs to;
+#   2. write its descriptions in ``scripts/embeddings/generate_assay_embeddings.py``, which
+#      refuses to run while a key has none;
+#   3. regenerate the table with that script and publish it. The vocabulary size is part of the
+#      file name, so a new category lands the table under a name no release has used.
 
-#: Block name -> the cached table and its PCA side file.
-CONTEXT_FILES: Dict[str, Dict[str, str]] = {
-    "cell": {
-        "table": "cell_embeddings_model=sentence-transformer_pooling=mean_pca56.npz",
-        "pca_model": "cell_embeddings_model=sentence-transformer_pooling=mean_pca56_model.npz",
-    },
-    "poi": {
-        "table": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=poi_pca78.npz",
-        "pca_model": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=poi_pca78_model.npz",
-    },
-    "e3": {
-        "table": f"{_PROTEIN_STEM}_layer=30_pooling=mean_rm_pc2_window=1022_block=e3_pca24.npz",
-        "pca_model": f"{_PROTEIN_STEM}_layer=30_pooling=mean_rm_pc2_window=1022_block=e3_pca24_model.npz",
-    },
-    "combined": {
-        "table": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=combined_pca86.npz",
-        "pca_model": f"{_PROTEIN_STEM}_layer=18_pooling=lse_window=1022_block=combined_pca86_model.npz",
-    },
-    "assay": {
-        "table": f"assay_embeddings_{_ASSAY_STEM}_pca8.npz",
-        "pca_model": f"assay_pca_{_ASSAY_STEM}_pca8.npz",
-    },
-}
+#: Every assay key the cached table holds, in a fixed order. The size is part of the file name.
+ASSAY_VOCAB: Tuple[str, ...] = (
+    # antibody-based
+    "western blot", "in-cell immunoassay", "in-cell immunoassay + western blot",
+    "capillary immunoassay", "elisa", "elisa + western blot", "dot blot", "msd", "htrf",
+    "alphalisa", "gel densitometry",
+    # luminescent / complementation reporters
+    "hibit", "nanobit", "nanoluc reporter", "luciferase reporter", "incell hunter",
+    # fluorescent reporters and imaging
+    "fluorescent reporter", "egfp/mcherry reporter assay",
+    "fluoresyn nanobody biosensor (gfp immunostaining)", "fluorescence imaging",
+    "high-content imaging", "flow cytometry",
+    # label-free
+    "mass spectrometry",
+    # cell health, catch-all, and absent
+    "viability assay", "other", "unknown",
+)
+
+#: Text stating that the method was not recorded. Checked before :data:`ASSAY_RULES`, so an
+#: explicit "not specified" resolves to ``"unknown"`` rather than to ``"other"``.
+_ASSAY_UNSPECIFIED = re.compile(r"not specified|unspecified|not reported|not stated|\bn/?a\b")
+
+#: ``(key, pattern)`` in priority order; the first pattern matching the normalised text wins.
+ASSAY_RULES: Tuple[Tuple[str, str], ...] = (
+    # Compound readouts first: either single rule would otherwise claim them.
+    # "in cell" is anchored at a word boundary: without it the pattern also fires inside
+    # unrelated text such as "within cells".
+    ("in-cell immunoassay + western blot", r"\bin[- ]?cell.*(western|immunoblot)"
+                                          r"|(western|immunoblot).*\bin[- ]?cell"),
+    ("elisa + western blot", r"elisa.*(western|immunoblot|\bwb\b)"
+                             r"|(western|immunoblot|\bwb\b).*elisa"),
+    # Named platforms, each above the family it belongs to.
+    ("capillary immunoassay", r"capillary|simple western|\bjess\b|\bwes\b|\bceia\b|proteinsimple"),
+    ("htrf", r"htrf"),
+    ("alphalisa", r"alpha\s?lisa|amplified luminescence proximity"),
+    ("msd", r"\bmsd\b|meso\s?scale"),
+    ("hibit", r"hibit"),
+    ("nanobit", r"nanobit"),
+    ("nanoluc reporter", r"nanoluc|nanoluciferase|nano-?glo"),
+    ("incell hunter", r"incell\s?hunter|enzyme fragment complementation|\befc\b"),
+    ("luciferase reporter", r"luciferase|firefly|renilla"),
+    ("flow cytometry", r"flow cytometr|\bfacs\b"),
+    ("high-content imaging", r"high[- ]?content|operetta"),
+    ("in-cell immunoassay", r"\bin[- ]?cell|cytoblot"),
+    ("dot blot", r"dot blot"),
+    # "wb" is matched as a whole word, not a substring: it is the abbreviation AutoTPD-TPDdb
+    # uses, but it also occurs inside unrelated tokens ("wbc"), which must not match.
+    ("western blot", r"western|immunoblot|\bwb\b|licor"),
+    ("elisa", r"elisa"),
+    ("gel densitometry", r"densitometr|sds-?page|coomassie"),
+    # A named fluorescent tag is a more specific signal than the microscope reading it, so the
+    # reporter rules sit above generic imaging.
+    ("fluoresyn nanobody biosensor (gfp immunostaining)", r"nanobody|fluoresyn"),
+    ("egfp/mcherry reporter assay", r"mcherry"),
+    ("fluorescent reporter", r"\be?gfp\b|egfp|fluorescent protein|\byfp\b|mneongreen"),
+    ("fluorescence imaging", r"immunofluorescen|fluorescen|imaging|microscop|incucyte"
+                             r"|immunostain"),
+    ("mass spectrometry", r"mass spec|proteomic|lc-?ms|dia-?ms|\bms\b|\bprm\b|\btmt\b"),
+    ("viability assay", r"\bmts\b|cck-?8|celltiter|viability|cytotox|\bmtt\b"),
+)
+
+_ASSAY_RULES_COMPILED = tuple((key, re.compile(pat)) for key, pat in ASSAY_RULES)
 
 #: Hugging Face Hub dataset repo published by scripts/publish_fusion_context.py and read by
 #: FusionData.from_pretrained(). A dataset repo, not a model repo: these tables are an input
@@ -100,6 +159,18 @@ TABLE_BLOCKS = ("cell", "poi", "e3", "combined", "assay")
 
 #: Roles every block publishes: the embedding table and the PCA that produced it.
 TABLE_ROLES = ("table", "pca_model")
+
+PART_MANIFEST_FORMAT = "tack-context-encoding/part/v1"
+
+#: Generator -> the part manifest it writes into the cache, the blocks it owns, and its script.
+CONTEXT_GENERATORS: Dict[str, Dict] = {
+    "protein": {"manifest": "manifest_protein.json", "blocks": ("poi", "e3", "combined"),
+                "script": "scripts/embeddings/generate_protein_embeddings.py"},
+    "cell": {"manifest": "manifest_cell.json", "blocks": ("cell",),
+             "script": "scripts/embeddings/generate_cell_embeddings.py"},
+    "assay": {"manifest": "manifest_assay.json", "blocks": ("assay",),
+              "script": "scripts/embeddings/generate_assay_embeddings.py"},
+}
 
 # A published filename, as strict as the real ones allow: the stems carry '=', '-', '_' and
 # '.', and nothing else. Anchored, so a separator or a parent reference cannot appear anywhere.
@@ -245,6 +316,140 @@ def _npz_pca_dims(path: Path) -> Tuple[int, int]:
     return int(full_dim), int(reduced_dim)
 
 
+def _file_entry(path: Path, block: str, role: str) -> Dict:
+    """Manifest entry of one context file, with its dimensions read out of the npz itself."""
+    entry = {"block": block, "role": role, "sha256": sha256_of(path),
+             "bytes": path.stat().st_size}
+    if role == "table":
+        entry["dim"], entry["n_keys"] = _npz_table_dims(path)
+    else:
+        entry["full_dim"], entry["reduced_dim"] = _npz_pca_dims(path)
+    return entry
+
+
+def write_part_manifest(cache_dir: Union[str, Path], generator: str,
+                        files: Dict[str, Dict[str, str]],
+                        provenance: Dict[str, Dict]) -> Dict:
+    """Record the tables one generator script just wrote, in its own manifest in the cache.
+
+    Blocks this run did not write keep their existing entries, so
+    ``generate_protein_embeddings.py --blocks poi`` does not forget ``e3`` and ``combined``.
+
+    Args:
+        cache_dir: Directory the generator wrote into.
+        generator: A :data:`CONTEXT_GENERATORS` key.
+        files: Block -> ``{"table": filename, "pca_model": filename}``, for the blocks written.
+        provenance: Block -> how it was made. Must hold ``"model"``, which becomes the block's
+            entry under ``models`` in the published manifest; the rest is recorded as given.
+
+    Returns:
+        The part manifest also written to ``cache_dir / CONTEXT_GENERATORS[generator]["manifest"]``.
+
+    Raises:
+        ValueError: If ``files`` names a block this generator does not own.
+    """
+    import tackai
+
+    spec = CONTEXT_GENERATORS[generator]
+    foreign = sorted(set(files) - set(spec["blocks"]))
+    if foreign:
+        raise ValueError(f"generator {generator!r} owns {spec['blocks']}, not {foreign}")
+
+    cache_dir = Path(cache_dir)
+    path = cache_dir / spec["manifest"]
+    previous = json.loads(path.read_text()) if path.exists() else {}
+    part = {
+        "format": PART_MANIFEST_FORMAT,
+        "generator": generator,
+        "script": spec["script"],
+        "files": {name: entry for name, entry in previous.get("files", {}).items()
+                  if entry.get("block") not in files},
+        "provenance": {block: record for block, record in previous.get("provenance", {}).items()
+                       if block not in files},
+    }
+    generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    for block, roles in files.items():
+        for role in TABLE_ROLES:
+            part["files"][roles[role]] = _file_entry(cache_dir / roles[role], block, role)
+        part["provenance"][block] = {
+            **provenance[block], "generated_at": generated_at,
+            "tackai_version": getattr(tackai, "__version__", "unknown")}
+    path.write_text(json.dumps(part, indent=1))
+    return part
+
+
+def aggregate_part_manifests(cache_dir: Union[str, Path]) -> Tuple[Dict[str, Dict[str, str]],
+                                                                   Dict[str, Dict]]:
+    """Merge every generator's part manifest, checking each file still matches its record.
+
+    Args:
+        cache_dir: Directory holding the tables and the part manifests.
+
+    Returns:
+        ``(files, provenance)``: block -> ``{"table": filename, "pca_model": filename}``, and
+        block -> the provenance its generator recorded.
+
+    Raises:
+        SystemExit: If a part manifest is missing or incomplete, or a file it lists is missing
+            or was rewritten after it was recorded (every problem is listed before exiting).
+    """
+    cache_dir = Path(cache_dir)
+    files: Dict[str, Dict[str, str]] = {}
+    provenance: Dict[str, Dict] = {}
+    problems = []
+    for spec in CONTEXT_GENERATORS.values():
+        path, script = cache_dir / spec["manifest"], spec["script"]
+        if not path.exists():
+            problems.append(f"{spec['manifest']} is missing: run {script}")
+            continue
+        part = json.loads(path.read_text())
+        if part.get("format") != PART_MANIFEST_FORMAT:
+            problems.append(f"{spec['manifest']} has format {part.get('format')!r}, expected "
+                            f"{PART_MANIFEST_FORMAT!r}: run {script}")
+            continue
+        try:
+            resolved = resolve_context_files(part, where=str(path), blocks=spec["blocks"])
+        except ValueError as err:
+            problems.append(f"{err} Run {script}.")
+            continue
+        for block, roles in resolved.items():
+            for name in roles.values():
+                if not (cache_dir / name).exists():
+                    problems.append(f"{name} is missing: run {script}")
+                elif sha256_of(cache_dir / name) != part["files"][name]["sha256"]:
+                    problems.append(f"{name} differs from {spec['manifest']}, so it was rewritten "
+                                    f"after that run: run {script}")
+            files[block] = roles
+            provenance[block] = part["provenance"][block]
+    if problems:
+        print(f"{len(problems)} problem(s) with the context tables in {cache_dir}:")
+        for problem in problems:
+            print(f"  {problem}")
+        print("Refusing to publish a partial or inconsistent set of context tables.")
+        raise SystemExit(1)
+    return files, provenance
+
+
+def stage_from_part_manifests(cache_dir: Union[str, Path], out_dir: Union[str, Path], *,
+                              repo_id: str = DEFAULT_CONTEXT_REPO) -> Dict:
+    """Stage the tables the generators' part manifests name, with an aggregated manifest.
+
+    Args:
+        cache_dir: Directory holding the tables and the part manifests.
+        out_dir: Staging directory to write into; refused if it already exists.
+        repo_id: Hub repo id the README points readers at.
+
+    Returns:
+        The manifest also written to ``out_dir / "manifest.json"``.
+
+    Raises:
+        SystemExit: See :func:`aggregate_part_manifests` and :func:`stage_context_tables`.
+    """
+    files, provenance = aggregate_part_manifests(cache_dir)
+    return stage_context_tables(cache_dir, out_dir, repo_id=repo_id, files=files,
+                                provenance=provenance)
+
+
 def _readme_text(repo_id: str, manifest: Dict) -> str:
     """Small human-facing card for the staged directory: what this is, how to load it."""
     blocks = ", ".join(f"{b} ({d}-d)" for b, d in sorted(manifest["block_dims"].items())
@@ -282,9 +487,11 @@ Generated by `tackai.fusion.context.stage_context_tables` (tackai version
 
 def stage_context_tables(cache_dir: Union[str, Path], out_dir: Union[str, Path], *,
                          repo_id: str = DEFAULT_CONTEXT_REPO,
-                         protein_space: Optional[str] = None) -> Dict:
-    """Copy every :data:`CONTEXT_FILES` entry from ``cache_dir`` into ``out_dir``, with a
-    manifest and a small README.
+                         files: Dict[str, Dict[str, str]],
+                         protein_space: Optional[str] = None,
+                         provenance: Optional[Dict[str, Dict]] = None) -> Dict:
+    """Copy every context table from ``cache_dir`` into ``out_dir``, with a manifest and a
+    small README.
 
     Shared by ``scripts/publish_fusion_context.py`` (publishing a whole cache) and
     :meth:`~tackai.fusion.data.FusionData.push_to_hub` (publishing one instance's own cache),
@@ -301,6 +508,7 @@ def stage_context_tables(cache_dir: Union[str, Path], out_dir: Union[str, Path],
     Args:
         cache_dir: Directory holding the cached context tables (``TACKAI_CACHE``).
         out_dir: Staging directory to write into; refused if it already exists.
+        files: Block -> ``{"table": filename, "pca_model": filename}`` to stage.
         repo_id: Hub repo id the README points readers at (purely descriptive here — it is
             not uploaded to until :func:`upload_context_tables` runs).
         protein_space: The ``protein_space`` of the encoder these tables are being staged
@@ -309,14 +517,16 @@ def stage_context_tables(cache_dir: Union[str, Path], out_dir: Union[str, Path],
             (the default, used by the maintainer CLI when staging a whole cache rather than
             one encoder's) means the manifest does not commit to either space, and a reader
             without its own ``protein_space`` falls back to ``"per_block"``.
+        provenance: Block -> how it was made, published under ``"provenance"``. Each record's
+            ``"model"`` also fills the manifest's ``"models"``.
 
     Returns:
         The manifest dict also written to ``out_dir / "manifest.json"``.
 
     Raises:
         ValueError: If ``protein_space`` is not ``None``, ``"per_block"`` or ``"combined"``.
-        SystemExit: If ``out_dir`` already exists, or any :data:`CONTEXT_FILES` entry is
-            missing from ``cache_dir`` (every missing file is listed before exiting).
+        SystemExit: If ``out_dir`` already exists, or any file to stage is missing from
+            ``cache_dir`` (every missing file is listed before exiting).
     """
     import tackai
 
@@ -331,8 +541,9 @@ def stage_context_tables(cache_dir: Union[str, Path], out_dir: Union[str, Path],
               "fresh files.")
         raise SystemExit(1)
 
-    wanted = [(filename, block, role) for block, files in CONTEXT_FILES.items()
-              for role, filename in files.items()]
+    wanted = [(filename, block, role)
+              for block, roles in files.items()
+              for role, filename in roles.items()]
     missing = [filename for filename, _, _ in wanted if not (cache_dir / filename).exists()]
     if missing:
         print(f"{len(missing)} file(s) missing from {cache_dir}:")
@@ -341,30 +552,28 @@ def stage_context_tables(cache_dir: Union[str, Path], out_dir: Union[str, Path],
         print("Refusing to publish a partial set of context tables.")
         raise SystemExit(1)
 
+    models = ({"cell": CELL_MODEL, "assay": ASSAY_MODEL, "poi": POI_ESM_MODEL,
+               "e3": POI_ESM_MODEL} if provenance is None
+              else {block: record["model"] for block, record in provenance.items()})
     manifest = {
         "format": MANIFEST_FORMAT,
         "tackai_version": getattr(tackai, "__version__", "unknown"),
         "protein_space": protein_space,
         "block_dims": {"assay_time": 1}, "combined_dim": None,
-        "models": {"cell": CELL_MODEL, "assay": ASSAY_MODEL, "poi": POI_ESM_MODEL,
-                  "e3": POI_ESM_MODEL},
+        "models": models,
         "files": {},
     }
+    if provenance is not None:
+        manifest["provenance"] = provenance
     out_dir.mkdir(parents=True)
     for filename, block, role in wanted:
         src = cache_dir / filename
-        entry = {"block": block, "role": role, "sha256": sha256_of(src),
-                 "bytes": src.stat().st_size}
+        entry = _file_entry(src, block, role)
         if role == "table":
-            dim, n_keys = _npz_table_dims(src)
-            entry["dim"], entry["n_keys"] = dim, n_keys
             if block == "combined":
-                manifest["combined_dim"] = dim
+                manifest["combined_dim"] = entry["dim"]
             else:
-                manifest["block_dims"][block] = dim
-        else:
-            full_dim, reduced_dim = _npz_pca_dims(src)
-            entry["full_dim"], entry["reduced_dim"] = full_dim, reduced_dim
+                manifest["block_dims"][block] = entry["dim"]
         manifest["files"][filename] = entry
         shutil.copy2(src, out_dir / filename)
         print(f"  staged {filename} ({block}/{role})")
@@ -377,7 +586,11 @@ def stage_context_tables(cache_dir: Union[str, Path], out_dir: Union[str, Path],
 
 def upload_context_tables(staged_dir: Union[str, Path], repo_id: str, private: bool,
                           commit_message: str) -> str:
-    """Create (if needed) the dataset repo and upload every file in ``staged_dir``.
+    """Create (if needed) the dataset repo and make its tables exactly those in ``staged_dir``.
+
+    Any ``.npz`` the staged folder does not hold is deleted in the same commit, so ``main`` holds
+    one generation and a snapshot download fetches nothing stale. Older generations stay
+    reachable through their commit.
 
     Args:
         staged_dir: Directory written by :func:`stage_context_tables`.
@@ -395,7 +608,8 @@ def upload_context_tables(staged_dir: Union[str, Path], repo_id: str, private: b
     api.create_repo(repo_id, repo_type="dataset", exist_ok=True, private=private)
     print(f"Uploading {staged_dir} -> {repo_id} ...")
     commit = api.upload_folder(repo_id=repo_id, repo_type="dataset",
-                               folder_path=str(staged_dir), commit_message=commit_message)
+                               folder_path=str(staged_dir), commit_message=commit_message,
+                               delete_patterns="*.npz")
     sha = getattr(commit, "oid", str(commit))
     print(f"Done: https://huggingface.co/datasets/{repo_id} (commit {sha})")
     return sha
@@ -451,62 +665,37 @@ def _sanitize_sequence_key(seq) -> str:
 
 
 def normalize_assay(value) -> str:
-    """Normalise a raw assay string to the open-vocabulary key.
+    """Normalise a raw assay string to one of the :data:`ASSAY_VOCAB` keys.
 
-    Ported from ``notebooks/assay_embeddings.ipynb``: text no rule recognises is passed
-    through, so the vocabulary grows with the data instead of collapsing to "other".
+    The vocabulary is closed, so every return value has a vector in the cached table:
 
-    Abbreviations are folded into the canonical type they stand for — ``"wb"`` is western
-    blot — because an unrecognised key falls back to the "unknown" vector and so throws away
-    a signal the vocabulary already holds.
+    * a missing value, or text saying the method was not recorded, gives ``"unknown"``;
+    * the first rule of :data:`ASSAY_RULES` whose pattern matches gives that rule's key.
+      Abbreviations are folded into the type they stand for — ``"wb"`` is western blot —
+      because the vocabulary already holds that signal;
+    * any other non-blank text gives ``"other"``: a real readout this vocabulary has no
+      category for, which is a different thing from not knowing the method at all.
+
+    Add a category by extending :data:`ASSAY_VOCAB` and :data:`ASSAY_RULES` — see the comment
+    above them — rather than by special-casing here.
 
     Args:
         value: Raw assay description, possibly missing.
 
     Returns:
-        The canonical assay key, or ``"unknown"`` when the value is missing.
+        One of :data:`ASSAY_VOCAB`.
     """
     if _is_missing(value):
         return "unknown"
     text = unicodedata.normalize("NFKC", str(value)).casefold().strip()
     text = re.sub(r"[‐‑–—−]", "-", text)
     text = re.sub(r"\s+", " ", text)
-    if text in {"", "nan", "none", "missing", "unknown", "n/a"}:
+    if text in {"", "nan", "none", "missing", "unknown", "n/a"} or _ASSAY_UNSPECIFIED.search(text):
         return "unknown"
-    if "capillary" in text or "simple western" in text:
-        return "capillary immunoassay"
-    if "htrf" in text:
-        return "htrf"
-    if "hibit" in text:
-        return "hibit"
-    if "nanoluc" in text or "nanoluciferase" in text:
-        return "nanoluc reporter"
-    if "msd" in text or "meso scale" in text:
-        return "msd"
-    if "flow cytometr" in text or "facs" in text:
-        return "flow cytometry"
-    if "incell hunter" in text or "incellhunter" in text:
-        return "incell hunter"
-    if "in-cell" in text or "in cell" in text or "cytoblot" in text:
-        return "in-cell immunoassay + western blot" if "/western blot" in text else "in-cell immunoassay"
-    if "dot blot" in text:
-        return "dot blot"
-    # "wb" is matched as a whole word, not a substring: it is the abbreviation AutoTPD-TPDdb
-    # uses, but it also occurs inside unrelated tokens ("wbc"), which must still pass through.
-    western = "western" in text or "immunoblot" in text or re.search(r"\bwb\b", text) is not None
-    if western and "elisa" in text:
-        return "elisa + western blot"
-    if western:
-        return "western blot"
-    if "elisa" in text:
-        return "elisa"
-    if "high-content" in text or "high content" in text:
-        return "high-content imaging"
-    if "fluorescence" in text or "immunofluorescence" in text or "imaging" in text:
-        return "fluorescence imaging"
-    if "mts" in text or "cck8" in text or "celltiter" in text:
-        return "viability assay"
-    return text
+    for key, pattern in _ASSAY_RULES_COMPILED:
+        if pattern.search(text):
+            return key
+    return "other"
 
 
 class ContextEncoder:
@@ -533,6 +722,11 @@ class ContextEncoder:
             read_context_manifest(self.cache_dir), where=str(self.cache_dir / "manifest.json"))
         self._tables: Dict[str, Dict[str, np.ndarray]] = {}
         self._warned_assay_misses: set = set()
+
+    @property
+    def context_files(self) -> Dict[str, Dict[str, str]]:
+        """Every block's table and PCA side-file names, as the manifest declares them."""
+        return self._files
 
     def files(self, block: str) -> Dict[str, str]:
         """The cached table and PCA side-file names backing a block.

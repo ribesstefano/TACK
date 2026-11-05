@@ -140,8 +140,8 @@ python scripts/ensembles/publish_ensemble_hf.py upload --all
 
 ## 🧬 `embeddings/` — context tables
 
-Each script regenerates the npz tables `tackai.fusion.context.CONTEXT_FILES`
-names, writing into `TACKAI_CACHE`. They are the generation half of the
+Each script regenerates the npz tables of its context blocks, writing into
+`TACKAI_CACHE`. They are the generation half of the
 corresponding notebook with the sweep and analysis removed, so the published
 tables have a reproducible recipe.
 
@@ -235,8 +235,9 @@ surrogates see them as different vectors.
 2. add three descriptions under that key in `ASSAY_DESCRIPTIONS` in
    `generate_assay_embeddings.py`; the script refuses to start otherwise;
 3. rerun the script. The vocabulary size is part of the file name
-   (`vocab=open<N>`), so the table lands under a new name and `CONTEXT_FILES`
-   must be updated to match — the script warns when they disagree.
+   (`vocab=open<N>`), so the table lands under a new name. The script warns that
+   the cache's `manifest.json` still names the old table until the new generation
+   is staged and installed.
 
 Adding a key refits the PCA over one more row, so **every** compressed vector
 moves, not only the new one. The full (pre-PCA) vectors of existing keys do not
@@ -255,14 +256,30 @@ Two properties worth knowing before enlarging a vocabulary: the E3 table's
 so **adding one sequence rewrites every E3 vector**; and the PCA component count
 is chosen from the data, so every regenerated table is a new embedding space.
 
+### Publishing
+
+Each generator records what it wrote in its own part manifest in `TACKAI_CACHE`:
+`manifest_protein.json`, `manifest_cell.json` and `manifest_assay.json`. They hold
+each table's and PCA side file's sha256, size and dimensions, plus the model,
+dataset revision and PCA settings behind each block. `--verify` and `--dry-run`
+write none. `generate_protein_embeddings.py --blocks poi` replaces only the `poi`
+entries.
+
 ```bash
-# Publish the context tables (manifest records sha256, size and npz-read dims)
+# Aggregate the three part manifests into manifest.json and copy the tables they
+# name to scripts/hf_staging/fusion_context/
 python scripts/embeddings/publish_fusion_context.py stage
+
+# Review that folder, then upload it
 python scripts/embeddings/publish_fusion_context.py upload
 ```
 
-Staging refuses to write a partial repo — a cache missing one PCA side file
-breaks `ContextEncoder.register_sequence` far from this script.
+Staging publishes the generation the part manifests name, even when older PCA
+widths are still in the cache. It refuses to write anything if a part manifest is
+missing, or if a file it lists is missing or was rewritten after its generator
+recorded it; the error names the script to rerun. The cache's own `manifest.json`,
+which names the tables `ContextEncoder` reads, is not changed by generating or
+staging.
 
 ## 🔮 `inference/` — batch prediction and analysis
 

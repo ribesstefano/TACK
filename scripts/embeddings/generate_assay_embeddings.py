@@ -17,7 +17,7 @@ report coverage.
 :mod:`tackai.fusion.context`, add its descriptions to :data:`ASSAY_DESCRIPTIONS` below, and
 rerun this script. It refuses to start while a key has no descriptions, and the vocabulary
 size is part of the file name (``vocab=open<N>``), so a new category lands the table under a
-name no release has used — update ``CONTEXT_FILES`` to match, as the script tells you to.
+name no release has used. The part manifest this script writes records that name.
 
 Coverage is read from the public ``ailab-bio/AutoTPDplus`` dataset on the Hugging Face Hub,
 config ``autotpdplus-protac``; see ``scripts/embeddings/_dataset.py``.
@@ -59,14 +59,15 @@ import pandas as pd
 from sklearn.decomposition import PCA
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _dataset import add_source_arguments, load_env, load_frames, source_record
+from _dataset import (add_source_arguments, load_env, load_frames, source_record,
+                      warn_if_new_generation)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_env(REPO_ROOT)
 
 from tackai.data.utils import get_cache_dir
 from tackai.data.embeddings.utils import EmbeddingMixin
-from tackai.fusion.context import ASSAY_RULES, ASSAY_VOCAB, CONTEXT_FILES, normalize_assay
+from tackai.fusion.context import ASSAY_RULES, ASSAY_VOCAB, normalize_assay, write_part_manifest
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -404,11 +405,7 @@ def main() -> int:
     files = cache_files(len(vocab), pooling)
     logger.info("%d keys -> PCA %d dims (%.1f%% variance)",
                 len(vocab), PCA_DIMS, 100 * pca.explained_variance_ratio_.sum())
-    if files["pca"] != CONTEXT_FILES["assay"]["table"]:
-        logger.warning("  !! this vocabulary writes %s, but tackai.fusion.context.CONTEXT_FILES "
-                       "names %s. Update CONTEXT_FILES (and republish the context repo), or the "
-                       "surrogates will keep reading the old table.",
-                       files["pca"], CONTEXT_FILES["assay"]["table"])
+    warn_if_new_generation(cache_dir, "assay", files["pca"])
 
     status = 0
     if args.verify:
@@ -444,6 +441,14 @@ def main() -> int:
             "files": files}
     (cache_dir / DESCRIPTIONS_FILE).write_text(json.dumps(meta, indent=1, ensure_ascii=False))
     written.append(DESCRIPTIONS_FILE)
+    write_part_manifest(
+        cache_dir, "assay",
+        {"assay": {"table": files["pca"], "pca_model": files["pca_model"]}},
+        {"assay": {"model": MODEL_NAME, "pooling": meta["pooling"], "n_keys": len(vocab),
+                   "n_descriptions": N_DESCRIPTIONS, "embedding_dim": emb_dim,
+                   "pca_dims": PCA_DIMS,
+                   "explained_variance": float(pca.explained_variance_ratio_.sum()),
+                   "source": source_record(args)}})
     for name in written:
         logger.info("%9.1f KB  %s", (cache_dir / name).stat().st_size / 1024, name)
     return status

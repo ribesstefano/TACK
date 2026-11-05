@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from fusion_fixtures import ASSAYS, CELLS, SEQS
-from tackai.fusion.context import ContextEncoder, normalize_assay
+from tackai.fusion.context import ASSAY_RULES, ASSAY_VOCAB, ContextEncoder, normalize_assay
 
 
 def test_normalize_assay_ported_rules():
@@ -16,7 +16,45 @@ def test_normalize_assay_ported_rules():
     assert normalize_assay("") == "unknown"
     assert normalize_assay(float("nan")) == "unknown"
     assert normalize_assay("HiBiT assay") == "hibit"
-    assert normalize_assay("some novel readout") == "some novel readout"
+
+
+def test_normalize_assay_closes_the_vocabulary():
+    """Every return value has a vector in the table, so free text cannot escape the vocabulary.
+
+    A real but uncategorised readout is "other"; only a missing value, or text saying the
+    method was not recorded, is "unknown" -- the two are different facts and the surrogates
+    should not confuse them.
+    """
+    assert normalize_assay("some novel readout") == "other"
+    assert normalize_assay("cell-based degradation assay") == "other"
+    assert normalize_assay("not specified") == "unknown"
+    assert normalize_assay("cellular degradation assay (method not specified)") == "unknown"
+    assert normalize_assay("N/A") == "unknown"
+
+
+def test_assay_vocabulary_and_rules_agree():
+    """Every rule names a key of the vocabulary; `other`/`unknown` are reached without a rule."""
+    assert set(k for k, _ in ASSAY_RULES) <= set(ASSAY_VOCAB)
+    assert {"other", "unknown"} <= set(ASSAY_VOCAB)
+    assert len(set(ASSAY_VOCAB)) == len(ASSAY_VOCAB), "duplicate key in ASSAY_VOCAB"
+
+
+def test_normalize_assay_new_categories():
+    """The platforms the AutoTPD+ living release named, which used to pass through as free text."""
+    assert normalize_assay("Mesoscale discovery assay") == "msd"
+    assert normalize_assay("AlphaLISA SureFire Ultra (cell lysate)") == "alphalisa"
+    assert normalize_assay("targeted mass spectrometry") == "mass spectrometry"
+    assert normalize_assay("DIA-MS proteomics") == "mass spectrometry"
+    assert normalize_assay("NanoBiT") == "nanobit"
+    assert normalize_assay("Firefly luciferase luminescence") == "luciferase reporter"
+    assert normalize_assay("SDS-PAGE/Coomassie densitometry") == "gel densitometry"
+    assert normalize_assay("endogenous WDR5 degradation assay (ProteinSimple Jess)") == \
+        "capillary immunoassay"
+    assert normalize_assay("immunostaining and microscopy") == "fluorescence imaging"
+    assert normalize_assay("enzyme fragment complementation") == "incell hunter"
+    # "in cell" is matched at a word boundary, so it does not fire inside another word.
+    assert normalize_assay("In-Cell Western") == "in-cell immunoassay + western blot"
+    assert normalize_assay("degradation measured within cells") == "other"
 
 
 def test_normalize_assay_maps_wb_abbreviation():
@@ -27,8 +65,8 @@ def test_normalize_assay_maps_wb_abbreviation():
     assert normalize_assay("wb") == "western blot"
     assert normalize_assay(" WB ") == "western blot"
     assert normalize_assay("WB/ELISA") == "elisa + western blot"
-    # Matched as a word, so a longer token that merely contains "wb" is still passed through.
-    assert normalize_assay("wbc count") == "wbc count"
+    # Matched as a word, so a longer token that merely contains "wb" does not match this rule.
+    assert normalize_assay("wbc count") == "other"
 
 
 def test_sequences_with_non_standard_residues_resolve_to_their_sanitised_key(fake_cache):
@@ -60,13 +98,11 @@ def test_fingerprint_tracks_the_content_of_the_tables(fake_cache):
     Refitting a PCA over a larger vocabulary leaves the table's name and width alone while
     changing every vector, so anything caching encoder output has to key on content.
     """
-    from tackai.fusion.context import CONTEXT_FILES
-
     enc = ContextEncoder()
     before = enc.fingerprint()
     assert before == ContextEncoder().fingerprint()        # same cache, same answer
 
-    path = fake_cache / CONTEXT_FILES["poi"]["table"]
+    path = fake_cache / enc.context_files["poi"]["table"]
     with np.load(path) as data:
         tables = {k: data[k] for k in data.files}
     tables[next(iter(tables))] += 1.0                      # same keys, same width, new vectors
@@ -112,16 +148,41 @@ def test_known_assay_comes_from_the_table(fake_cache):
     assert np.array_equal(enc.encode("assay", ["Western blot"]), enc.encode("assay", ["western blot"]))
 
 
-def test_unseen_assay_falls_back_to_unknown_with_one_warning(fake_cache):
-    """A canonical type absent from the table resolves to the table's "unknown" vector."""
+def test_unrecognised_assay_text_is_other_not_unknown(fake_cache):
+    """Free text no rule matches is a real readout: it gets the "other" vector, silently.
+
+    Nothing is missing from the table in this case -- the vocabulary is closed, so there is
+    no fallback to warn about, and "other" must stay distinct from the "unknown" reserved for
+    a value that was never recorded.
+    """
     enc = ContextEncoder()
-    with pytest.warns(UserWarning, match="a brand new readout"):
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         out = enc.encode("assay", ["a brand new readout"])
+    assert np.array_equal(out, enc.encode("assay", ["other"]))
+    assert not np.array_equal(out, enc.encode("assay", ["unknown"]))
+    assert np.array_equal(enc.encode("assay", [None]), enc.encode("assay", ["unknown"]))
+
+
+def test_assay_key_missing_from_a_stale_table_falls_back_with_one_warning(fake_cache):
+    """A key the cache predates resolves to "unknown" with a single warning.
+
+    With a closed vocabulary this is the only way to miss: a table written before a category
+    was added. Simulated by dropping one key from the cached table.
+    """
+    path = fake_cache / ContextEncoder().files("assay")["table"]
+    with np.load(path, allow_pickle=False) as data:
+        kept = {k: data[k] for k in data.keys() if k != "hibit"}
+    np.savez(path, **kept)
+
+    enc = ContextEncoder()
+    with pytest.warns(UserWarning, match="hibit"):
+        out = enc.encode("assay", ["HiBiT assay"])
     assert np.array_equal(out, enc.encode("assay", ["unknown"]))
     # The same miss does not warn again.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        enc.encode("assay", ["a brand new readout"])
+        enc.encode("assay", ["HiBiT assay"])
 
 
 def test_register_sequence_projects_a_full_embedding(fake_cache):

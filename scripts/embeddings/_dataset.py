@@ -19,6 +19,7 @@ fetch fail loudly instead of hanging.
 
 Author: Stefano Ribes
 """
+import json
 import logging
 from pathlib import Path
 from typing import Dict, List
@@ -51,6 +52,30 @@ def load_env(repo_root: Path = REPO_ROOT) -> None:
     """
     load_dotenv(Path(repo_root) / ".env")
     load_dotenv(find_dotenv(usecwd=True))
+
+
+def warn_if_new_generation(cache_dir: Path, block: str, table: str) -> None:
+    """Warn when a run writes a table other than the one the cache's ``manifest.json`` names.
+
+    The PCA width is chosen from the data and is part of the file name, so a new name means a
+    new embedding space, which models trained in the old one cannot use. The encoder keeps
+    reading the old table until the new generation is staged and installed.
+
+    Args:
+        cache_dir: Directory the tables are written to.
+        block: Context block being written.
+        table: File name of the PCA-reduced table this run writes.
+    """
+    path = Path(cache_dir) / "manifest.json"
+    if not path.exists():
+        return
+    current = [name for name, entry in json.loads(path.read_text()).get("files", {}).items()
+               if entry.get("block") == block and entry.get("role") == "table"]
+    if current and table not in current:
+        logger.warning("  !! %s writes %s, but %s names %s. This is a new embedding space: the "
+                       "encoder keeps reading the old table until this generation is staged "
+                       "with publish_fusion_context.py and installed with "
+                       "FusionData.from_pretrained.", block, table, path.name, current[0])
 
 
 def add_source_arguments(parser) -> None:

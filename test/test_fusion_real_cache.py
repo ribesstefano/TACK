@@ -1,8 +1,9 @@
-"""Opt-in checks against the real TACKAI_CACHE: filenames, keys and dimensions.
+"""Opt-in checks against the real TACKAI_CACHE: its manifest, keys and dimensions.
 
 These are the only tests that touch the downloaded cache, so a renamed npz or a changed PCA
 width is caught by the suite rather than at runtime. Run with ``pytest -m requires_cache``.
 """
+import json
 from pathlib import Path
 
 import numpy as np
@@ -12,7 +13,7 @@ from dotenv import find_dotenv, load_dotenv
 load_dotenv(find_dotenv(usecwd=True))
 
 from tackai.data.utils import get_cache_dir
-from tackai.fusion.context import CONTEXT_FILES, ContextEncoder
+from tackai.fusion.context import ContextEncoder, resolve_context_files
 
 pytestmark = pytest.mark.requires_cache
 
@@ -20,8 +21,11 @@ CACHE = Path(get_cache_dir())
 DEV_FILES = [Path("data/yaochen/AutoTPDplus-PROTAC-training.csv"),
              Path("data/yaochen/TACKv2.csv")]
 
-MISSING_TABLES = [spec["table"] for spec in CONTEXT_FILES.values()
-                  if not (CACHE / spec["table"]).exists()]
+MANIFEST = (json.loads((CACHE / "manifest.json").read_text())
+            if (CACHE / "manifest.json").exists() else None)
+MISSING_TABLES = (["manifest.json"] if MANIFEST is None else
+                  [spec["table"] for spec in resolve_context_files(MANIFEST).values()
+                   if not (CACHE / spec["table"]).exists()])
 needs_cache = pytest.mark.skipif(bool(MISSING_TABLES),
                                  reason=f"TACKAI_CACHE lacks {MISSING_TABLES}")
 needs_csvs = pytest.mark.skipif(not all(f.exists() for f in DEV_FILES),
@@ -29,25 +33,22 @@ needs_csvs = pytest.mark.skipif(not all(f.exists() for f in DEV_FILES),
 
 
 @needs_cache
-def test_real_tables_have_the_documented_dimensions():
-    enc = ContextEncoder()
-    assert enc.dim("cell") == 47
-    assert enc.dim("poi") == 51
-    assert enc.dim("e3") == 7
-    assert enc.dim("assay") == 8
-    assert ContextEncoder(protein_space="combined").dim("poi") == 52
+def test_real_tables_have_the_dimensions_their_manifest_records():
+    assert ContextEncoder().dims == MANIFEST["block_dims"]
+    assert ContextEncoder(protein_space="combined").dim("poi") == MANIFEST["combined_dim"]
 
 
 @needs_cache
 def test_real_cache_has_the_unknown_cell_line_key():
-    assert ContextEncoder().encode("cell", [None]).shape == (1, 47)
+    enc = ContextEncoder()
+    assert enc.encode("cell", [None]).shape == (1, enc.dim("cell"))
 
 
 @needs_cache
 def test_real_assay_table_covers_the_common_readouts():
     enc = ContextEncoder()
     for raw in ["Western blot", "HiBiT", "HTRF", "simple western", None]:
-        assert enc.encode("assay", [raw]).shape == (1, 8)
+        assert enc.encode("assay", [raw]).shape == (1, enc.dim("assay"))
 
 
 @needs_cache

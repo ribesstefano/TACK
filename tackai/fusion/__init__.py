@@ -13,8 +13,8 @@ gradient-boosted members with the latter, neither of which needs ``torch``. The 
 either name below only loads ``torch`` the first time it is actually accessed, so
 ``import tackai.fusion`` itself never requires it.
 """
-from tackai.fusion.context import (CONTEXT_FILES, DEFAULT_CONTEXT_REPO, ContextEncoder,
-                                   normalize_assay)
+from tackai.fusion.context import (ASSAY_RULES, ASSAY_VOCAB, DEFAULT_CONTEXT_REPO,
+                                   ContextEncoder, normalize_assay)
 from tackai.fusion.data import (BLOCK_ORDER, TASK_LABELS, TASK_TYPES, TASKS, FusionData, build_table,
                                 make_targets, scaffold_groups)
 from tackai.fusion.training import check_labels, fit_member, validation_split
@@ -49,7 +49,8 @@ def __dir__():
 
 
 __all__ = ["BLOCK_ORDER", "MolEncoder", "DESCRIPTOR_NAMES",
-           "ContextEncoder", "CONTEXT_FILES", "DEFAULT_CONTEXT_REPO", "normalize_assay",
+           "ContextEncoder", "DEFAULT_CONTEXT_REPO", "normalize_assay",
+           "ASSAY_VOCAB", "ASSAY_RULES",
            "FusionData", "build_table", "make_targets", "scaffold_groups", "TASKS",
            "TASK_TYPES", "TASK_LABELS", "XGBStackedEnsemble",
            "AdditiveProductGP", "GPInteraction",

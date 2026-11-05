@@ -3,9 +3,8 @@ Regenerate the cached POI / E3-ligase protein embeddings, the generation half of
 ``notebooks/protein_pooling_comparison.ipynb`` with the pooling sweep and its analysis left out.
 
 The notebook scores ~1,600 (block, model, layer, pooling) variants and then writes the winner
-of each block to ``TACKAI_CACHE``. The winners are now fixed — they are what
-:data:`tackai.fusion.context.CONTEXT_FILES` names — so this script skips the sweep and runs
-only the three winning combinations in :data:`BLOCK_SPEC`. One ESM pass per sequence serves
+of each block to ``TACKAI_CACHE``. The winners are now fixed, so this script skips the sweep
+and runs only the three winning combinations in :data:`BLOCK_SPEC`. One ESM pass per sequence serves
 all three, because they need just two layers and two poolings between them.
 
 Per block it writes the same three npz files the notebook wrote: the full table, the
@@ -27,9 +26,8 @@ Two things to know before running it over a *larger* vocabulary than the publish
 * **The number of PCA components is chosen from the data**, by the notebook's rule: the fewest
   that explain ``--variance-target`` of the variance *and* keep ``--similarity-target`` of the
   similarity structure. A different vocabulary can therefore choose a different ``k``, which
-  changes the file name (``_pca51`` -> ``_pca53``) and so needs ``CONTEXT_FILES`` updated.
-  The script says so loudly when ``k`` differs from :data:`PUBLISHED_PCA_DIMS`; pass
-  ``--pca-dims poi=51`` to pin it instead.
+  changes the file name (``_pca51`` -> ``_pca53``). The script warns when the name differs from
+  the one the cache's ``manifest.json`` holds; pass ``--pca-dims poi=51`` to pin it instead.
 
 A run **overwrites the cache**, and a regenerated space invalidates models trained in the old
 one, so check with ``--verify`` first when that matters.
@@ -61,7 +59,8 @@ from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _dataset import add_source_arguments, load_env, load_frames, source_record
+from _dataset import (add_source_arguments, load_env, load_frames, source_record,
+                      warn_if_new_generation)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_env(REPO_ROOT)
@@ -69,6 +68,7 @@ load_env(REPO_ROOT)
 from tackai.data.utils import get_cache_dir
 from tackai.data.embeddings.utils import EmbeddingMixin
 from tackai.data.embeddings.protein_embeddings import sanitize_sequence
+from tackai.fusion.context import write_part_manifest
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -78,11 +78,8 @@ WINDOW = 1022                                 # residues per ESM-2 window (1024 
 LSE_TAU = 1.0                                 # temperature of the smooth-max pooling
 VARIANCE_TARGET, SIMILARITY_TARGET = 0.90, 0.95   # the notebook's PCA rule
 
-#: block -> (layer, pooling): the winners of the notebook's sweep, i.e. what CONTEXT_FILES names.
+#: block -> (layer, pooling): the winners of the notebook's sweep.
 BLOCK_SPEC = {"e3": (30, "mean_rm_pc2"), "poi": (18, "lse"), "combined": (18, "lse")}
-
-#: The PCA widths the published tables carry, used only to warn when a rerun disagrees.
-PUBLISHED_PCA_DIMS = {"e3": 7, "poi": 51, "combined": 52}
 
 SEQ_COLUMNS = {"e3": "Recruiter_Sequence", "poi": "Degradation_Target_Sequence"}
 GENE_COLUMNS = {"e3": "Recruiter_Gene", "poi": "Degradation_Target_Gene"}
@@ -433,12 +430,7 @@ def main() -> int:
         logger.info("%s: layer %s / %s -> %d-d, PCA %d dims (%.1f%% variance, %s)",
                     block, layer, pooling, X.shape[1], k,
                     100 * pca.explained_variance_ratio_.sum(), chosen)
-        if k != PUBLISHED_PCA_DIMS.get(block) and block not in pinned:
-            logger.warning("  !! %s chose %d components, but the published table has %d. The file "
-                           "name changes to %s, so tackai.fusion.context.CONTEXT_FILES must be "
-                           "updated to match (or pass --pca-dims %s=%d to keep the old width).",
-                           block, k, PUBLISHED_PCA_DIMS[block], files["pca"], block,
-                           PUBLISHED_PCA_DIMS[block])
+        warn_if_new_generation(cache_dir, block, files["pca"])
 
         if args.verify:
             for kind, built in (("full", full), ("pca", reduced)):
@@ -471,6 +463,16 @@ def main() -> int:
             "blocks": info}
     (cache_dir / meta_file).write_text(json.dumps(meta, indent=1))
     written.append(meta_file)
+    write_part_manifest(
+        cache_dir, "protein",
+        {block: {"table": i["files"]["pca"], "pca_model": i["files"]["pca_model"]}
+         for block, i in info.items()},
+        {block: {**{key: value for key, value in i.items() if key != "files"},
+                 "variance_target": args.variance_target,
+                 "similarity_target": similarity_target,
+                 "pinned_pca_dims": pinned.get(block),
+                 "source": source_record(args)}
+         for block, i in info.items()})
     for name in written:
         logger.info("%9.1f KB  %s", (cache_dir / name).stat().st_size / 1024, name)
     return status

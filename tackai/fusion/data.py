@@ -195,49 +195,69 @@ def _file_sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def build_table(files: Sequence[Union[str, Path]]) -> pd.DataFrame:
-    """Read and harmonise the curated CSVs into one row-per-measurement table.
+def _harmonise_source(raw: pd.DataFrame, label: str) -> pd.DataFrame:
+    """Harmonise one curated table into the row-per-measurement columns of `build_table`.
+
+    Args:
+        raw: One curated table, in either the AutoTPD+ or the TACKv2 layout.
+        label: Name of the source, reported in errors and kept as the ``source`` column.
+
+    Returns:
+        Frame with `build_table`'s columns, before SMILES filtering and POI-sequence filling.
+
+    Raises:
+        ValueError: If a row carrying both a SMILES and a DC50 reports a unit other than nM.
+    """
+    # Checked only on the rows whose DC50 is actually read: one without a SMILES is
+    # dropped later, so rejecting the source over its units would refuse data on the
+    # strength of rows that never reach a model. A foreign unit on a usable row is still
+    # an error -- silently reading µg/mL as nM is exactly what this guard is for.
+    has_smiles = raw["SMILES"].notna() & (raw["SMILES"].astype(str).str.strip() != "")
+    units = set(raw.loc[has_smiles & raw["DC50"].notna(), "DC50_units"].dropna().unique())
+    if not units <= {"nM"}:
+        raise ValueError(f"{label}: unexpected DC50 units {units}")
+    if "Cell_Line_STD_Accession" in raw:                       # AutoTPD+ layout
+        cell_key = _first_valid(raw["Cell_Line_STD_Accession"], raw["Cell_Line_STD"],
+                                raw["Cell_Line"])
+    else:                                                      # TACKv2 layout
+        cell_key = _first_valid(raw["Cell_Line_ID"], raw["Cell_Line"])
+    e3_raw = (_first_valid(raw["Recruiter"], raw["Recruiter_Gene"])
+              if "Recruiter_Gene" in raw else raw["Recruiter"])
+    hours = raw[["DC50_h", "Dmax_h"]].astype(float)
+    return pd.DataFrame({
+        "source": label, "smiles": raw["SMILES"], "e3_raw": e3_raw,
+        "e3_seq": raw["Recruiter_Sequence"],
+        "poi_uniprot": raw["Degradation_Target_Uniprot"],
+        "poi_seq": raw["Degradation_Target_Sequence"],
+        "cell_key": cell_key, "assay_raw": raw["Assay"],
+        "assay_time": hours.mean(axis=1, skipna=True),   # DC50_h and Dmax_h agree in ~98% of rows
+        "dmax_pct": raw["Dmax"].astype(float).clip(0, 100),
+        "dc50_nM": raw["DC50"].astype(float)})
+
+
+def build_table(sources: Sequence[Union[str, Path, pd.DataFrame]]) -> pd.DataFrame:
+    """Harmonise the curated tables into one row-per-measurement table.
 
     Handles both layouts in AutoTPD+ and TACKv2, drops rows without a
     SMILES, and fills a missing POI sequence from the most frequent sequence recorded for the
     same UniProt entry. No de-duplication: repeated measurements are repeated rows.
 
     Args:
-        files: CSV paths.
+        sources: CSV paths, or already-loaded DataFrames — a dataset pulled straight from the
+            Hub needs no CSV on disk. A frame's ``source`` label comes from its
+            ``attrs["name"]`` when set, else its position. A path's is the file stem.
 
     Returns:
         Frame with columns ``source``, ``smiles``, ``e3_raw``, ``e3_seq``, ``poi_uniprot``,
         ``poi_seq``, ``cell_key``, ``assay_raw``, ``assay_time``, ``dmax_pct``, ``dc50_nM``.
     """
     parts = []
-    for f in files:
-        f = Path(f)
-        raw = pd.read_csv(f, low_memory=False)
-        # Checked only on the rows whose DC50 is actually read: one without a SMILES is
-        # dropped below, so rejecting the file over its units would refuse data on the
-        # strength of rows that never reach a model. A foreign unit on a usable row is still
-        # an error -- silently reading µg/mL as nM is exactly what this guard is for.
-        has_smiles = raw["SMILES"].notna() & (raw["SMILES"].astype(str).str.strip() != "")
-        units = set(raw.loc[has_smiles & raw["DC50"].notna(), "DC50_units"].dropna().unique())
-        if not units <= {"nM"}:
-            raise ValueError(f"{f.name}: unexpected DC50 units {units}")
-        if "Cell_Line_STD_Accession" in raw:                       # AutoTPD+ layout
-            cell_key = _first_valid(raw["Cell_Line_STD_Accession"], raw["Cell_Line_STD"],
-                                    raw["Cell_Line"])
-        else:                                                      # TACKv2 layout
-            cell_key = _first_valid(raw["Cell_Line_ID"], raw["Cell_Line"])
-        e3_raw = (_first_valid(raw["Recruiter"], raw["Recruiter_Gene"])
-                  if "Recruiter_Gene" in raw else raw["Recruiter"])
-        hours = raw[["DC50_h", "Dmax_h"]].astype(float)
-        parts.append(pd.DataFrame({
-            "source": f.stem, "smiles": raw["SMILES"], "e3_raw": e3_raw,
-            "e3_seq": raw["Recruiter_Sequence"],
-            "poi_uniprot": raw["Degradation_Target_Uniprot"],
-            "poi_seq": raw["Degradation_Target_Sequence"],
-            "cell_key": cell_key, "assay_raw": raw["Assay"],
-            "assay_time": hours.mean(axis=1, skipna=True),   # DC50_h and Dmax_h agree in ~98% of rows
-            "dmax_pct": raw["Dmax"].astype(float).clip(0, 100),
-            "dc50_nM": raw["DC50"].astype(float)}))
+    for i, src in enumerate(sources):
+        if isinstance(src, pd.DataFrame):
+            parts.append(_harmonise_source(src, str(src.attrs.get("name", f"frame{i}"))))
+        else:
+            f = Path(src)
+            parts.append(_harmonise_source(pd.read_csv(f, low_memory=False), f.stem))
 
     tab = pd.concat(parts, ignore_index=True)
     tab = tab[tab["smiles"].notna() & (tab["smiles"].astype(str).str.strip() != "")]
@@ -429,8 +449,8 @@ class FusionData:
                         descriptors: Optional[Sequence[str]] = DESCRIPTOR_NAMES) -> "FusionData":
         """Build an encoder-only FusionData from the published context embedding tables.
 
-        Downloads (or reuses a local directory of) the context tables named in
-        :data:`~tackai.fusion.context.CONTEXT_FILES`, installs them into the local cache, and
+        Downloads (or reuses a local directory of) the context tables named in the source's
+        ``manifest.json``, installs them into the local cache, and
         returns a :class:`FusionData` with no table — ready for :meth:`transform`,
         :meth:`transform_context` and :meth:`assemble`, but not for :attr:`X`, :attr:`groups` or
         :meth:`target` (use :meth:`from_csv` for a training table).
@@ -600,8 +620,8 @@ class FusionData:
                     dry_run: bool = False) -> Optional[str]:
         """Publish this instance's context tables to the Hub, the inverse of :meth:`from_pretrained`.
 
-        Stages the :data:`~tackai.fusion.context.CONTEXT_FILES` tables read out of
-        :attr:`encoder`'s own cache directory and uploads them, so the published repo always
+        Stages the tables :attr:`encoder` resolved from its cache's ``manifest.json`` and
+        uploads them, so the published repo always
         matches what this instance actually encodes with — never :attr:`table`, :attr:`X`,
         the targets or the splits (see the module-level rationale in
         ``tackai/fusion/context.py`` for why those stay out of this artifact). The manifest
@@ -631,14 +651,16 @@ class FusionData:
             raise ValueError("dry_run requires staging_dir, otherwise the staged files would "
                              "be thrown away unseen")
         if staging_dir is not None:
-            stage_context_tables(self.encoder.cache_dir, staging_dir, repo_id=repo_id,
+            stage_context_tables(self.encoder.cache_dir, staging_dir,
+                                 files=self.encoder.context_files, repo_id=repo_id,
                                  protein_space=self.encoder.protein_space)
             if dry_run:
                 return None
             return upload_context_tables(staging_dir, repo_id, private, commit_message)
         with tempfile.TemporaryDirectory() as tmp:
             staged = Path(tmp) / "fusion_context"
-            stage_context_tables(self.encoder.cache_dir, staged, repo_id=repo_id,
+            stage_context_tables(self.encoder.cache_dir, staged,
+                                 files=self.encoder.context_files, repo_id=repo_id,
                                  protein_space=self.encoder.protein_space)
             return upload_context_tables(staged, repo_id, private, commit_message)
 

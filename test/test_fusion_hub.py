@@ -7,22 +7,27 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "embeddings"))
 import publish_fusion_context as pfc  # noqa: E402
 
 from fusion_fixtures import (ASSAY_FILE, ASSAY_PCA_FILE, BLOCK_DIMS, CELL_FILE, COMBINED_DIM,
-                             COMBINED_FILE, E3_FILE, POI_FILE, write_context_source)
-from tackai.fusion.context import CONTEXT_FILES, ContextEncoder
+                             COMBINED_FILE, E3_FILE, POI_FILE, write_context_source,
+                             write_part_manifests)
+from tackai.fusion.context import (CONTEXT_GENERATORS, ContextEncoder, resolve_context_files,
+                                   write_part_manifest)
 from tackai.fusion.data import FusionData
 
 
-def _all_context_filenames():
-    from tackai.fusion.context import CONTEXT_FILES
-    return [filename for files in CONTEXT_FILES.values() for filename in files.values()]
+def _resolved(cache):
+    return resolve_context_files(json.loads((cache / "manifest.json").read_text()))
 
 
-def test_fake_cache_has_every_context_files_entry(fake_cache):
-    for block, files in CONTEXT_FILES.items():
+def _all_context_filenames(cache):
+    return [name for files in _resolved(cache).values() for name in files.values()]
+
+
+def test_fake_cache_has_every_file_its_manifest_names(fake_cache):
+    for block, files in _resolved(fake_cache).items():
         for role, filename in files.items():
             assert (fake_cache / filename).exists(), f"missing {block}/{role}: {filename}"
 
@@ -35,7 +40,7 @@ def test_default_context_repo_is_exported():
 def test_stage_copies_all_ten_files_and_writes_a_manifest(fake_cache, tmp_path):
     out = tmp_path / "staged"
     manifest = pfc.stage(fake_cache, out)
-    for name in _all_context_filenames():
+    for name in _all_context_filenames(fake_cache):
         assert (out / name).exists()
     assert (out / "manifest.json").exists()
     expected = {block: BLOCK_DIMS[block] for block in ("e3", "cell", "poi", "assay")}
@@ -68,9 +73,8 @@ def test_stage_hashes_match_the_staged_bytes(fake_cache, tmp_path):
 
 
 def test_stage_pca_model_entries_record_the_reduced_dimension(fake_cache, tmp_path):
-    from tackai.fusion.context import CONTEXT_FILES
     manifest = pfc.stage(fake_cache, tmp_path / "staged")
-    for block, files in CONTEXT_FILES.items():
+    for block, files in resolve_context_files(manifest).items():
         table_dim = manifest["files"][files["table"]]["dim"]
         reduced_dim = manifest["files"][files["pca_model"]]["reduced_dim"]
         assert table_dim == reduced_dim, block
@@ -103,8 +107,9 @@ def test_upload_calls_create_repo_and_upload_folder(fake_cache, tmp_path, monkey
         def create_repo(self, repo_id, repo_type, exist_ok, private):
             calls["create_repo"] = (repo_id, repo_type, exist_ok, private)
 
-        def upload_folder(self, repo_id, repo_type, folder_path, commit_message):
+        def upload_folder(self, repo_id, repo_type, folder_path, commit_message, delete_patterns):
             calls["upload_folder"] = (repo_id, repo_type, folder_path, commit_message)
+            calls["delete_patterns"] = delete_patterns
             return type("Commit", (), {"oid": "abc123"})()
 
     monkeypatch.setattr("huggingface_hub.HfApi", lambda: FakeApi())
@@ -123,7 +128,7 @@ def test_from_pretrained_installs_into_an_empty_cache(fake_cache, tmp_path):
     data = FusionData.from_pretrained(staged, cache_dir=target)
     assert data.table is None
     assert data.dims == BLOCK_DIMS
-    for name in _all_context_filenames():
+    for name in _all_context_filenames(fake_cache):
         assert (target / name).exists()
     with pytest.raises(ValueError, match="no table"):
         _ = data.X
@@ -361,8 +366,9 @@ class _FakeHubApi:
     def create_repo(self, repo_id, repo_type, exist_ok, private):
         self.calls["create_repo"] = (repo_id, repo_type, exist_ok, private)
 
-    def upload_folder(self, repo_id, repo_type, folder_path, commit_message):
+    def upload_folder(self, repo_id, repo_type, folder_path, commit_message, delete_patterns):
         self.calls["upload_folder"] = (repo_id, repo_type, folder_path, commit_message)
+        self.calls["delete_patterns"] = delete_patterns
         return type("Commit", (), {"oid": "abc123"})()
 
 
@@ -376,7 +382,7 @@ def test_push_to_hub_stages_to_a_given_directory_and_uploads(fake_cache, tmp_pat
                            staging_dir=staged)
 
     assert sha == "abc123"
-    for name in _all_context_filenames():
+    for name in _all_context_filenames(fake_cache):
         assert (staged / name).exists()
     assert (staged / "manifest.json").exists()
     assert "ailab-bio/TACK-fusion-context" in (staged / "README.md").read_text()
@@ -407,7 +413,7 @@ def test_push_to_hub_dry_run_stages_without_uploading(fake_cache, tmp_path, monk
 
     assert result is None
     assert calls == {}
-    for name in _all_context_filenames():
+    for name in _all_context_filenames(fake_cache):
         assert (staged / name).exists()
 
 
@@ -521,3 +527,115 @@ def test_from_pretrained_refuses_a_manifest_that_covers_no_assay_block(tmp_path)
 
     with pytest.raises(ValueError, match="declares no table for block 'assay'"):
         FusionData.from_pretrained(source, cache_dir=tmp_path / "cache")
+
+
+# --- Aggregating the generators' part manifests -----------------------------------------------
+# A cache keeps old generations under their old PCA widths, so what to publish has to come from
+# what the generators last wrote, not from what happens to be on disk.
+
+NEW_DIMS = {"cell": 40, "poi": 33, "e3": 11, "combined": 35, "assay": 6}
+
+
+def test_stage_publishes_the_generation_the_part_manifests_name(fake_cache, tmp_path):
+    """Two generations share the cache; only the one the generators last wrote is published."""
+    write_part_manifests(fake_cache, write_context_source(fake_cache, NEW_DIMS))
+    staged = tmp_path / "staged"
+    manifest = pfc.stage(fake_cache, staged)
+    assert manifest["block_dims"] == {**{b: d for b, d in NEW_DIMS.items() if b != "combined"},
+                                      "assay_time": 1}
+    assert manifest["combined_dim"] == NEW_DIMS["combined"]
+    assert len(manifest["files"]) == 10 and not (staged / POI_FILE).exists()
+    assert FusionData.from_pretrained(str(staged), cache_dir=tmp_path / "target").encoder.dim(
+        "poi") == NEW_DIMS["poi"]
+
+
+def test_stage_aggregates_models_and_provenance(fake_cache, tmp_path):
+    staged = tmp_path / "staged"
+    manifest = pfc.stage(fake_cache, staged)
+    assert manifest["models"]["poi"] == "test/protein"
+    assert manifest["models"]["cell"] == "test/cell"
+    assert set(manifest["provenance"]) == {"cell", "poi", "e3", "combined", "assay"}
+    assert manifest["provenance"]["assay"]["source"] == {"dataset": "test"}
+    assert json.loads((staged / "manifest.json").read_text()) == manifest
+
+
+@pytest.mark.parametrize("generator", list(CONTEXT_GENERATORS))
+def test_stage_refuses_a_missing_part_manifest_and_names_its_script(
+        fake_cache, tmp_path, capsys, generator):
+    spec = CONTEXT_GENERATORS[generator]
+    (fake_cache / spec["manifest"]).unlink()
+    with pytest.raises(SystemExit):
+        pfc.stage(fake_cache, tmp_path / "staged")
+    assert spec["script"] in capsys.readouterr().out
+    assert not (tmp_path / "staged").exists()
+
+
+def test_stage_refuses_a_table_rewritten_after_its_part_manifest(fake_cache, tmp_path, capsys):
+    """A crashed or hand-edited regeneration must not publish a table its record does not describe."""
+    np.savez(fake_cache / POI_FILE, other=np.zeros(78, dtype=np.float32))
+    with pytest.raises(SystemExit):
+        pfc.stage(fake_cache, tmp_path / "staged")
+    out = capsys.readouterr().out
+    assert POI_FILE in out and CONTEXT_GENERATORS["protein"]["script"] in out
+
+
+def test_part_manifest_records_entries_read_from_the_files(fake_cache):
+    part = json.loads((fake_cache / CONTEXT_GENERATORS["protein"]["manifest"]).read_text())
+    assert part["generator"] == "protein"
+    entry = part["files"][POI_FILE]
+    assert (entry["block"], entry["role"], entry["dim"]) == ("poi", "table", BLOCK_DIMS["poi"])
+    assert entry["sha256"] == pfc.sha256_of(fake_cache / POI_FILE)
+    assert part["provenance"]["poi"]["model"] == "test/protein"
+    assert "generated_at" in part["provenance"]["poi"]
+
+
+def test_rerunning_one_protein_block_keeps_the_others(fake_cache):
+    """generate_protein_embeddings.py --blocks poi must not forget e3 and combined."""
+    manifest = write_context_source(fake_cache, {"poi": 33})
+    new_poi = {entry["role"]: name for name, entry in manifest["files"].items()}
+    write_part_manifest(fake_cache, "protein", {"poi": new_poi}, {"poi": {"model": "test/new"}})
+    part = json.loads((fake_cache / CONTEXT_GENERATORS["protein"]["manifest"]).read_text())
+    by_block = {}
+    for name, entry in part["files"].items():
+        by_block.setdefault(entry["block"], {})[entry["role"]] = name
+    assert by_block["poi"] == new_poi
+    assert by_block["e3"]["table"] == E3_FILE and by_block["combined"]["table"] == COMBINED_FILE
+    assert part["provenance"]["poi"]["model"] == "test/new"
+    assert part["provenance"]["e3"]["model"] == "test/protein"
+
+
+def test_part_manifest_refuses_a_block_its_generator_does_not_own(fake_cache):
+    with pytest.raises(ValueError, match="owns"):
+        write_part_manifest(fake_cache, "cell", {"poi": {}}, {"poi": {"model": "x"}})
+
+
+def test_part_manifests_leave_the_caches_own_manifest_alone(fake_cache):
+    """manifest.json names the tables the encoder reads; regenerating must not repoint it."""
+    before = (fake_cache / "manifest.json").read_bytes()
+    write_part_manifests(fake_cache, json.loads(before))
+    assert (fake_cache / "manifest.json").read_bytes() == before
+
+
+def test_push_to_hub_publishes_the_generation_its_encoder_reads(tmp_path):
+    """Another generation in the cache must not be published in place of the encoder's own."""
+    cache = tmp_path / "cache"
+    write_context_source(cache, {"cell": 56, "poi": 78, "e3": 24, "combined": 86, "assay": 8})
+    manifest = write_context_source(cache, NEW_DIMS)
+    data = FusionData(encoder=ContextEncoder(cache_dir=str(cache)))
+    staged = tmp_path / "staged"
+
+    data.push_to_hub("ailab-bio/TACK-fusion-context", staging_dir=staged, dry_run=True)
+
+    published = json.loads((staged / "manifest.json").read_text())
+    assert set(published["files"]) == set(manifest["files"])
+    assert not (staged / POI_FILE).exists()
+
+
+def test_upload_deletes_the_tables_of_older_generations(fake_cache, tmp_path, monkeypatch):
+    """upload_folder only adds by default, which left every old generation on main."""
+    staged = tmp_path / "staged"
+    pfc.stage(fake_cache, staged)
+    calls = {}
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda: _FakeHubApi(calls))
+    pfc.upload(staged, "ailab-bio/TACK-fusion-context", private=False, commit_message="m")
+    assert calls["delete_patterns"] == "*.npz"

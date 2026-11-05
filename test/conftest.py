@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from fusion_fixtures import ASSAYS, CELLS, SEQS, SMILES, write_context_source
+from fusion_fixtures import ASSAYS, CELLS, SEQS, SMILES, write_context_source, write_part_manifests
 
 
 @pytest.fixture
@@ -17,9 +17,11 @@ def fake_cache(tmp_path, monkeypatch):
     """A TACKAI_CACHE holding the five npz tables under their real names, plus the manifest
     that names them — the shape ``FusionData.from_pretrained`` installs, and the shape a bare
     ``ContextEncoder`` needs, since the filenames are read from the manifest rather than
-    hardcoded. Returns the Path."""
+    hardcoded — and the part manifests the generator scripts leave behind. Returns the Path."""
     cache = tmp_path / "cache"
-    write_context_source(cache, {"cell": 56, "poi": 78, "e3": 24, "combined": 86, "assay": 8})
+    manifest = write_context_source(cache, {"cell": 56, "poi": 78, "e3": 24, "combined": 86,
+                                            "assay": 8})
+    write_part_manifests(cache, manifest)
     monkeypatch.setenv("TACKAI_CACHE", str(cache))
     return cache
 

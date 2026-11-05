@@ -22,7 +22,7 @@ returns a `FusionData` with no training table — it is ready for `transform`, `
 curated CSVs).
 
 Passing a local directory instead of a repo id (one written by
-`scripts/publish_fusion_context.py`'s `stage` phase) skips the network entirely:
+`scripts/embeddings/publish_fusion_context.py`'s `stage` phase) skips the network entirely:
 
 ```python
 data = FusionData.from_pretrained("/path/to/staged/fusion_context")

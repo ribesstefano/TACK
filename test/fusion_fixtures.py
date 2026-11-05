@@ -5,6 +5,8 @@ in ``test/`` (which pytest puts on ``sys.path``) rather than a ``test`` package,
 ``test`` is a standard-library package name and importing ``test.conftest`` would shadow it.
 """
 
+from tackai.fusion.context import (ASSAY_VOCAB, CONTEXT_GENERATORS,
+                                   resolve_context_files, write_part_manifest)
 from tackai.fusion.data import BLOCK_ORDER, block_index  # noqa: F401  (re-exported for tests)
 
 #: Widths of a FusionData built on the synthetic cache below and the default featuriser.
@@ -26,9 +28,6 @@ COMBINED_FILE = ("protein_embeddings_esm_model=facebook-esm2_t30_150M_UR50D_laye
                  "_pooling=lse_window=1022_block=combined_pca86.npz")
 E3_FILE = ("protein_embeddings_esm_model=facebook-esm2_t30_150M_UR50D_layer=30"
            "_pooling=mean_rm_pc2_window=1022_block=e3_pca24.npz")
-ASSAY_FILE = "assay_embeddings_vocab=open20_model=all-mpnet-base-v1_pooling=mean_pca8.npz"
-ASSAY_PCA_FILE = "assay_pca_vocab=open20_model=all-mpnet-base-v1_pooling=mean_pca8.npz"
-
 NOT_FOUND = "Unknown cell line."
 
 # Short stand-in sequences; the real tables are keyed by full amino-acid sequences.
@@ -43,11 +42,9 @@ SEQS = {
 
 CELLS = ["CVCL_0031", "CVCL_0395", "CVCL_0291", "CVCL_0062"]
 
-ASSAYS = ["western blot", "htrf", "hibit", "capillary immunoassay", "elisa", "unknown",
-          "nanoluc reporter", "flow cytometry", "in-cell immunoassay", "msd",
-          "high-content imaging", "fluorescence imaging", "dot blot", "viability assay",
-          "incell hunter", "elisa + western blot", "in-cell immunoassay + western blot",
-          "mass spectrometry", "immunoprecipitation", "reporter assay"]
+#: The real assay vocabulary: it is closed, so the synthetic table holds exactly the keys
+#: ``normalize_assay`` can return. Tests index the first few, and every one of those is a key.
+ASSAYS = list(ASSAY_VOCAB)
 
 SMILES = [
     "CC(C)(C)c1ccc(cc1)C(=O)NC1CCN(CC1)C(=O)c1ccccc1",
@@ -65,7 +62,7 @@ SMILES = [
 #: repo encodes each block's width in its filename, so a regenerated table arrives under a name
 #: no previous release used. Tests build sources at arbitrary widths from these.
 _PROTEIN_STEM = "protein_embeddings_esm_model=facebook-esm2_t30_150M_UR50D"
-_ASSAY_STEM = "vocab=open20_model=all-mpnet-base-v1_pooling=mean"
+_ASSAY_STEM = f"vocab=open{len(ASSAY_VOCAB)}_model=all-mpnet-base-v1_pooling=mean"
 NAME_TEMPLATES = {
     "cell": ("cell_embeddings_model=sentence-transformer_pooling=mean_pca{d}.npz",
              "cell_embeddings_model=sentence-transformer_pooling=mean_pca{d}_model.npz"),
@@ -79,6 +76,10 @@ NAME_TEMPLATES = {
     "assay": (f"assay_embeddings_{_ASSAY_STEM}_pca{{d}}.npz",
               f"assay_pca_{_ASSAY_STEM}_pca{{d}}.npz"),
 }
+
+# Built from the template: the assay file name carries the vocabulary size, so adding an assay
+# category renames it and a literal here would silently stop matching.
+ASSAY_FILE, ASSAY_PCA_FILE = (t.format(d=8) for t in NAME_TEMPLATES["assay"])
 
 #: Keys each block's table is written with, matching the synthetic cache in conftest.
 BLOCK_KEYS = {"cell": CELLS + [NOT_FOUND], "poi": SEQS["poi"], "e3": SEQS["e3"],
@@ -150,6 +151,20 @@ def write_context_source(out_dir, dims, *, protein_space=None, mutate=None):
         mutate(manifest)
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=1))
     return manifest
+
+
+def write_part_manifests(cache_dir, manifest):
+    """Record the tables ``manifest`` names as if each generator script had just written them.
+
+    Args:
+        cache_dir: Directory holding the tables.
+        manifest: The manifest returned by :func:`write_context_source`.
+    """
+    for generator, spec in CONTEXT_GENERATORS.items():
+        files = resolve_context_files(manifest, blocks=spec["blocks"])
+        write_part_manifest(cache_dir, generator, files,
+                            {block: {"model": f"test/{generator}", "source": {"dataset": "test"}}
+                             for block in files})
 
 
 def build_ensemble(factory, data, task, n_members=3, n_folds=3):

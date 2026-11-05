@@ -1,32 +1,35 @@
 """
-Stage and publish the fusion pipeline's context embedding tables to the
-Hugging Face Hub (ailab-bio/TACK-fusion-context).
+Aggregate the generators' part manifests, stage the tables they name, and publish them to the
+Hugging Face Hub (ailab-bio/TACK-Context-Encoding).
 
-Two phases, run separately so the staged folder can be inspected before
-anything is uploaded:
+Each ``generate_*_embeddings.py`` script writes its own part manifest into TACKAI_CACHE
+(``manifest_protein.json``, ``manifest_cell.json``, ``manifest_assay.json``), so run all three
+at least once first. Then two phases, run separately so the staged folder can be inspected
+before anything is uploaded:
 
     # 1. Stage locally (pure file copies + a generated manifest, no network writes)
-    python scripts/publish_fusion_context.py stage
+    python scripts/embeddings/publish_fusion_context.py stage
 
-    # 2. Review hf_staging/fusion_context/, then upload
-    python scripts/publish_fusion_context.py upload
+    # 2. Review scripts/hf_staging/fusion_context/, then upload
+    python scripts/embeddings/publish_fusion_context.py upload
 
-Staging resolves every (block, role) pair of tackai.fusion.context.CONTEXT_FILES against
-TACKAI_CACHE (or --cache-dir) and refuses to write a partial repo: a cache missing even one
-PCA side file breaks ContextEncoder.register_sequence and the assay fallback path at
-inference time, far from this script. The generated manifest.json records each file's
-sha256, byte size, and the dimensions read out of the npz itself (never parsed from the
-filename), plus the block widths in the same `block_dims` shape FusionEnsemble.save() writes,
-so it can be fed straight to FusionEnsemble._check_layout.
+Staging takes the table names from the part manifests, so an older generation still sitting in
+the cache under another PCA width is not published. It refuses to write a partial repo: a part
+manifest that is missing, or a file that is missing or was rewritten since its generator
+recorded it, would otherwise surface far from this script, at inference time. The generated
+manifest.json records each file's sha256, byte size and the dimensions read out of the npz
+itself (never parsed from the filename), the block widths in the same `block_dims` shape
+FusionEnsemble.save() writes, so it can be fed straight to FusionEnsemble._check_layout, and
+each block's provenance as its generator recorded it.
 
 Requires `huggingface_hub` to be installed and an authenticated session
 (`hf auth login`, or an HF_TOKEN in the environment) with write access to the
 ailab-bio org for the `upload` phase.
 
-This is a maintainer tool for publishing an arbitrary TACKAI_CACHE. To publish the tables one
-already-built FusionData instance is using, call its own `push_to_hub()` instead
-(`tackai/fusion/data.py`) — both this script and that method call the same
-`stage_context_tables` / `upload_context_tables` functions in `tackai/fusion/context.py`.
+This is a maintainer tool for publishing a freshly generated TACKAI_CACHE. To publish the tables
+one already-built FusionData instance is using, call its own `push_to_hub()` instead
+(`tackai/fusion/data.py`) — both end in the same `stage_context_tables` /
+`upload_context_tables` functions in `tackai/fusion/context.py`.
 
 Author: Stefano Ribes
 """
@@ -35,18 +38,24 @@ import sys
 from pathlib import Path
 from typing import Dict
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _dataset import load_env
+
+# HF_TOKEN (and TACKAI_CACHE) come from the repo's .env; HfApi reads HF_TOKEN from the
+# environment, so the upload phase needs no --token flag. Existing variables win.
+load_env()
+
 from tackai.data.utils import get_cache_dir
 from tackai.fusion.context import (DEFAULT_CONTEXT_REPO, sha256_of,  # noqa: F401  (re-exported for tests)
-                                   stage_context_tables, upload_context_tables)
+                                   stage_from_part_manifests, upload_context_tables)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 STAGING_ROOT = REPO_ROOT / "hf_staging" / "fusion_context"
 
 
 def stage(cache_dir: Path, out_dir: Path, repo_id: str = DEFAULT_CONTEXT_REPO) -> Dict:
-    """Thin CLI wrapper over :func:`tackai.fusion.context.stage_context_tables`."""
-    return stage_context_tables(cache_dir, out_dir, repo_id=repo_id)
+    """Thin CLI wrapper over :func:`tackai.fusion.context.stage_from_part_manifests`."""
+    return stage_from_part_manifests(cache_dir, out_dir, repo_id=repo_id)
 
 
 def cmd_stage(args: argparse.Namespace) -> None:

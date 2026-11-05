@@ -3,16 +3,16 @@ Regenerate the cached cell-line embeddings, the cell half of
 ``notebooks/context_embeddings.ipynb`` with the analysis left out.
 
 Each cell line is embedded from its Cellosaurus description with a sentence-transformer,
-PCA-compressed, and written to ``TACKAI_CACHE`` as the three npz files
-:data:`tackai.fusion.context.CONTEXT_FILES` names for the ``cell`` block. A key Cellosaurus
-does not know keeps its own entry and is embedded from the "unknown" description, so it
+PCA-compressed, and written to ``TACKAI_CACHE`` as three npz files: the full table, the
+compressed table the ``cell`` block publishes, and the fitted PCA. A key Cellosaurus does not
+know keeps its own entry and is embedded from the "unknown" description, so it
 resolves to a vector instead of being dropped.
 
 Only the ``cell`` block is regenerated. That notebook also writes ``recruiter`` and ``target``
-protein tables with ``pooling=sum``; those are the superseded generation —
-``CONTEXT_FILES`` now points at the ``lse`` / ``mean_rm_pc2`` tables that
-``scripts/generate_protein_embeddings.py`` writes, so regenerating them here would only add
-dead files.
+protein tables with ``pooling=sum``; those are the superseded generation — the protein blocks
+now use the ``lse`` / ``mean_rm_pc2`` tables that
+``scripts/embeddings/generate_protein_embeddings.py`` writes, so regenerating them here would
+only add dead files.
 
 **The vocabulary is taken from the production path, not from the notebook's columns.**
 ``FusionData.build_table`` resolves a row's cell key as
@@ -54,13 +54,15 @@ from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _dataset import add_source_arguments, load_env, load_frames, source_record
+from _dataset import (add_source_arguments, load_env, load_frames, source_record,
+                      warn_if_new_generation)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_env(REPO_ROOT)
 
 from tackai.data.utils import get_cache_dir
 from tackai.data.embeddings.utils import EmbeddingMixin
+from tackai.fusion.context import write_part_manifest
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
@@ -69,7 +71,6 @@ CELL_MODEL = "sentence-transformers/all-mpnet-base-v1"
 CELL_POOLING = "mean"                       # pooling over the tokens of a cell-line description
 NOT_FOUND = "Unknown cell line."            # CellEmbedding's description for a missing cell line
 VARIANCE_TARGET, SIMILARITY_TARGET = 0.90, 0.95   # the notebook's PCA rule
-PUBLISHED_PCA_DIMS = 47                     # width the published table carries, used only to warn
 META_FILE = "context_embeddings_meta.json"
 
 
@@ -84,8 +85,13 @@ def stem() -> str:
     return f"cell_embeddings_model=sentence-transformer_pooling={CELL_POOLING}"
 
 
+def full_file() -> str:
+    """The full table's name; unlike the compressed files', it does not depend on the PCA width."""
+    return f"{stem()}.npz"
+
+
 def cache_files(k: int) -> dict:
-    return {"full": f"{stem()}.npz", "pca": f"{stem()}_pca{k}.npz",
+    return {"full": full_file(), "pca": f"{stem()}_pca{k}.npz",
             "pca_model": f"{stem()}_pca{k}_model.npz"}
 
 
@@ -201,7 +207,7 @@ def main() -> int:
     # Union in whatever the cached table already holds, so regenerating from one dataset
     # never drops a key another dataset still looks up. The vectors already exist, so the only
     # cost is keeping them.
-    cached_full = cache_dir / cache_files(PUBLISHED_PCA_DIMS)["full"]
+    cached_full = cache_dir / full_file()
     if cached_full.exists() and not args.recompute:
         with np.load(cached_full, allow_pickle=False) as data:
             carried = [k for k in data.keys() if k not in set(vocab)]
@@ -214,7 +220,7 @@ def main() -> int:
 
     encoder = CellEmbedding(embeddings_type="sentence_transformer", pretrained_model=CELL_MODEL,
                             pooling=CELL_POOLING, not_found_description=NOT_FOUND,
-                            filename=cache_files(PUBLISHED_PCA_DIMS)["full"], cache_dir=cache_dir,
+                            filename=full_file(), cache_dir=cache_dir,
                             load_from_cache=not args.recompute,
                             device=args.device, batch_size=args.batch_size)
     todo = [k for k in vocab if k not in encoder]
@@ -246,11 +252,7 @@ def main() -> int:
     logger.info("cell: %d keys, %d distinct vectors of dim %d -> PCA %d dims (%.1f%% variance, %s)",
                 len(vocab), len(fit), matrix.shape[1], k,
                 100 * pca.explained_variance_ratio_.sum(), chosen)
-    if k != PUBLISHED_PCA_DIMS and not args.pca_dims:
-        logger.warning("  !! cell chose %d components, but the published table has %d. The file "
-                       "name changes to %s, so tackai.fusion.context.CONTEXT_FILES must be "
-                       "updated to match (or pass --pca-dims %d to keep the old width).",
-                       k, PUBLISHED_PCA_DIMS, files["pca"], PUBLISHED_PCA_DIMS)
+    warn_if_new_generation(cache_dir, "cell", files["pca"])
 
     if args.verify:
         status = 0
@@ -283,6 +285,15 @@ def main() -> int:
                     "similarity_target": similarity_target}
     meta["not_found_description"] = NOT_FOUND
     meta_path.write_text(json.dumps(meta, indent=1))
+    write_part_manifest(
+        cache_dir, "cell",
+        {"cell": {"table": files["pca"], "pca_model": files["pca_model"]}},
+        {"cell": {"model": CELL_MODEL, "pooling": CELL_POOLING, "n_keys": len(vocab),
+                  "n_distinct_vectors": int(len(fit)), "embedding_dim": int(matrix.shape[1]),
+                  "pca_dims": k, "explained_variance": float(pca.explained_variance_ratio_.sum()),
+                  "variance_target": args.variance_target,
+                  "similarity_target": similarity_target,
+                  "source": source_record(args)}})
 
     for name in list(files.values()) + [META_FILE]:
         logger.info("%9.1f KB  %s", (cache_dir / name).stat().st_size / 1024, name)
