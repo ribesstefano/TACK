@@ -23,12 +23,15 @@ builds a vector for those keys, which is why they were being dropped. Building t
 with ``build_table`` guarantees the table covers exactly the keys the encoder will be asked
 for.
 
-    python scripts/generate_cell_embeddings.py \\
-        --csv data/AutoTPD-TPDdb.csv data/auto_tpd_plus/*.csv --write
+The rows come from the public ``ailab-bio/AutoTPDplus`` dataset on the Hugging Face Hub,
+config ``autotpdplus-protac``; see ``scripts/embeddings/_dataset.py``.
+
+    python scripts/embeddings/generate_cell_embeddings.py            # overwrites the cache
+    python scripts/embeddings/generate_cell_embeddings.py --verify    # diff against it instead
 
 Like the protein script, the number of PCA components is chosen from the data, so a larger
 vocabulary can change it and with it the file name (``_pca47`` -> ``_pca49``); the script says
-so loudly, and ``--pca-dims`` pins it. Nothing is written without ``--write``, because
+so loudly, and ``--pca-dims`` pins it. **A run overwrites the cache**, because
 refitting the PCA is a new embedding space that invalidates models trained in the old one.
 
 Author: Stefano Ribes
@@ -47,13 +50,14 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from dotenv import find_dotenv, load_dotenv
 from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _dataset import add_source_arguments, load_env, load_frames, source_record
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(REPO_ROOT / ".env")
-load_dotenv(find_dotenv(usecwd=True))
+load_env(REPO_ROOT)
 
 from tackai.data.utils import get_cache_dir
 from tackai.data.embeddings.utils import EmbeddingMixin
@@ -85,18 +89,19 @@ def cache_files(k: int) -> dict:
             "pca_model": f"{stem()}_pca{k}_model.npz"}
 
 
-def load_vocab(files) -> list:
+def load_vocab(frames) -> list:
     """Cell keys the production table actually asks for, most frequent first, "unknown" last.
 
     Args:
-        files: CSV paths.
+        frames: Curated tables as DataFrames (see ``scripts/embeddings/_dataset.py``);
+            ``build_table`` takes them directly, so nothing is read from a CSV.
 
     Returns:
         List of cell keys.
     """
     from tackai.fusion.data import build_table
 
-    table = build_table(files)
+    table = build_table(frames)
     keys = table["cell_key"].astype("string").str.strip()
     keys = keys.mask(keys.isna() | (keys == "") | (keys.str.lower() == "nan"))
     n_missing = int(keys.isna().sum())
@@ -159,8 +164,7 @@ def compare_to_cached(path: Path, table: dict, atol: float) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Regenerate the cached cell-line embeddings (generation only, no analysis).")
-    parser.add_argument("--csv", nargs="+", required=True, type=Path,
-                        help="Curated CSV(s) whose cell-line keys define the vocabulary.")
+    add_source_arguments(parser)
     parser.add_argument("--cache-dir", default=None,
                         help="Directory to write the npz files to (default: TACKAI_CACHE).")
     parser.add_argument("--pca-dims", type=int, default=None,
@@ -172,8 +176,11 @@ def parse_args() -> argparse.Namespace:
                              f"(default: {SIMILARITY_TARGET}).")
     parser.add_argument("--recompute", action="store_true",
                         help="Re-encode every key instead of reusing the cached full embeddings.")
-    parser.add_argument("--write", action="store_true",
-                        help="Actually write the cache files. Without it the script only reports.")
+    parser.add_argument("--device", default="cpu",
+                        help="Torch device for the sentence-transformer pass (default: cpu). "
+                             "Pass cuda on a GPU node, with apptainer --nv.")
+    parser.add_argument("--batch-size", type=int, default=64,
+                        help="Descriptions encoded per forward pass (default: 64).")
     parser.add_argument("--verify", action="store_true",
                         help="Compare the rebuilt tables against the cached ones instead of "
                              "writing; exits non-zero on any difference.")
@@ -186,16 +193,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.write and args.verify:
-        raise SystemExit("--write and --verify are mutually exclusive")
     cache_dir = Path(args.cache_dir) if args.cache_dir else Path(get_cache_dir())
-    missing_csv = [str(p) for p in args.csv if not Path(p).exists()]
-    if missing_csv:
-        raise FileNotFoundError(f"CSV(s) not found: {missing_csv}")
+    frames = load_frames(args)
     similarity_target = None if args.similarity_target < 0 else args.similarity_target
 
-    vocab = load_vocab(args.csv)
-    # Union in whatever the cached table already holds, so regenerating from one set of CSVs
+    vocab = load_vocab(frames)
+    # Union in whatever the cached table already holds, so regenerating from one dataset
     # never drops a key another dataset still looks up. The vectors already exist, so the only
     # cost is keeping them.
     cached_full = cache_dir / cache_files(PUBLISHED_PCA_DIMS)["full"]
@@ -203,7 +206,7 @@ def main() -> int:
         with np.load(cached_full, allow_pickle=False) as data:
             carried = [k for k in data.keys() if k not in set(vocab)]
         if carried:
-            logger.info("carrying %d key(s) held by the cached table but absent from these CSVs",
+            logger.info("carrying %d key(s) held by the cached table but absent from this dataset",
                         len(carried))
             vocab = [k for k in vocab if k != NOT_FOUND] + carried + [NOT_FOUND]
 
@@ -212,7 +215,8 @@ def main() -> int:
     encoder = CellEmbedding(embeddings_type="sentence_transformer", pretrained_model=CELL_MODEL,
                             pooling=CELL_POOLING, not_found_description=NOT_FOUND,
                             filename=cache_files(PUBLISHED_PCA_DIMS)["full"], cache_dir=cache_dir,
-                            load_from_cache=not args.recompute)
+                            load_from_cache=not args.recompute,
+                            device=args.device, batch_size=args.batch_size)
     todo = [k for k in vocab if k not in encoder]
     if todo:
         # A key Cellosaurus does not know is embedded from the "unknown" description but keeps
@@ -221,6 +225,7 @@ def main() -> int:
         logger.info("encoding %d key(s) not in the cache (%d with a Cellosaurus description, "
                     "%d falling back to %r)", len(todo), known, len(todo) - known, NOT_FOUND)
         encoder.transform(todo)
+    encoder.save()
     logger.info("cell: %d from the cache, %d encoded", len(vocab) - len(todo), len(todo))
 
     table = {k: np.asarray(encoder[k], dtype=np.float32) for k in vocab}
@@ -254,10 +259,6 @@ def main() -> int:
             logger.info("  %s", verdict)
             status |= int(not verdict.startswith("OK"))
         return status
-    if not args.write:
-        logger.info("would write %s", ", ".join(files.values()))
-        logger.info("nothing written (pass --write to overwrite the cache)")
-        return 0
 
     encoder.embeddings = dict(table)
     encoder.save(filename=files["full"], cache_dir=cache_dir)
@@ -276,8 +277,8 @@ def main() -> int:
         "explained_variance": float(pca.explained_variance_ratio_.sum()), "files": files}
     meta["cell"] = {"model": CELL_MODEL, "pooling": CELL_POOLING,
                     "key": "FusionData.build_table cell_key (accession, else cell-line text)",
-                    "script": "scripts/generate_cell_embeddings.py",
-                    "source": {"files": sorted(str(p) for p in args.csv)},
+                    "script": "scripts/embeddings/generate_cell_embeddings.py",
+                    "source": source_record(args),
                     "variance_target": args.variance_target,
                     "similarity_target": similarity_target}
     meta["not_found_description"] = NOT_FOUND

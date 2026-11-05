@@ -11,8 +11,10 @@ all three, because they need just two layers and two poolings between them.
 Per block it writes the same three npz files the notebook wrote: the full table, the
 PCA-compressed table, and the fitted PCA.
 
-    python scripts/generate_protein_embeddings.py \\
-        --csv data/AutoTPD-TPDdb.csv data/auto_tpd_plus/*.csv
+The vocabulary comes from the public ``ailab-bio/AutoTPDplus`` dataset on the Hugging Face
+Hub, config ``autotpdplus-protac``; see ``scripts/embeddings/_dataset.py``.
+
+    python scripts/embeddings/generate_protein_embeddings.py
 
 Two things to know before running it over a *larger* vocabulary than the published one:
 
@@ -29,11 +31,11 @@ Two things to know before running it over a *larger* vocabulary than the publish
   The script says so loudly when ``k`` differs from :data:`PUBLISHED_PCA_DIMS`; pass
   ``--pca-dims poi=51`` to pin it instead.
 
-Because a regenerated space invalidates models trained in the old one, the default is
-``--dry-run``-safe: nothing is written unless ``--write`` is given.
+A run **overwrites the cache**, and a regenerated space invalidates models trained in the old
+one, so check with ``--verify`` first when that matters.
 
-    python scripts/generate_protein_embeddings.py --csv ... --verify   # reproduce the cache?
-    python scripts/generate_protein_embeddings.py --csv ... --write    # overwrite it
+    python scripts/embeddings/generate_protein_embeddings.py            # overwrites the cache
+    python scripts/embeddings/generate_protein_embeddings.py --verify   # reproduce the cache?
 
 Author: Stefano Ribes
 """
@@ -54,14 +56,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from dotenv import find_dotenv, load_dotenv
 from scipy.special import logsumexp
 from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _dataset import add_source_arguments, load_env, load_frames, source_record
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(REPO_ROOT / ".env")
-load_dotenv(find_dotenv(usecwd=True))
+load_env(REPO_ROOT)
 
 from tackai.data.utils import get_cache_dir
 from tackai.data.embeddings.utils import EmbeddingMixin
@@ -98,29 +101,30 @@ class StoredEmbedding(EmbeddingMixin):
 
 
 # ------------------------------- vocabulary ------------------------------------------------- #
-def load_sequences(files) -> pd.DataFrame:
-    """Collect the distinct recruiter and target sequences of every CSV, with gene names and row counts.
+def load_sequences(frames) -> pd.DataFrame:
+    """Collect the distinct recruiter and target sequences, with gene names and row counts.
 
     Args:
-        files: CSV paths.
+        frames: Curated tables as DataFrames (see ``scripts/embeddings/_dataset.py``).
 
     Returns:
         DataFrame indexed by sanitised sequence with the columns ``block`` (``"e3"``, ``"poi"``
-        or ``"both"``), ``gene`` (most frequent gene name, upper case), ``rows`` (CSV rows) and
-        ``length``.
+        or ``"both"``), ``gene`` (most frequent gene name, upper case), ``rows`` (dataset rows)
+        and ``length``.
     """
     records = {}
-    for path in files:
-        header = pd.read_csv(path, nrows=0).columns
+    for frame in frames:
         for block, seq_col in SEQ_COLUMNS.items():
             gene_col = GENE_COLUMNS[block]
-            if seq_col not in header:
+            if seq_col not in frame.columns:
                 continue
-            df = pd.read_csv(path, usecols=[c for c in (seq_col, gene_col) if c in header],
-                             dtype="string")
-            seqs = df[seq_col].str.strip()
-            genes = (df[gene_col].str.strip().str.upper() if gene_col in df
-                     else pd.Series(pd.NA, index=df.index, dtype="string"))
+            # Cast to the nullable string dtype the .str accessors below expect: a column
+            # arriving as object with None, as it does straight from the Hub, would make
+            # .str.strip() return NaN rather than <NA> and compare unequal to itself.
+            seqs = frame[seq_col].astype("string").str.strip()
+            genes = (frame[gene_col].astype("string").str.strip().str.upper()
+                     if gene_col in frame.columns
+                     else pd.Series(pd.NA, index=frame.index, dtype="string"))
             for raw, gene in zip(seqs, genes):
                 if pd.isna(raw) or not raw or raw.lower() == "nan":
                     continue
@@ -131,7 +135,7 @@ def load_sequences(files) -> pd.DataFrame:
                 if not pd.isna(gene) and gene:
                     rec["genes"][gene] = rec["genes"].get(gene, 0) + 1
     if not records:
-        raise ValueError("no sequences found: none of the CSVs has a recruiter or target sequence column")
+        raise ValueError("no sequences found: no source has a recruiter or target sequence column")
     rows = [{"sequence": s,
              "block": "both" if len(r["blocks"]) == 2 else next(iter(r["blocks"])),
              "gene": max(r["genes"], key=r["genes"].get) if r["genes"] else "?",
@@ -344,8 +348,7 @@ def compare_to_cached(path: Path, table: dict, atol: float) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Regenerate the cached POI/E3 protein embeddings (generation only, no sweep).")
-    parser.add_argument("--csv", nargs="+", required=True, type=Path,
-                        help="Curated CSV(s) whose recruiter/target sequence columns define the vocabulary.")
+    add_source_arguments(parser)
     parser.add_argument("--blocks", nargs="+", default=list(BLOCK_SPEC), choices=list(BLOCK_SPEC),
                         help="Blocks to write (default: all of e3, poi, combined).")
     parser.add_argument("--cache-dir", default=None,
@@ -365,10 +368,6 @@ def parse_args() -> argparse.Namespace:
                              f"(default: {SIMILARITY_TARGET}).")
     parser.add_argument("--recompute", action="store_true",
                         help="Ignore the pooled-vector cache and run the ESM passes again.")
-    parser.add_argument("--write", action="store_true",
-                        help="Actually write the cache files. Without it the script only reports "
-                             "what it would write, because a regenerated table is a new "
-                             "embedding space that invalidates models trained in the old one.")
     parser.add_argument("--verify", action="store_true",
                         help="Compare the rebuilt tables against the cached ones instead of "
                              "writing; exits non-zero on any difference.")
@@ -379,12 +378,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.write and args.verify:
-        raise SystemExit("--write and --verify are mutually exclusive")
     cache_dir = Path(args.cache_dir) if args.cache_dir else Path(get_cache_dir())
-    missing = [str(p) for p in args.csv if not Path(p).exists()]
-    if missing:
-        raise FileNotFoundError(f"CSV(s) not found: {missing}")
+    frames = load_frames(args)
     pinned = {}
     for item in args.pca_dims:
         block, _, value = item.partition("=")
@@ -393,7 +388,7 @@ def main() -> int:
         pinned[block] = int(value)
     similarity_target = None if args.similarity_target < 0 else args.similarity_target
 
-    seq_info = load_sequences(args.csv)
+    seq_info = load_sequences(frames)
     vocab = build_vocab(seq_info)
     both = int((seq_info["block"] == "both").sum())
     logger.info("%d distinct sequences need an ESM pass (%d appear as both recruiter and target)",
@@ -456,10 +451,6 @@ def main() -> int:
                        "embedding_dim": int(X.shape[1]), "pca_dims": k,
                        "explained_variance": float(pca.explained_variance_ratio_.sum()),
                        "files": files}
-        if not args.write:
-            logger.info("  would write %s", ", ".join(files.values()))
-            continue
-
         StoredEmbedding(embeddings=full, filename=files["full"], cache_dir=cache_dir).save()
         StoredEmbedding(embeddings=reduced, filename=files["pca"], cache_dir=cache_dir).save()
         np.savez(cache_dir / files["pca_model"],
@@ -468,20 +459,20 @@ def main() -> int:
                  explained_variance_ratio_=pca.explained_variance_ratio_.astype(np.float32))
         written.extend(files.values())
 
-    if args.write:
-        meta_file = "protein_pooling_meta.json"
-        meta = {"script": "scripts/generate_protein_embeddings.py",
-                "notebook": "notebooks/protein_pooling_comparison.ipynb",
-                "variance_target": args.variance_target, "similarity_target": similarity_target,
-                "pinned_pca_dims": pinned,
-                "source": {"files": sorted(str(p) for p in args.csv)},
-                "blocks": info}
-        (cache_dir / meta_file).write_text(json.dumps(meta, indent=1))
-        written.append(meta_file)
-        for name in written:
-            logger.info("%9.1f KB  %s", (cache_dir / name).stat().st_size / 1024, name)
-    elif not args.verify:
-        logger.info("nothing written (pass --write to overwrite the cache)")
+    if args.verify:                      # compared, nothing written: no meta to update either
+        return status
+
+    meta_file = "protein_pooling_meta.json"
+    meta = {"script": "scripts/embeddings/generate_protein_embeddings.py",
+            "notebook": "notebooks/protein_pooling_comparison.ipynb",
+            "variance_target": args.variance_target, "similarity_target": similarity_target,
+            "pinned_pca_dims": pinned,
+            "source": source_record(args),
+            "blocks": info}
+    (cache_dir / meta_file).write_text(json.dumps(meta, indent=1))
+    written.append(meta_file)
+    for name in written:
+        logger.info("%9.1f KB  %s", (cache_dir / name).stat().st_size / 1024, name)
     return status
 
 
