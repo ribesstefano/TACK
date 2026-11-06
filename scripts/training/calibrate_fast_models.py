@@ -56,7 +56,7 @@ from tackai.fusion.xgb_ensemble import XGBStackedEnsemble
 # Load HF_TOKEN / TACKAI_CACHE from the repo's .env before any tackai/huggingface_hub call.
 # Anchored on this file rather than the cwd so it also works from a job submitted elsewhere;
 # variables already in the environment take precedence.
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(REPO_ROOT / ".env")
 load_dotenv(find_dotenv(usecwd=True))
 
@@ -182,6 +182,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--context-repo-id", default=DEFAULT_CONTEXT_REPO,
                         help="Hub repo id (or local staged directory) of the context "
                              "embedding tables used to encode --test-file.")
+    parser.add_argument("--protein-space", default="combined", choices=["per_block", "combined"],
+                        help="POI/E3 embedding space the models were trained in. Must match "
+                             "train_fast_models.py --protein-space (default: combined).")
     parser.add_argument("--calibration-npz", default=None,
                         help="Held-out calibration set written by train_fast_models.py "
                              "(<model-dir>/calibration.npz). When given, the stacking weights "
@@ -208,7 +211,8 @@ def main():
                        "Hub repo will fail.", REPO_ROOT / ".env")
 
     logger.info("Loading context tables from %s", args.context_repo_id)
-    context_dt = FusionData.from_pretrained(args.context_repo_id)
+    context_dt = FusionData.from_pretrained(args.context_repo_id,
+                                            protein_space=args.protein_space)
 
     logger.info("Building the test table from %s", args.test_file)
     test_dt = FusionData.from_csv([args.test_file], encoder=context_dt.encoder, verbose=True)

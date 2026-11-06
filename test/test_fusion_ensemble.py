@@ -5,6 +5,7 @@ from functools import partial
 import numpy as np
 import pytest
 
+from tackai.fusion.mol_encoder import FP_SIZE
 from fusion_fixtures import DEFAULT_BLOCKS, CELLS, SEQS, SMILES, build_ensemble
 from tackai.fusion.data import FusionData
 from tackai.fusion.ensemble import FusionEnsemble, FusionPrediction
@@ -84,7 +85,7 @@ def test_manifest_records_the_block_layout(data, tmp_path):
     build_ensemble(fast_gp, data, task="pdc50", n_members=1, n_folds=3).save(tmp_path / "ens")
     manifest = json.loads((tmp_path / "ens" / "manifest.json").read_text())
     assert manifest["task"] == "pdc50"
-    assert manifest["block_dims"]["fingerprint"] == 1024
+    assert manifest["block_dims"]["fingerprint"] == FP_SIZE
     assert manifest["n_members"] == 1 and "tackai" in manifest["versions"]
 
 

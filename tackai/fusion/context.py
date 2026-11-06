@@ -709,7 +709,7 @@ class ContextEncoder:
 
     NOT_FOUND = "Unknown cell line."
 
-    def __init__(self, cache_dir: Optional[str] = None, protein_space: str = "per_block",
+    def __init__(self, cache_dir: Optional[str] = None, protein_space: str = "combined",
                  files: Optional[Dict[str, Dict[str, str]]] = None):
         if protein_space not in {"per_block", "combined"}:
             raise ValueError(f"protein_space must be 'per_block' or 'combined', got {protein_space!r}")

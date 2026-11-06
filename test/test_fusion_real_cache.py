@@ -58,7 +58,10 @@ def test_development_table_encodes_end_to_end():
     from tackai.fusion.data import FusionData
 
     data = FusionData.from_csv(DEV_FILES, verbose=True)
-    assert data.X.shape[1] == 1355
+    # The sum of the blocks the encoder and featuriser actually declare, not a literal: the
+    # molecular half moves with MolEncoder's defaults (1024 -> 4096 bits on 2026-11-06) and
+    # the context half with every PCA refit, so a repeated total only ever goes stale.
+    assert data.X.shape[1] == sum(data.dims.values())
     assert data.dropped["read"] == 8432
     assert data.dropped["total"] / data.dropped["read"] < 0.06    # ~4.6% on this snapshot
     assert len(data.table) == data.dropped["read"] - data.dropped["total"]

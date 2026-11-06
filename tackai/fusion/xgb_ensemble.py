@@ -128,6 +128,9 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
         n = len(self.models)
         self.weights_, self.sigmas_ = np.full(n, 1 / n), np.zeros(n)  # uniform, unknown noise
         self.lambda_ = self.q_hat_ = self.temperature_ = None
+        self.feature_spec = None
+        self.target_name = None
+        self.training_provenance = None
 
     # --------------------------- introspection ------------------------------ #
     def help(self, show_extras: bool = False) -> dict:
@@ -340,6 +343,51 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
                     entropy_epistemic=np.maximum(_entropy(pooled) - aleatoric, 0.0))
 
     # ------------------------- Hugging Face Hub ---------------------------- #
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path: str | Path, *, revision: str | None = None,
+                        cache_dir: str | Path | None = None, force_download: bool = False,
+                        local_files_only: bool = False, token: str | None = None,
+                        subfolder: str | None = None, **kwargs) -> "XGBStackedEnsemble":
+        """Load one local or HF task folder, including its own config and feature spec.
+
+        The generic Hub mixin looks for config.json at the repository root before
+        calling the loader. Our multi-task repositories store it inside each task;
+        loading that folder directly avoids an unnecessary root lookup and warning.
+        Extra keyword arguments override the ensemble hyperparameters in HPARAMS.
+        """
+        return cls._from_pretrained(
+            model_id=str(pretrained_model_name_or_path), revision=revision, cache_dir=cache_dir,
+            force_download=force_download, local_files_only=local_files_only,
+            token=token, subfolder=subfolder, **kwargs)
+
+    def load_data(self, *, token: str | None = None, local_files_only: bool = False,
+                  n_workers: int = 1) -> "FusionData":
+        """Restore the exact HF context snapshot and molecular layout used at training.
+
+        Returns an encoder-only FusionData; use its transform(records) to score new
+        molecule/context records. No encoder is fitted and the shared cache is untouched.
+        Older artifacts without feature metadata must supply their encoder explicitly.
+        """
+        from tackai.fusion.data import FusionData
+        from tackai.fusion.mol_encoder import MolEncoder
+
+        spec = self.feature_spec
+        if spec is None:
+            raise ValueError("This legacy ensemble has no feature_spec; supply its training encoder.")
+        source = Path(spec["context_repo"])
+        if not source.is_dir():
+            source = Path(snapshot_download(spec["context_repo"], repo_type="dataset",
+                                            revision=spec["context_revision"], token=token,
+                                            local_files_only=local_files_only))
+        data = FusionData.from_pretrained(
+            source, cache_dir=source, protein_space=spec["protein_space"],
+            featurizer=MolEncoder(radius=spec["fingerprint"]["radius"],
+                                  fp_size=spec["fingerprint"]["size"],
+                                  descriptors=spec["descriptors"], n_workers=n_workers))
+        if data.encoder.fingerprint() != spec["context_fingerprint"] or data.dims != spec["block_dims"]:
+            raise ValueError("The restored features do not match the training feature_spec")
+        return data
+
     # ModelHubMixin builds save_pretrained and from_pretrained on the two hooks below.
     # push_to_hub is overridden only to add `subfolder`, so one repo can hold many ensembles.
     def push_to_hub(self, repo_id, *, subfolder=None, commit_message=None, private=None,
@@ -361,10 +409,46 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
     def _save_pretrained(self, save_directory: Path) -> None:
         for i, model in enumerate(self.models):
             model.save_model(save_directory / f"model_{i:03d}.ubj")
-        config = {"task": self.task,
+        config = {"task": self.task, "target_name": self.target_name,
+                  "training_provenance": self.training_provenance,
+                  "model_files": [f"model_{i:03d}.ubj" for i in range(len(self.models))],
+                  "feature_spec": self.feature_spec,
                   "init": {k: getattr(self, k) for k in HPARAMS},
                   "state": {k: getattr(self, k) for k in STATE}}
         (save_directory / CONFIG).write_text(json.dumps(config, indent=2, default=lambda a: a.tolist()))
+        if self.feature_spec is not None:
+            # The Hub mixin preserves a card written by this hook. Keep loading
+            # instructions alongside every local export and uploaded task bundle.
+            point_key = "proba" if self.task == "classification" else "mean"
+            units = {"dmax": "Dmax fraction (0–1)", "pdc50": "pDC50 (−log10 molar DC50)",
+                     "activity": "Probability of activity (0–1)"}.get(self.target_name, "Task-specific target")
+            layout = {k: v for k, v in self.feature_spec.items() if k != "descriptors"}
+            (save_directory / "README.md").write_text(
+                "---\nlibrary_name: xgboost\ntags:\n- protac\n- ensemble\n---\n\n"
+                f"# TACK {self.target_name or 'fast'} ensemble\n\n"
+                f"{len(self.models)} XGBoost members; {self.task}. Output: {units}.\n\n"
+                "Use the TACK source checkout and its inference image. Set HF_HOME to a "
+                "writable cache before starting Python; private repositories need HF_TOKEN.\n\n"
+                "```python\nfrom tackai.fusion.xgb_ensemble import XGBStackedEnsemble\n\n"
+                'ensemble = XGBStackedEnsemble.from_pretrained(\n'
+                '    "YOUR_ORG/YOUR_REPO", subfolder="TASK_SUBFOLDER", revision="MODEL_COMMIT")\n'
+                "data = ensemble.load_data()  # restores the pinned HF context and feature layout\n"
+                "# records: a list of dictionaries with smiles, poi_seq, e3_seq,\n"
+                "# cell_id, assay, and assay_time (hours).\n"
+                f'prediction = ensemble.predict(data.transform(records))["{point_key}"]\n'
+                "```\n\nFor a local bundle, pass its directory and omit subfolder/revision. "
+                "After warming both caches, use local_files_only=True in both loading calls "
+                "for offline inference. Do not refit the context embeddings or PCA.\n\n"
+                "## Training feature layout\n\n```json\n"
+                + json.dumps(layout, indent=2) + "\n```\n\n"
+                "Descriptor names and their order are recorded in config.json. "
+                "Activity thresholds describe the label definition; a regression model's "
+                "output is the target of its task subfolder.\n")
+            if self.training_provenance is not None:
+                with (save_directory / "README.md").open("a") as card:
+                    card.write("\n## Training provenance\n\nDataset revision, software versions "
+                               "and run settings:\n\n```json\n"
+                               + json.dumps(self.training_provenance, indent=2) + "\n```\n")
 
     @classmethod
     def _from_pretrained(cls, *, model_id, revision=None, cache_dir=None, force_download=False,
@@ -380,14 +464,23 @@ class XGBStackedEnsemble(ModelHubMixin, library_name="xgboost", tags=["xgboost",
                                           force_download=force_download, local_files_only=local_files_only,
                                           allow_patterns=f"{subfolder}/*" if subfolder else None))
         path = path / (subfolder or "")
-        files = sorted(f for f in path.iterdir()
-                       if f.suffix in MODEL_SUFFIXES and f.name != CONFIG
-                       and not f.name.endswith(".params.json"))
+        config = json.loads((path / CONFIG).read_text()) if (path / CONFIG).exists() else {}
+        if "model_files" in config:
+            names = config["model_files"]
+            if any(Path(n).name != n or Path(n).suffix not in MODEL_SUFFIXES for n in names):
+                raise ValueError("model_files must contain model basenames only")
+            files = [path / n for n in names]
+        else:
+            files = sorted(f for f in path.iterdir()
+                           if f.suffix in MODEL_SUFFIXES and f.name != CONFIG
+                           and not f.name.endswith(".params.json"))
         if not files:
             raise FileNotFoundError(f"No model files ({', '.join(sorted(MODEL_SUFFIXES))}) in {path}")
-        config = json.loads((path / CONFIG).read_text()) if (path / CONFIG).exists() else {}
         overrides = {k: v for k, v in kwargs.items() if k in HPARAMS}
         ensemble = cls([_load_model(f) for f in files], **{**config.get("init", {}), **overrides})
+        ensemble.feature_spec = config.get("feature_spec")
+        ensemble.target_name = config.get("target_name")
+        ensemble.training_provenance = config.get("training_provenance")
         for key, value in config.get("state", {}).items():
             setattr(ensemble, key, np.asarray(value) if isinstance(value, list) else value)
         return ensemble

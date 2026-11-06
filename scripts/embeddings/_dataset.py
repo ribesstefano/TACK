@@ -79,7 +79,7 @@ def warn_if_new_generation(cache_dir: Path, block: str, table: str) -> None:
 
 
 def add_source_arguments(parser) -> None:
-    """Add the ``--dataset`` / ``--dataset-config`` / ``--revision`` group.
+    """Add the ``--dataset`` / ``--dataset-config`` / ``--dataset-revision`` group.
 
     Args:
         parser: The script's :class:`argparse.ArgumentParser`.
@@ -90,28 +90,31 @@ def add_source_arguments(parser) -> None:
     parser.add_argument("--dataset-config", default=DEFAULT_DATASET_CONFIG,
                         help=f"Config of --dataset to load "
                              f"(default: {DEFAULT_DATASET_CONFIG}).")
-    parser.add_argument("--revision", default=None,
+    parser.add_argument("--dataset-revision", default=None,
                         help="Revision of --dataset to load (default: the main branch). "
                              "Pin it to make a regeneration reproducible.")
+    parser.add_argument("--dataset-files", nargs="+", default=None,
+                        help="Explicit training files inside the dataset repo; use this when "
+                             "the repo also contains a separate test CSV.")
 
 
 def _resolve_revision(args) -> str:
-    """The commit this run loads: ``--revision`` when given, else what the branch points at now.
+    """The commit this run loads: ``--dataset-revision`` when given, else where the branch points.
 
     Resolved *before* loading, so the recorded provenance is the revision actually read and
     not whatever the branch has moved to by the time the meta is written — AutoTPD+ is a
     living release and does move. Falls back to the branch name when the Hub is unreachable,
     which is the offline case where ``datasets`` serves its cache.
     """
-    if args.revision:
-        return args.revision
+    if args.dataset_revision:
+        return args.dataset_revision
     try:
         from huggingface_hub import HfApi
 
         return HfApi().dataset_info(args.dataset).sha
     except Exception:
         logger.warning("  could not reach the Hub to resolve a commit; recording \"main\". "
-                       "Pass --revision to pin the source exactly.")
+                       "Pass --dataset-revision to pin the source exactly.")
         return "main"
 
 
@@ -127,12 +130,27 @@ def load_frames(args) -> List[pd.DataFrame]:
     """
     from datasets import load_dataset
 
-    config = args.dataset_config
+    config = None if args.dataset_config == "default" else args.dataset_config
     args.resolved_revision = _resolve_revision(args)
     logger.info("source: %s@%s, config %s", args.dataset, args.resolved_revision, config)
-    ds = load_dataset(args.dataset, config, revision=args.resolved_revision)[DATASET_SPLIT]
+    files = getattr(args, "dataset_files", None)
+    if files:
+        # Resolve explicit files through the pinned Hub snapshot, then use a built-in
+        # reader. In offline mode datasets cannot discover a repo's default config:
+        # "default" can become a different cache key from the actual named config.
+        from huggingface_hub import hf_hub_download
+
+        paths = [hf_hub_download(args.dataset, name, repo_type="dataset",
+                                 revision=args.resolved_revision) for name in files]
+        readers = {".csv": "csv", ".parquet": "parquet", ".json": "json", ".jsonl": "json"}
+        formats = {readers.get(Path(name).suffix.lower()) for name in files}
+        if len(formats) != 1 or None in formats:
+            raise ValueError("--dataset-files must contain one supported format: CSV, Parquet or JSON")
+        ds = load_dataset(formats.pop(), data_files={DATASET_SPLIT: paths})[DATASET_SPLIT]
+    else:
+        ds = load_dataset(args.dataset, config, revision=args.resolved_revision)[DATASET_SPLIT]
     frame = ds.to_pandas()
-    frame.attrs["name"] = config
+    frame.attrs["name"] = config or args.dataset
     logger.info("  %d rows x %d columns", len(frame), frame.shape[1])
     return [frame]
 
@@ -141,9 +159,10 @@ def source_record(args) -> Dict:
     """What the meta JSON records about this run's source: repo id, config, revision.
 
     ``revision`` is the commit :func:`load_frames` resolved and loaded; ``pinned`` says whether
-    it came from ``--revision`` or from wherever the branch stood at load time.
+    it came from ``--dataset-revision`` or from wherever the branch stood at load time.
     """
     return {"dataset": args.dataset, "repo_type": "dataset",
             "config": args.dataset_config, "split": DATASET_SPLIT,
-            "revision": getattr(args, "resolved_revision", args.revision or "main"),
-            "pinned": bool(args.revision)}
+            "revision": getattr(args, "resolved_revision", args.dataset_revision or "main"),
+            "pinned": bool(args.dataset_revision),
+            "files": getattr(args, "dataset_files", None)}

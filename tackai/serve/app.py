@@ -292,14 +292,6 @@ def load_service(*, model: str, tasks: Sequence[str],
     from tackai.fusion.mol_encoder import MolEncoder
     from tackai.fusion.xgb_ensemble import XGBStackedEnsemble
 
-    featurizer = MolEncoder(n_workers=n_workers)
-    if context_repo is None:
-        encoder = ContextEncoder(protein_space=protein_space) if protein_space else None
-        data = FusionData(encoder=encoder, featurizer=featurizer)
-    else:
-        data = FusionData.from_pretrained(context_repo, token=token, featurizer=featurizer,
-                                          protein_space=protein_space)
-
     ensembles = {}
     for task in tasks:
         try:
@@ -314,9 +306,30 @@ def load_service(*, model: str, tasks: Sequence[str],
             source = model
         logger.info(f"Loaded {len(ensemble.models)} models ({ensemble.task}) "
                     f"for {task} from {source}")
+        target_name = getattr(ensemble, "target_name", None)
+        if target_name is not None and target_name != task:
+            raise ValueError(f"Requested task {task!r}, but the ensemble target is {target_name!r}")
         ensembles[task] = ensemble
 
     # Checked here so a width mismatch stops startup rather than failing every request.
+    specs = [getattr(e, "feature_spec", None) for e in ensembles.values()]
+    if any(s is not None for s in specs):
+        if any(s != specs[0] for s in specs):
+            raise ValueError("All served tasks must use the same training feature_spec")
+        restored = next(iter(ensembles.values())).load_data(token=token, n_workers=n_workers)
+        if protein_space is not None and protein_space != restored.encoder.protein_space:
+            raise ValueError("--protein-space contradicts the ensemble's training feature_spec")
+        if context_repo is not None and context_repo != specs[0]["context_repo"]:
+            raise ValueError("--context-repo contradicts the ensemble's training feature_spec")
+        data = restored
+    else:
+        featurizer = MolEncoder(n_workers=n_workers)
+        if context_repo is None:
+            encoder = ContextEncoder(protein_space=protein_space) if protein_space else None
+            data = FusionData(encoder=encoder, featurizer=featurizer)
+        else:
+            data = FusionData.from_pretrained(context_repo, token=token, featurizer=featurizer,
+                                              protein_space=protein_space)
     _check_layout(ensembles, data)
     service = Service(ensembles, data, model_source=model, default_context=context)
     if context is not None:

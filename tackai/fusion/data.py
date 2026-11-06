@@ -29,7 +29,7 @@ from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES, MOL_BLOCKS, MolEncoder
 RDLogger.DisableLog("rdApp.*")
 
 DMAX_THR = 0.80          # Dmax fraction above which a degrader counts as active
-PDC50_THR = 6.0          # pDC50 above which a degrader counts as active (DC50 < 1 uM)
+PDC50_THR = 7.0          # pDC50 above which a degrader counts as active (DC50 < 100 nM)
 TASKS = ("dmax", "pdc50", "activity")
 TASK_TYPES = {"dmax": "regression", "pdc50": "regression", "activity": "binary"}
 TASK_LABELS = {"dmax": "Dmax (fraction)", "pdc50": "pDC50", "activity": "P(active)"}
@@ -224,7 +224,7 @@ def _harmonise_source(raw: pd.DataFrame, label: str) -> pd.DataFrame:
     e3_raw = (_first_valid(raw["Recruiter"], raw["Recruiter_Gene"])
               if "Recruiter_Gene" in raw else raw["Recruiter"])
     hours = raw[["DC50_h", "Dmax_h"]].astype(float)
-    return pd.DataFrame({
+    table = pd.DataFrame({
         "source": label, "smiles": raw["SMILES"], "e3_raw": e3_raw,
         "e3_seq": raw["Recruiter_Sequence"],
         "poi_uniprot": raw["Degradation_Target_Uniprot"],
@@ -233,6 +233,9 @@ def _harmonise_source(raw: pd.DataFrame, label: str) -> pd.DataFrame:
         "assay_time": hours.mean(axis=1, skipna=True),   # DC50_h and Dmax_h agree in ~98% of rows
         "dmax_pct": raw["Dmax"].astype(float).clip(0, 100),
         "dc50_nM": raw["DC50"].astype(float)})
+    if "benchmark_row_id" in raw:
+        table["benchmark_row_id"] = raw["benchmark_row_id"]
+    return table
 
 
 def build_table(sources: Sequence[Union[str, Path, pd.DataFrame]]) -> pd.DataFrame:
@@ -380,7 +383,7 @@ class FusionData:
     # ---------------------------------------------------------------- construction
 
     @classmethod
-    def from_csv(cls, files: Sequence[Union[str, Path]], *,
+    def from_csv(cls, files: Sequence[Union[str, Path, pd.DataFrame]], *,
                  encoder: Optional[ContextEncoder] = None,
                  featurizer: Optional[MolEncoder] = None,
                  descriptors: Optional[Sequence[str]] = DESCRIPTOR_NAMES,
@@ -397,7 +400,7 @@ class FusionData:
         request is never silently replaced.
 
         Args:
-            files: CSV paths.
+            files: CSV paths or already-loaded DataFrames (see :func:`build_table`).
             encoder: Context embedding lookup.
             featurizer: Molecular featuriser.
             descriptors: RDKit descriptor names for the default featuriser, or ``None`` for
@@ -501,7 +504,8 @@ class FusionData:
                     "pass a local directory to from_pretrained() instead."
                 ) from e
             source = Path(snapshot_download(repo_id=str(repo_id), repo_type="dataset",
-                                            revision=revision, token=token))
+                                            revision=revision, token=token,
+                                            force_download=force_download))
 
         manifest_path = source / "manifest.json"
         manifest = read_context_manifest(source)
@@ -794,6 +798,18 @@ class FusionData:
     def n_columns(self) -> int:
         """Width of the design matrix."""
         return sum(self.dims.values())
+
+    @property
+    def feature_names(self) -> List[str]:
+        """Stable column identities for comparing models with different feature layouts."""
+        names = [f"morgan:r{self.featurizer.radius}:n{self.featurizer.fp_size}:stereo:{i}"
+                 for i in range(self.dims["fingerprint"])]
+        names.extend(f"rdkit:{name}" for name in self.featurizer.descriptors)
+        context_id = f"{self.encoder.fingerprint()}:{self.encoder.protein_space}"
+        for block in BLOCK_ORDER:
+            if block not in MOL_BLOCKS:
+                names.extend(f"context:{context_id}:{block}:{i}" for i in range(self.dims[block]))
+        return names
 
     @property
     def context_columns(self) -> np.ndarray:

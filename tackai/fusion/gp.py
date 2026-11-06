@@ -4,7 +4,7 @@ This is M4 of the fusion comparison, written directly in torch rather than throu
 for one reason: **the pairwise squared distances never change during the marginal-likelihood
 fit** — only the lengthscales do. Caching them per block turns every Adam step into an
 elementwise ``exp`` plus a Cholesky, which matters now that no PCA runs upstream and the
-fingerprint block is 1024 columns wide instead of 64.
+fingerprint block is 4096 columns wide instead of 64.
 
 Blocks listed in ``ard_blocks`` are the exception: per-column lengthscales make the distance
 depend on the parameters, and an ``N x N x D`` cache is not affordable, so those blocks

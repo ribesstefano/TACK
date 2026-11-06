@@ -8,10 +8,11 @@ in ``test/`` (which pytest puts on ``sys.path``) rather than a ``test`` package,
 from tackai.fusion.context import (ASSAY_VOCAB, CONTEXT_GENERATORS,
                                    resolve_context_files, write_part_manifest)
 from tackai.fusion.data import BLOCK_ORDER, block_index  # noqa: F401  (re-exported for tests)
+from tackai.fusion.mol_encoder import FP_SIZE
 
 #: Widths of a FusionData built on the synthetic cache below and the default featuriser.
 #: ``test_fusion_data.py`` checks that they agree with what the library discovers.
-BLOCK_DIMS = {"fingerprint": 1024, "descriptors": 216, "e3": 24, "cell": 56, "poi": 78,
+BLOCK_DIMS = {"fingerprint": FP_SIZE, "descriptors": 216, "e3": 24, "cell": 56, "poi": 78,
               "assay": 8, "assay_time": 1}
 
 #: Width of the shared POI+E3 table, which ``protein_space="combined"`` reads instead of the

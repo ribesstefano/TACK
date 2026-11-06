@@ -340,7 +340,7 @@ def test_from_pretrained_uses_snapshot_download_for_a_repo_id(fake_cache, tmp_pa
     pfc.stage(fake_cache, staged)
     calls = {}
 
-    def fake_snapshot_download(repo_id, repo_type, revision, token):
+    def fake_snapshot_download(repo_id, repo_type, revision, token, force_download=False):
         calls["args"] = (repo_id, repo_type, revision, token)
         return str(staged)
 

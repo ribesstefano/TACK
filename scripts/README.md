@@ -50,8 +50,10 @@ then a separate calibration pass that turns the fold models into a calibrated
 
 ```bash
 # Train. Resumable: a fold whose model+params JSONs exist is skipped.
+# Development rows come from ailab-bio/AutoTPDplus; the context tables are downloaded
+# fresh from ailab-bio/TACK-Context-Encoding (needs HF_TOKEN in .env while it is private).
 python scripts/training/train_fast_models.py \
-    --dev-files data/yaochen/AutoTPDplus-PROTAC-training.csv \
+    --dataset-revision <dataset-sha> \
     --test-file data/yaochen/PROTAC-test.csv \
     --tasks dmax pdc50 activity \
     --output-dir outputs/fast_models
@@ -70,6 +72,48 @@ Per-fold metrics land in `<output-dir>/fold_metrics.csv`; models are cached as
 `--n-inner`, `--seed`). `calibrate_fast_models.py` takes one `--task` at a
 time, and `--output-dir` without `--repo-id` saves locally without touching the
 network.
+
+Rows are carved **test → calibration → training**, each step blind to what the
+previous one reserved:
+
+* **test** — `--test-file`, or, without one, whole Taylor-Butina clusters of the
+  development molecules (`--test-frac` 0.1, `--butina-cutoff` 0.65,
+  `--butina-seed` 42), saved as `<task>/test.npz`;
+* **calibration** — `--calibration-frac` (0.1) of the rest, grouped by scaffold,
+  saved as `<task>/calibration.npz`; `--calibration-frac 0` holds nothing out and
+  performs no calibration;
+* **training** — the remainder, cross-validated.
+
+`--push-to-hub <repo-id>` assembles each task's folds into an
+`XGBStackedEnsemble`, fits the stacking weights and the conformal quantile /
+temperature on that calibration holdout, saves it under
+`<output-dir>/ensembles/<task>` and pushes it to a **private** repo under the
+subfolder `<task>` (`--no-private` to make it public). That is the one-shot
+alternative to running `calibrate_fast_models.py` per task against a separate
+test CSV.
+
+`train_fast_models.slurm` runs one task per job on CPU (`berzelius-cpu`, 32 cores) out
+of `apptainer/training.sif`; the task is the first argument:
+
+```bash
+sbatch -J tack-fast-dmax     scripts/training/train_fast_models.slurm dmax
+sbatch -J tack-fast-pdc50    scripts/training/train_fast_models.slurm pdc50
+sbatch -J tack-fast-activity scripts/training/train_fast_models.slurm activity
+# Overrides by environment variable, extra flags passed through:
+N_TRIALS=20 PUSH_TO_HUB=ailab-bio/TACK-Fast-Ensemble \
+    sbatch -J tack-fast-dmax scripts/training/train_fast_models.slurm dmax --butina-cutoff 0.5
+```
+
+`-J` only names the job and its log files. Each task writes its own
+`--output-dir` (`outputs/fast_models/<task>`), because all three otherwise
+overwrite one `fold_metrics.csv` and `provenance.json`. Budget **~3.5 h per
+task**: 3775 XGBoost fits (25 folds × (50 trials × 3 inner folds + 1 refit)),
+measured at 7–9 min per fold on the 2026-11-06 dmax run (4262 rows, 4096-bit
+fingerprints, 32 cores). `--time` is 2.5 days anyway, because the cost scales
+with the task's row count and with the tree counts Optuna proposes, and the job
+is resumable if it still runs out. 32 cores rather than a whole node because one
+`hist` fit stops speeding up past ~8–16 threads and the trials run
+sequentially — parallel trials (`study.optimize(n_jobs=…)`) are not implemented.
 
 ### `train_models.py` (legacy)
 
@@ -170,7 +214,7 @@ python scripts/embeddings/generate_cell_embeddings.py
 python scripts/embeddings/generate_assay_embeddings.py
 
 # Pin a revision for a reproducible regeneration
-python scripts/embeddings/generate_assay_embeddings.py --revision <sha>
+python scripts/embeddings/generate_assay_embeddings.py --dataset-revision <sha>
 ```
 
 Compute nodes have no reliable outbound network. `datasets` caches the download

@@ -13,7 +13,7 @@ def design(n=40, seed=0):
     rng = np.random.default_rng(seed)
     idx = block_index(BLOCK_DIMS)
     X = np.zeros((n, sum(BLOCK_DIMS.values())))
-    X[:, idx["fingerprint"]] = rng.integers(0, 2, (n, 1024))
+    X[:, idx["fingerprint"]] = rng.integers(0, 2, (n, BLOCK_DIMS["fingerprint"]))
     X[:, idx["descriptors"]] = rng.normal(size=(n, 217))
     for b in ("e3", "cell", "poi", "assay"):
         X[:, idx[b]] = rng.normal(size=(n, BLOCK_DIMS[b]))

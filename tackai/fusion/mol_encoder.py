@@ -18,8 +18,14 @@ from tackai.chem_utils import canonicalize_smiles
 
 RDLogger.DisableLog("rdApp.*")
 
-FP_RADIUS = 16
-FP_SIZE = 1024
+# Morgan geometry every fusion component defaults to: radius 2, 4096 bits, chirality always
+# included (see _featurize_chunk). It is the models' input space, so changing these numbers
+# invalidates every ensemble fitted at the previous ones -- they were radius 16 / 1024 bits
+# until 2026-11-06. A width mismatch is caught, not silent: tackai.serve._check_layout
+# refuses to start a server whose design matrix is not the width the members report in
+# n_features_in_, and FusionEnsemble records the geometry in its manifest and restores it.
+FP_RADIUS = 2
+FP_SIZE = 4096
 # NOTE: "fr_Nhpyrrole" and "fr_Ar_NH" are actually the same, so we drop one
 DESCRIPTOR_NAMES: List[str] = [name for name, _ in Descriptors._descList if name != "fr_Ar_NH"]
 N_DESC = len(DESCRIPTOR_NAMES)

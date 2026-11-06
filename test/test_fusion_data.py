@@ -2,10 +2,14 @@
 import numpy as np
 import pytest
 
-from fusion_fixtures import BLOCK_DIMS, BLOCK_ORDER, CELLS, SEQS, SMILES, block_index
+from fusion_fixtures import (BLOCK_DIMS as PER_BLOCK_DIMS, BLOCK_ORDER, CELLS, COMBINED_DIM,
+                             SEQS, SMILES, block_index)
 from tackai.fusion.data import (DMAX_THR, PDC50_THR, REPEAT_SEEDS, FusionData, make_splits,
                                 make_targets, repeat_seeds, scaffold_groups)
 
+# ContextEncoder defaults to the shared protein space; keep the fixture's two
+# per-block widths available to tests that request that space explicitly.
+BLOCK_DIMS = {**PER_BLOCK_DIMS, "poi": COMBINED_DIM, "e3": COMBINED_DIM}
 N_COLS = sum(BLOCK_DIMS.values())
 
 
@@ -24,7 +28,7 @@ def test_make_targets_non_positive_dc50_is_undefined():
 def test_activity_needs_both_or_a_decisive_one():
     t = make_targets([95.0, 95.0, 60.0, np.nan, np.nan],
                      [10.0, 10000.0, np.nan, 10.0, 10000.0])
-    assert t["activity"][0] == 1.0        # dmax > .8 and pdc50 > 6
+    assert t["activity"][0] == 1.0        # dmax > .8 and pdc50 > 7
     assert t["activity"][1] == 0.0        # pdc50 = 5 -> inactive
     assert t["activity"][2] == 0.0        # dmax .6 < .8 alone is decisive
     assert np.isnan(t["activity"][3])     # pdc50 = 8 alone cannot decide active
@@ -33,7 +37,7 @@ def test_activity_needs_both_or_a_decisive_one():
 
 def test_a_lone_measurement_exactly_on_its_threshold_is_inactive():
     # Active needs strictly > on both, so equality already fails the condition.
-    t = make_targets([80.0, np.nan], [np.nan, 1000.0])    # Dmax == 80 %, pDC50 == 6
+    t = make_targets([80.0, np.nan], [np.nan, 100.0])    # Dmax == 80 %, pDC50 == 7
     assert t["dmax"][0] == DMAX_THR and t["pdc50"][1] == PDC50_THR
     assert list(t["activity"]) == [0.0, 0.0]
 
@@ -52,7 +56,7 @@ def test_make_splits_rejects_too_few_seeds():
 
 
 def test_thresholds_are_the_documented_ones():
-    assert (DMAX_THR, PDC50_THR) == (0.80, 6.0)
+    assert (DMAX_THR, PDC50_THR) == (0.80, 7.0)
 
 
 def test_scaffold_groups_share_a_group_for_one_scaffold():
@@ -313,7 +317,7 @@ def test_blocks_indexes_is_a_copy(fake_cache, tiny_csv):
 def test_the_gp_follows_the_layout_of_data_with_non_default_widths(fake_cache, tiny_csv):
     from tackai.fusion.context import ContextEncoder
     from tackai.fusion.gp import GPInteraction
-    data = FusionData.from_csv([tiny_csv], encoder=ContextEncoder(protein_space="combined"),
+    data = FusionData.from_csv([tiny_csv], encoder=ContextEncoder(protein_space="per_block"),
                                cache=False)
     assert data.dims != BLOCK_DIMS and data.n_columns != N_COLS
     _, X, y, _ = data.task_rows("pdc50")

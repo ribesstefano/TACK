@@ -11,7 +11,7 @@ def synth(n=90, seed=0, binary=False):
     rng = np.random.default_rng(seed)
     idx = block_index(BLOCK_DIMS)
     X = np.zeros((n, sum(BLOCK_DIMS.values())), dtype=np.float64)
-    X[:, idx["fingerprint"]] = rng.integers(0, 2, (n, 1024))
+    X[:, idx["fingerprint"]] = rng.integers(0, 2, (n, BLOCK_DIMS["fingerprint"]))
     X[:, idx["descriptors"]] = rng.normal(size=(n, 217))
     X[:, idx["descriptors"][0]] *= 1e18                      # Ipc-scale column
     for b in ("poi", "e3", "cell", "assay"):

@@ -3,12 +3,12 @@ import numpy as np
 import pytest
 
 from fusion_fixtures import SMILES
-from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES, MolEncoder
+from tackai.fusion.mol_encoder import DESCRIPTOR_NAMES, FP_SIZE, MolEncoder
 
 
 def test_shapes_and_dtypes():
     fp, desc, ok = MolEncoder().featurize(SMILES)
-    assert fp.shape == (len(SMILES), 1024) and fp.dtype == np.float32
+    assert fp.shape == (len(SMILES), FP_SIZE) and fp.dtype == np.float32
     assert desc.shape == (len(SMILES), 217) and desc.dtype == np.float32
     assert ok.all() and len(DESCRIPTOR_NAMES) == 217
 
@@ -26,7 +26,7 @@ def test_invalid_smiles_does_not_raise_and_is_flagged():  # Review Focus 2
 
 def test_empty_input_returns_empty_arrays():  # Review Focus 5
     fp, desc, ok = MolEncoder().featurize([])
-    assert fp.shape == (0, 1024) and desc.shape == (0, 217) and ok.shape == (0,)
+    assert fp.shape == (0, FP_SIZE) and desc.shape == (0, 217) and ok.shape == (0,)
 
 
 def test_duplicates_are_computed_once_and_cached_across_calls():
@@ -51,7 +51,10 @@ def test_descriptor_sentinel_replaces_non_finite_and_huge_values():
 def test_bit_exact_with_tackai_mol_embedding(tmp_path):
     """The whole point: these features must equal what the training cache holds."""
     from tackai.data.embeddings.mol_embeddings import MolEmbedding
-    fp_ref = MolEmbedding(embeddings_type="fingerprint", radius=16, fp_size=1024,
+    from tackai.fusion.mol_encoder import FP_RADIUS, FP_SIZE
+    # The constants, not literals: this test pins the two paths to each other, not the
+    # geometry itself -- MolEncoder's defaults are free to change, together.
+    fp_ref = MolEmbedding(embeddings_type="fingerprint", radius=FP_RADIUS, fp_size=FP_SIZE,
                           cache_dir=str(tmp_path)).transform(SMILES[:3])
     de_ref = MolEmbedding(embeddings_type="rdkit_descriptors",
                           cache_dir=str(tmp_path)).transform(SMILES[:3])
